@@ -263,14 +263,18 @@ PM3INCLUDES += $(MQTTLIBINC)
 # but MacOSX /Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/ld
 # doesn't recognize option --as-needed
 ifneq ($(platform),Darwin)
+ifndef EMSCRIPTEN
     LDLIBS += -Wl,--as-needed -latomic -Wl,--no-as-needed
+endif
 endif
 
 ## BZIP2
+ifndef EMSCRIPTEN
 LDLIBS += -lbz2
 
 ## LZ4
 LDLIBS += -llz4
+endif
 
 ## Bluez (optional)
 ifneq ($(SKIPBT),1)
@@ -416,6 +420,10 @@ MYCFLAGS += -O3
 CFLAGS ?= $(DEFCFLAGS)
 CFLAGS += $(MYDEFS) $(MYCFLAGS) $(MYINCLUDES)
 
+ifdef EMSCRIPTEN
+    CFLAGS += -pthread
+endif
+
 # We cannot just use CFLAGS+=... because it has impact on sub-makes if CFLAGS is defined in env:
 PM3CFLAGS = $(CFLAGS)
 PM3CFLAGS += -I./src -I./include -I../include -I../common -I../common_fpga $(PM3INCLUDES) $(INCLUDES)
@@ -465,6 +473,10 @@ PM3CFLAGS += -DHAVE_SNPRINTF
 CXXFLAGS ?= -Wall -Werror
 CXXFLAGS += $(MYDEFS) $(MYCXXFLAGS) $(MYINCLUDES)
 
+ifdef EMSCRIPTEN
+    MYCXXFLAGS += -pthread
+endif
+
 PM3CXXFLAGS = $(CXXFLAGS)
 PM3CXXFLAGS += -I../include -I./include
 
@@ -484,6 +496,7 @@ LDFLAGS += $(MYLDFLAGS)
 
 PM3LDFLAGS = $(LDFLAGS)
 ifeq ($(platform),Darwin)
+ifndef EMSCRIPTEN
     ifeq ($(shell uname -p),arm64)
         # The platform is iOS
         PM3LDFLAGS += -framework Foundation -framework UIKit
@@ -491,6 +504,15 @@ ifeq ($(platform),Darwin)
         # M* macOS devices return arm
         PM3LDFLAGS += -framework Foundation -framework AppKit
     endif
+endif
+endif
+
+# WebAssembly build flags
+ifdef EMSCRIPTEN
+    PM3LDFLAGS += -pthread -sTOTAL_MEMORY=50331648 -sUSE_PTHREADS -sASYNCIFY
+    PM3LDFLAGS += -sPROXY_TO_PTHREAD=1
+    PM3LDFLAGS += -sEXPORTED_FUNCTIONS=_main,_pm3_uart_rx_head_ptr,_pm3_uart_rx_tail_ptr,_pm3_uart_rx_buf_ptr,_pm3_uart_rx_initialized_ptr,_pm3_uart_tx_head_ptr,_pm3_uart_tx_tail_ptr,_pm3_uart_tx_buf_ptr,_pm3_uart_rb_capacity,_pm3_uart_stdin_head_ptr,_pm3_uart_stdin_tail_ptr,_pm3_uart_stdin_buf_ptr
+    PM3LDFLAGS += -sEXPORTED_RUNTIME_METHODS=ccall,cwrap,HEAPU8,HEAPU32,wasmMemory
 endif
 
 ###################
@@ -767,21 +789,18 @@ SRCS =  mifare/aiddesfire.c \
 		mifare/gen4.c \
 		nfc/ndef.c \
 		pm3.c \
-		pm3_binlib.c \
-		pm3_bitlib.c \
-		preferences.c \
-		pm3line.c \
-		proxmark3.c \
-		scandir.c \
-		uart/ringbuffer.c \
-		uart/uart_common.c \
-		uart/uart_posix.c \
-		uart/uart_win32.c \
-		scripting.c \
-		ui.c \
-		util.c \
-		qrcode/qrcode.c \
-		version_pm3.c \
+			pm3_binlib.c \
+			pm3_bitlib.c \
+			preferences.c \
+			pm3line.c \
+			proxmark3.c \
+			scandir.c \
+			uart/ringbuffer.c \
+			scripting.c \
+			ui.c \
+			util.c \
+			qrcode/qrcode.c \
+			version_pm3.c \
 		wiegand_formats.c \
 		wiegand_formatutils.c
 
@@ -818,6 +837,15 @@ ifeq ($(SWIG_PYTHON_FOUND),1)
     SWIGSRCS += pm3_pywrap.c
 endif
 
+# UART implementation - WebSerial for Emscripten, native for others
+ifdef EMSCRIPTEN
+SRCS += uart/uart_web.c
+else
+SRCS += uart/uart_common.c \
+		uart/uart_posix.c \
+		uart/uart_win32.c
+endif
+
 # gui
 ifeq ($(QT_FOUND),1)
     CXXSRCS = proxgui.cpp proxguiqt.cpp proxguiqt.moc.cpp
@@ -827,7 +855,9 @@ endif
 
 # OS X
 ifeq ($(platform),Darwin)
+ifndef EMSCRIPTEN
     OBJCSRCS = util_darwin.m
+endif
 endif
 
 OBJS = $(SRCS:%.c=$(OBJDIR)/%.o)
@@ -845,16 +875,22 @@ CLEAN += flasher *.moc.cpp ui/ui_overlays.h ui/ui_image.h
 # targets #
 ###########
 
-# need to assign dependancies to build these first...
+	# need to assign dependancies to build these first...
 all: $(BINS)
 
 all-static: LDLIBS:=-static $(LDLIBS)
 all-static: $(BINS)
 
+ifdef EMSCRIPTEN
 proxmark3: $(OBJS) $(STATICLIBS) lualibs/pm3_cmd.lua lualibs/mfc_default_keys.lua
-	$(info [=] CXX $@)
+		$(info [=] CXX $@.js)
+		$(Q)$(CXX) $(PM3CFLAGS) $(PM3LDFLAGS) $(OBJS) $(STATICLIBS) $(LDLIBS) -o $@.js
+else
+proxmark3: $(OBJS) $(STATICLIBS) lualibs/pm3_cmd.lua lualibs/mfc_default_keys.lua
+		$(info [=] CXX $@)
 #	$(Q)$(CXX) $(PM3LDFLAGS) $(OBJS) $(STATICLIBS) $(LDLIBS) -o $@
-	$(Q)$(CXX) $(PM3CFLAGS) $(PM3LDFLAGS) $(OBJS) $(STATICLIBS) $(LDLIBS) -o $@
+		$(Q)$(CXX) $(PM3CFLAGS) $(PM3LDFLAGS) $(OBJS) $(STATICLIBS) $(LDLIBS) -o $@
+endif
 
 src/proxgui.cpp: src/ui/ui_overlays.h src/ui/ui_image.h
 
@@ -883,9 +919,10 @@ lualibs/mfc_default_keys.lua : mfc_default_keys.dic
 	$(Q)awk -f default_keys_dic2lua.awk $^ > $@
 
 clean:
-	$(Q)$(RM) $(CLEAN)
-	$(Q)$(RMDIR) $(OBJDIR)
-	$(Q)$(MAKE) --no-print-directory -C $(AMIIBOLIBPATH) clean
+		$(Q)$(RM) $(CLEAN)
+		$(Q)$(RM) proxmark3.js proxmark3.wasm
+		$(Q)$(RMDIR) $(OBJDIR)
+		$(Q)$(MAKE) --no-print-directory -C $(AMIIBOLIBPATH) clean
 	$(Q)$(MAKE) --no-print-directory -C $(CLIPARSERLIBPATH) clean
 	$(Q)$(MAKE) --no-print-directory -C $(HARDNESTEDLIBPATH) clean
 	$(Q)$(MAKE) --no-print-directory -C $(ID48LIBPATH) clean

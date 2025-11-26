@@ -37,6 +37,10 @@
 #include "preferences.h"
 #include "commonutil.h"
 
+#if defined(__EMSCRIPTEN__)
+#include <emscripten/emscripten.h>
+#endif
+
 #ifndef _WIN32
 #include <locale.h>
 #endif
@@ -360,6 +364,38 @@ static bool pop_cmdscriptfile(void) {
         return true;
 }
 
+#if defined(__EMSCRIPTEN__)
+
+// External function from uart_web.c
+extern int uart_read_stdin(void);
+
+static int js_getchar(void) {
+    return uart_read_stdin();
+}
+
+static char *em_fgets(char *buf, size_t size, FILE *stream) {
+    (void)stream;
+    while (true) {
+        int c = js_getchar();
+        if (c != 0) {
+            if (c == '\n') {
+                *buf = '\0';
+                return buf;
+            }
+            if (size == 1) {
+                *buf = '\0';
+                return buf;
+            }
+            *buf++ = (char)c;
+            size--;
+            continue;
+        }
+        emscripten_sleep(100);
+    }
+    return NULL;
+}
+#endif
+
 // Main thread of PM3 Client
 void
 #ifdef __has_attribute
@@ -378,8 +414,11 @@ main_loop(const char *script_cmds_file, char *script_cmd, bool stayInCommandLoop
         script_cmd_len = strlen(script_cmd);
         str_creplace(script_cmd, script_cmd_len, ';', '\0');
     }
-
+#ifdef __EMSCRIPTEN__
+    bool stdinOnPipe = true;
+#else
     bool stdinOnPipe = !isatty(STDIN_FILENO);
+#endif
     char script_cmd_buf[256] = {0x00};  // iceman, needs lua script the same file_path_buffer as the rest
 
     // cache Version information now:
@@ -477,14 +516,23 @@ check_script:
                 if (stdinOnPipe) {
                     // clear array
                     memset(script_cmd_buf, 0, sizeof(script_cmd_buf));
-                    // get
+#if defined(__EMSCRIPTEN__)
+                    prompt_ctx = PROXPROMPT_CTX_INTERACTIVE;
+                    char prompt[PROXPROMPT_MAX_SIZE] = {0};
+                    prompt_compose(prompt, sizeof(prompt), prompt_ctx, prompt_dev, prompt_net, true);
+                    fprintf(stdout, "%s", prompt);
+                    fflush(stdout);
+                    fromInteractive = true;
+                    em_fgets(script_cmd_buf, sizeof(script_cmd_buf), stdin);
+#else
                     if (fgets(script_cmd_buf, sizeof(script_cmd_buf), stdin) == NULL) {
                         PrintAndLogEx(ERR, "STDIN unexpected end, exit...");
                         break;
                     }
+                    fromInteractive = false;
+#endif
                     execCommand = true;
                     stayInCommandLoop = true;
-                    fromInteractive = false;
                     script_cmd = script_cmd_buf;
                     script_cmd_len = strlen(script_cmd);
                     str_creplace(script_cmd, script_cmd_len, ';', '\0');

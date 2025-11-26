@@ -74,6 +74,10 @@ else
   DETECTED_COMPILER = gcc
 endif
 
+ifdef EMSCRIPTEN
+  AR= emar rcs
+  RANLIB= emranlib
+else
 ifeq ($(platform),Darwin)
     ifeq ($(shell uname -p),arm64)
         # The platform is iOS
@@ -90,6 +94,7 @@ ifeq ($(platform),Darwin)
 else
   AR= ar rcs
   RANLIB= ranlib
+endif
 endif
 
 ifeq ($(USE_BREW),1)
