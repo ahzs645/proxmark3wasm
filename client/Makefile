@@ -236,17 +236,19 @@ LDLIBS += $(TINYCBORLIBLD)
 PM3INCLUDES += $(TINYCBORLIBINC)
 
 ## Whereami
-ifneq ($(SKIPWHEREAMISYSTEM),1)
-    ifneq (,$(wildcard /usr/include/whereami.h))
-        WHEREAMILIB =
-        WHEREAMILIBLD = -lwhereami
-        WHEREAMILIBINC =
-        WHEREAMI_FOUND = 1
+ifndef EMSCRIPTEN
+    ifneq ($(SKIPWHEREAMISYSTEM),1)
+        ifneq (,$(wildcard /usr/include/whereami.h))
+            WHEREAMILIB =
+            WHEREAMILIBLD = -lwhereami
+            WHEREAMILIBINC =
+            WHEREAMI_FOUND = 1
+        endif
     endif
+    STATICLIBS += $(WHEREAMILIB)
+    LDLIBS += $(WHEREAMILIBLD)
+    PM3INCLUDES += $(WHEREAMILIBINC)
 endif
-STATICLIBS += $(WHEREAMILIB)
-LDLIBS += $(WHEREAMILIBLD)
-PM3INCLUDES += $(WHEREAMILIBINC)
 
 ## MQTT
 # not distributed as system library
@@ -789,20 +791,25 @@ SRCS =  mifare/aiddesfire.c \
 		mifare/gen4.c \
 		nfc/ndef.c \
 		pm3.c \
-			pm3_binlib.c \
-			pm3_bitlib.c \
-			preferences.c \
-			pm3line.c \
-			proxmark3.c \
-			scandir.c \
-			uart/ringbuffer.c \
-			scripting.c \
-			ui.c \
-			util.c \
-			qrcode/qrcode.c \
-			version_pm3.c \
+		pm3_binlib.c \
+		pm3_bitlib.c \
+		preferences.c \
+		pm3line.c \
+		proxmark3.c \
+		scandir.c \
+		uart/ringbuffer.c \
+		scripting.c \
+		ui.c \
+		util.c \
+		qrcode/qrcode.c \
+		version_pm3.c \
 		wiegand_formats.c \
 		wiegand_formatutils.c
+
+# Skip heavy compression-dependent tools for WASM builds
+ifdef EMSCRIPTEN
+SRCS := $(filter-out cmdhfmfhard.c,$(SRCS))
+endif
 
 # common
 SRCS += bucketsort.c \
@@ -1027,9 +1034,11 @@ $(TINYCBORLIB): .FORCE
 	$(Q)$(MAKE) --no-print-directory -C $(TINYCBORLIBPATH) all
 
 $(WHEREAMILIB): .FORCE
+ifndef EMSCRIPTEN
 ifneq ($(WHEREAMI_FOUND),1)
-	$(info [*] MAKE $@)
-	$(Q)$(MAKE) --no-print-directory -C $(WHEREAMILIBPATH) all
+		$(info [*] MAKE $@)
+		$(Q)$(MAKE) --no-print-directory -C $(WHEREAMILIBPATH) all
+endif
 endif
 
 $(MQTTLIB): .FORCE
