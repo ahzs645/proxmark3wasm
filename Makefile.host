@@ -41,6 +41,14 @@ LDFLAGS ?= $(DEFLDFLAGS)
 LDFLAGS += $(MYLDFLAGS)
 LDLIBS += $(MYLDLIBS)
 
+# Enable pthread support for Emscripten WebAssembly builds
+# This ensures all dependencies are compiled with atomics/bulk-memory features
+ifdef EMSCRIPTEN
+  CFLAGS   += -pthread
+  CXXFLAGS += -pthread
+  LDFLAGS  += -pthread
+endif
+
 vpath %.c $(MYSRCPATHS)
 
 # Flags to generate temporary dependency files

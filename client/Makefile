@@ -511,8 +511,22 @@ endif
 
 # WebAssembly build flags
 ifdef EMSCRIPTEN
-    PM3LDFLAGS += -pthread -sTOTAL_MEMORY=50331648 -sUSE_PTHREADS -sASYNCIFY
-    PM3LDFLAGS += -sPROXY_TO_PTHREAD=1
+    # Thread configuration
+    PM3LDFLAGS += -pthread -sUSE_PTHREADS=1 -sPROXY_TO_PTHREAD=1
+    # Stack sizes (1MB main stack, 1MB per pthread)
+    PM3LDFLAGS += -sSTACK_SIZE=1048576
+    PM3LDFLAGS += -sDEFAULT_PTHREAD_STACK_SIZE=1048576
+    # Memory configuration (128MB initial, can grow to 512MB)
+    PM3LDFLAGS += -sINITIAL_MEMORY=134217728
+    PM3LDFLAGS += -sALLOW_MEMORY_GROWTH=1
+    PM3LDFLAGS += -sMAXIMUM_MEMORY=536870912
+    # Asyncify for blocking operations
+    PM3LDFLAGS += -sASYNCIFY -sASYNCIFY_STACK_SIZE=32768
+    # Debug checks (can be removed for production)
+    PM3LDFLAGS += -sASSERTIONS=2 -sSAFE_HEAP=1 -sSTACK_OVERFLOW_CHECK=2
+    # Suppress pthreads + memory growth warning
+    PM3LDFLAGS += -Wno-pthreads-mem-growth
+    # Exported functions for ring buffer communication
     PM3LDFLAGS += -sEXPORTED_FUNCTIONS=_main,_pm3_uart_rx_head_ptr,_pm3_uart_rx_tail_ptr,_pm3_uart_rx_buf_ptr,_pm3_uart_rx_initialized_ptr,_pm3_uart_tx_head_ptr,_pm3_uart_tx_tail_ptr,_pm3_uart_tx_buf_ptr,_pm3_uart_rb_capacity,_pm3_uart_stdin_head_ptr,_pm3_uart_stdin_tail_ptr,_pm3_uart_stdin_buf_ptr
     PM3LDFLAGS += -sEXPORTED_RUNTIME_METHODS=ccall,cwrap,HEAPU8,HEAPU32,wasmMemory
 endif

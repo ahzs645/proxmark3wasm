@@ -30,7 +30,15 @@
 #include "cmdmain.h"
 #include "ui.h"
 #include "cmdhw.h"
+#ifndef __EMSCRIPTEN__
 #include "whereami.h"
+#else
+// Stub for EMSCRIPTEN - no executable path concept in WASM
+static inline int wai_getExecutablePath(char *out, int capacity, int *dirname_length) {
+    (void)out; (void)capacity; (void)dirname_length;
+    return -1;
+}
+#endif
 #include "comms.h"
 #include "fileutils.h"
 #include "flash.h"
