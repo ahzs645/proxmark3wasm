@@ -236,6 +236,7 @@ LDLIBS += $(TINYCBORLIBLD)
 PM3INCLUDES += $(TINYCBORLIBINC)
 
 ## Whereami
+ifndef EMSCRIPTEN
 ifneq ($(SKIPWHEREAMISYSTEM),1)
     ifneq (,$(wildcard /usr/include/whereami.h))
         WHEREAMILIB =
@@ -247,6 +248,7 @@ endif
 STATICLIBS += $(WHEREAMILIB)
 LDLIBS += $(WHEREAMILIBLD)
 PM3INCLUDES += $(WHEREAMILIBINC)
+endif
 
 ## MQTT
 # not distributed as system library
@@ -263,14 +265,18 @@ PM3INCLUDES += $(MQTTLIBINC)
 # but MacOSX /Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/ld
 # doesn't recognize option --as-needed
 ifndef IS_DARWIN
+ifndef EMSCRIPTEN
     LDLIBS += -Wl,--as-needed -latomic -Wl,--no-as-needed
+endif
 endif
 
 ## BZIP2
+ifndef EMSCRIPTEN
 LDLIBS += -lbz2
 
 ## LZ4
 LDLIBS += -llz4
+endif
 
 ## ZLIB
 ZLIBINCLUDES = $(shell $(PKG_CONFIG_ENV) pkg-config --cflags zlib 2>/dev/null)
@@ -458,6 +464,10 @@ MYCFLAGS += -O3
 CFLAGS ?= $(DEFCFLAGS)
 CFLAGS += $(MYDEFS) $(MYCFLAGS) $(MYINCLUDES)
 
+ifdef EMSCRIPTEN
+    CFLAGS += -pthread
+endif
+
 # We cannot just use CFLAGS+=... because it has impact on sub-makes if CFLAGS is defined in env:
 PM3CFLAGS = $(CFLAGS)
 PM3CFLAGS += -I./src -I./include -I../include -I../common -I../common_fpga $(PM3INCLUDES) $(INCLUDES)
@@ -511,6 +521,10 @@ PM3CFLAGS += -DHAVE_SNPRINTF
 CXXFLAGS ?= $(DEFCXXFLAGS)
 CXXFLAGS += $(MYDEFS) $(MYCXXFLAGS) $(MYINCLUDES)
 
+ifdef EMSCRIPTEN
+    MYCXXFLAGS += -pthread
+endif
+
 PM3CXXFLAGS = $(CXXFLAGS)
 PM3CXXFLAGS += -I../include -I./include
 
@@ -533,11 +547,29 @@ LDFLAGS += $(MYLDFLAGS)
 
 PM3LDFLAGS = $(LDFLAGS)
 ifdef IS_IOS
+ifndef EMSCRIPTEN
     PM3LDFLAGS += -framework Foundation -framework UIKit
 endif
+endif
 ifdef IS_MACOS
+ifndef EMSCRIPTEN
     # M* macOS devices return arm
     PM3LDFLAGS += -framework Foundation -framework AppKit
+endif
+endif
+
+ifdef EMSCRIPTEN
+    PM3LDFLAGS += -pthread -sUSE_PTHREADS=1 -sPROXY_TO_PTHREAD=1
+    PM3LDFLAGS += -sSTACK_SIZE=1048576
+    PM3LDFLAGS += -sDEFAULT_PTHREAD_STACK_SIZE=1048576
+    PM3LDFLAGS += -sINITIAL_MEMORY=134217728
+    PM3LDFLAGS += -sALLOW_MEMORY_GROWTH=1
+    PM3LDFLAGS += -sMAXIMUM_MEMORY=536870912
+    PM3LDFLAGS += -sASYNCIFY -sASYNCIFY_STACK_SIZE=32768
+    PM3LDFLAGS += -sASSERTIONS=2 -sSAFE_HEAP=1 -sSTACK_OVERFLOW_CHECK=2
+    PM3LDFLAGS += -Wno-pthreads-mem-growth
+    PM3LDFLAGS += -sEXPORTED_FUNCTIONS=_main,_pm3_uart_rx_head_ptr,_pm3_uart_rx_tail_ptr,_pm3_uart_rx_buf_ptr,_pm3_uart_rx_initialized_ptr,_pm3_uart_tx_head_ptr,_pm3_uart_tx_tail_ptr,_pm3_uart_tx_buf_ptr,_pm3_uart_rb_capacity,_pm3_uart_stdin_head_ptr,_pm3_uart_stdin_tail_ptr,_pm3_uart_stdin_buf_ptr
+    PM3LDFLAGS += -sEXPORTED_RUNTIME_METHODS=ccall,cwrap,HEAPU8,HEAPU32,wasmMemory
 endif
 
 ###################
@@ -842,6 +874,11 @@ SRCS =  mifare/aiddesfire.c \
         wiegand_formats.c \
         wiegand_formatutils.c
 
+ifdef EMSCRIPTEN
+SRCS := $(filter-out cmdhfmfhard.c uart/uart_common.c uart/uart_posix.c uart/uart_win32.c,$(SRCS))
+SRCS += uart/uart_web.c
+endif
+
 # common
 SRCS += bucketsort.c \
         bruteforce.c \
@@ -884,7 +921,9 @@ endif
 
 # OS X & iOS
 ifdef IS_DARWIN
+ifndef EMSCRIPTEN
     OBJCSRCS = util_darwin.m
+endif
 endif
 
 OBJS = $(SRCS:%.c=$(OBJDIR)/%.o)
@@ -908,10 +947,16 @@ all: $(BINS)
 all-static: LDLIBS:=-static $(LDLIBS)
 all-static: $(BINS)
 
+ifdef EMSCRIPTEN
+proxmark3: $(OBJS) $(STATICLIBS) lualibs/pm3_cmd.lua lualibs/mfc_default_keys.lua
+	$(info [=] CXX $@.js)
+	$(Q)$(CXX) $(PM3CFLAGS) $(PM3LDFLAGS) $(OBJS) $(STATICLIBS) $(LDLIBS) -o $@.js
+else
 proxmark3: $(OBJS) $(STATICLIBS) lualibs/pm3_cmd.lua lualibs/mfc_default_keys.lua
 	$(info [=] CXX $@)
 #	$(Q)$(CXX) $(PM3LDFLAGS) $(OBJS) $(STATICLIBS) $(LDLIBS) -o $@
 	$(Q)$(CXX) $(PM3CFLAGS) $(PM3LDFLAGS) $(OBJS) $(STATICLIBS) $(LDLIBS) -o $@
+endif
 
 src/proxgui.cpp: src/ui/ui_overlays.h src/ui/ui_image.h
 
@@ -947,6 +992,7 @@ lualibs/mfc_default_keys.lua : mfc_default_keys.dic
 
 clean:
 	$(Q)$(RM) $(CLEAN)
+	$(Q)$(RM) proxmark3.js proxmark3.wasm
 	$(Q)$(RMDIR) $(OBJDIR)
 	$(Q)$(MAKE) --no-print-directory -C $(AMIIBOLIBPATH) clean
 	$(Q)$(MAKE) --no-print-directory -C $(CLIPARSERLIBPATH) clean
@@ -1053,9 +1099,11 @@ $(TINYCBORLIB): .FORCE
 	$(Q)$(MAKE) --no-print-directory -C $(TINYCBORLIBPATH) all
 
 $(WHEREAMILIB): .FORCE
+ifndef EMSCRIPTEN
 ifneq ($(WHEREAMI_FOUND),1)
 	$(info [*] MAKE $@)
 	$(Q)$(MAKE) --no-print-directory -C $(WHEREAMILIBPATH) all
+endif
 endif
 
 $(MQTTLIB): .FORCE

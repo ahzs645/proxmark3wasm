@@ -91,6 +91,10 @@ else
   DETECTED_COMPILER = gcc
 endif
 
+ifdef EMSCRIPTEN
+  AR= emar rcs
+  RANLIB= emranlib
+else
 ifdef IS_IOS
     # The platform is iOS
     USE_BREW ?= 0
@@ -108,6 +112,7 @@ ifdef IS_DARWIN
 else
   AR= ar rcs
   RANLIB= ranlib
+endif
 endif
 
 ifeq ($(USE_BREW),1)
@@ -155,8 +160,10 @@ ifeq ($(shell expr $(CC_VERSION) \>= 14), 1)
 endif
 
 ifdef IS_IOS
+ifndef EMSCRIPTEN
   # iOS will refuse to compile without the minimum target of iOS 11.0
   DEFCFLAGS += -mios-version-min=11.0
+endif
 endif
 ifdef IS_DARWIN
   # their readline has strict-prototype issues
@@ -182,19 +189,21 @@ ifneq ($(NOHARDENING),1)
     endif
   endif
 
-  ifndef IS_WINDOWS
-    ifndef IS_DARWIN
-      ifeq ($(ARCH),x86_64)
-        CFLAGS += -fcf-protection=full
+  ifndef EMSCRIPTEN
+    ifndef IS_WINDOWS
+      ifndef IS_DARWIN
+        ifeq ($(ARCH),x86_64)
+          CFLAGS += -fcf-protection=full
+        endif
+        DEFCFLAGS += -fPIC
+        DEFCXXFLAGS += -fPIC
+        DEFLDFLAGS += -Wl,-z,now -Wl,-z,relro -Wl,-z,noexecstack -pie
       endif
-      DEFCFLAGS += -fPIC
-      DEFCXXFLAGS += -fPIC
-      DEFLDFLAGS += -Wl,-z,now -Wl,-z,relro -Wl,-z,noexecstack -pie
     endif
-  endif
-  ifdef IS_DARWIN
-    DEFLDFLAGS += -Wl,-bind_at_load          # equivalent of -z,now
-    DEFLDFLAGS += -Wl,-pie                   # ASLR
+    ifdef IS_DARWIN
+      DEFLDFLAGS += -Wl,-bind_at_load          # equivalent of -z,now
+      DEFLDFLAGS += -Wl,-pie                   # ASLR
+    endif
   endif
   ifeq ($(DETECTED_COMPILER), gcc)
     DEFCFLAGS += -fstack-clash-protection

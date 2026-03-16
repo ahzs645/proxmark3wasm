@@ -41,6 +41,12 @@ LDFLAGS ?= $(DEFLDFLAGS)
 LDFLAGS += $(MYLDFLAGS)
 LDLIBS += $(MYLDLIBS)
 
+ifdef EMSCRIPTEN
+  CFLAGS   += -pthread
+  CXXFLAGS += -pthread
+  LDFLAGS  += -pthread
+endif
+
 vpath %.c $(MYSRCPATHS)
 
 # Flags to generate temporary dependency files

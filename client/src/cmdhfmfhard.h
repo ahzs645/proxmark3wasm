@@ -21,8 +21,34 @@
 
 #include "common.h"
 
+#ifdef __EMSCRIPTEN__
+#include "pm3_cmd.h"
+
+static inline int mfnestedhard(uint8_t blockNo, uint8_t keyType, uint8_t *key, uint8_t trgBlockNo, uint8_t trgKeyType, uint8_t *trgkey, bool nonce_file_read, bool nonce_file_write, bool slow, int tests, uint64_t *foundkey, char *filename) {
+    (void)blockNo;
+    (void)keyType;
+    (void)key;
+    (void)trgBlockNo;
+    (void)trgKeyType;
+    (void)trgkey;
+    (void)nonce_file_read;
+    (void)nonce_file_write;
+    (void)slow;
+    (void)tests;
+    (void)foundkey;
+    (void)filename;
+    return PM3_ENOTIMPL;
+}
+
+static inline void hardnested_print_progress(uint32_t nonces, const char *activity, float brute_force, uint64_t min_diff_print_time) {
+    (void)nonces;
+    (void)activity;
+    (void)brute_force;
+    (void)min_diff_print_time;
+}
+#else
 int mfnestedhard(uint8_t blockNo, uint8_t keyType, uint8_t *key, uint8_t trgBlockNo, uint8_t trgKeyType, uint8_t *trgkey, bool nonce_file_read, bool nonce_file_write, bool slow, int tests, uint64_t *foundkey, char *filename);
 void hardnested_print_progress(uint32_t nonces, const char *activity, float brute_force, uint64_t min_diff_print_time);
-
 #endif
 
+#endif
