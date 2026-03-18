@@ -568,7 +568,7 @@ ifdef EMSCRIPTEN
     PM3LDFLAGS += -sASYNCIFY -sASYNCIFY_STACK_SIZE=32768
     PM3LDFLAGS += -sASSERTIONS=2 -sSAFE_HEAP=1 -sSTACK_OVERFLOW_CHECK=2
     PM3LDFLAGS += -Wno-pthreads-mem-growth
-    PM3LDFLAGS += -sEXPORTED_FUNCTIONS=_main,_pm3_uart_rx_head_ptr,_pm3_uart_rx_tail_ptr,_pm3_uart_rx_buf_ptr,_pm3_uart_rx_initialized_ptr,_pm3_uart_tx_head_ptr,_pm3_uart_tx_tail_ptr,_pm3_uart_tx_buf_ptr,_pm3_uart_rb_capacity,_pm3_uart_stdin_head_ptr,_pm3_uart_stdin_tail_ptr,_pm3_uart_stdin_buf_ptr
+    PM3LDFLAGS += -sEXPORTED_FUNCTIONS=_main,_pm3_console,_pm3_grabbed_output_get,_pm3_get_current_dev,_pm3_web_exec,_pm3_web_exec_opts,_pm3_web_take_output,_pm3_uart_rx_head_ptr,_pm3_uart_rx_tail_ptr,_pm3_uart_rx_buf_ptr,_pm3_uart_rx_initialized_ptr,_pm3_uart_tx_head_ptr,_pm3_uart_tx_tail_ptr,_pm3_uart_tx_buf_ptr,_pm3_uart_rb_capacity,_pm3_uart_stdin_head_ptr,_pm3_uart_stdin_tail_ptr,_pm3_uart_stdin_buf_ptr
     PM3LDFLAGS += -sEXPORTED_RUNTIME_METHODS=ccall,cwrap,HEAPU8,HEAPU32,wasmMemory
 endif
 

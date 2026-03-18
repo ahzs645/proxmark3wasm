@@ -177,6 +177,10 @@ serial_port uart_open(const char *pcPortName, uint32_t speed, bool silent) {
     (void)pcPortName;
     (void)speed;
 
+    g_conn.send_via_local_ip = false;
+    g_conn.send_via_ip = PM3_NONE;
+    g_conn.uart_speed = speed;
+
     atomic_store(&g_uart_rx.head, 0);
     atomic_store(&g_uart_rx.tail, 0);
     atomic_store(&g_uart_tx.head, 0);
