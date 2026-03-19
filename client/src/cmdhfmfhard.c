@@ -30,8 +30,34 @@
 #include <locale.h>
 #include <math.h>
 #include <time.h> // MingW
+#ifdef __EMSCRIPTEN__
+// Provide minimal stubs for lz4/bz2 APIs that are not available in the
+// Emscripten build.  The compressed table paths will never succeed at
+// runtime because the .lz4/.bz2 files are not shipped, but the code
+// must still compile.
+typedef unsigned LZ4F_errorCode_t;
+typedef struct { int dummy; } *LZ4F_decompressionContext_t;
+#define LZ4F_VERSION 100
+static inline int LZ4F_isError(LZ4F_errorCode_t c) { (void)c; return 1; }
+static inline const char *LZ4F_getErrorName(LZ4F_errorCode_t c) { (void)c; return "lz4 not available"; }
+static inline LZ4F_errorCode_t LZ4F_createDecompressionContext(LZ4F_decompressionContext_t *ctx, unsigned ver) { (void)ctx; (void)ver; return 1; }
+static inline void LZ4F_freeDecompressionContext(LZ4F_decompressionContext_t ctx) { (void)ctx; }
+static inline LZ4F_errorCode_t LZ4F_decompress(LZ4F_decompressionContext_t ctx, void *dst, size_t *dstsz, const void *src, size_t *srcsz, void *opt) { (void)ctx; (void)dst; (void)dstsz; (void)src; (void)srcsz; (void)opt; return 1; }
+
+typedef struct {
+    char *next_in;  unsigned int avail_in;
+    char *next_out; unsigned int avail_out;
+    void *bzalloc; void *bzfree; void *opaque;
+} bz_stream;
+#define BZ_OK 0
+#define BZ_STREAM_END 4
+static inline int BZ2_bzDecompressInit(bz_stream *s, int v, int small) { (void)s; (void)v; (void)small; return -1; }
+static inline int BZ2_bzDecompress(bz_stream *s) { (void)s; return -1; }
+static inline int BZ2_bzDecompressEnd(bz_stream *s) { (void)s; return -1; }
+#else
 #include <lz4frame.h>
 #include <bzlib.h>
+#endif
 
 #include "commonutil.h"  // ARRAYLEN
 #include "comms.h"

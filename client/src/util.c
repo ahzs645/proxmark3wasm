@@ -1362,7 +1362,15 @@ int num_CPUs(void) {
 
 // determine number of logical CPU cores (use for multithreaded functions)
 int detect_num_CPUs(void) {
-#if defined(_WIN32)
+#if defined(__EMSCRIPTEN__)
+    // Emscripten pthreads use Web Workers. Cap to a reasonable number
+    // to avoid spawning excessive workers in the browser/Node environment.
+    int count = sysconf(_SC_NPROCESSORS_ONLN);
+    if (count <= 0) {
+        count = 1;
+    }
+    return (count > 4) ? 4 : count;
+#elif defined(_WIN32)
 #include <sysinfoapi.h>
     SYSTEM_INFO sysinfo;
     GetSystemInfo(&sysinfo);

@@ -4,7 +4,11 @@ MYCFLAGS =
 MYDEFS =
 MYSRCS = hardnested_bruteforce.c
 
+ifdef EMSCRIPTEN
+cpu_arch = wasm
+else
 cpu_arch = $(shell uname -m)
+endif
 
 IS_SIMD_ARCH =
 ifneq ($(findstring 86, $(cpu_arch)), )
