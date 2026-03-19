@@ -1122,13 +1122,6 @@ Plot::Plot(QWidget *parent) : QWidget(parent), g_GraphPixelsPerPoint(1) {
     setPalette(palette);
     setAutoFillBackground(true);
 
-    g_MarkerA.pos = 0;
-    g_MarkerB.pos = 0;
-    g_MarkerC.pos = 0;
-    g_MarkerD.pos = 0;
-    g_GraphStart = 0;
-    g_GraphStop = 0;
-
     setWindowTitle(tr("Sliders"));
     master = parent;
 }
@@ -1289,7 +1282,11 @@ void Plot::wheelEvent(QWheelEvent *event) {
 }
 
 void Plot::mouseMoveEvent(QMouseEvent *event) {
+#if QT_VERSION >= 0x060000
+    int x = (int)event->position().x();
+#else
     int x = event->x();
+#endif
 
     //Only run the marker place code if a mouse button is pressed
     if ((event->buttons() & Qt::LeftButton) || (event->buttons() & Qt::RightButton)) {

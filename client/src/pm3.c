@@ -20,6 +20,12 @@
 
 #include <stdlib.h>
 
+#ifdef EMSCRIPTEN
+#include <emscripten/emscripten.h>
+#else
+#define EMSCRIPTEN_KEEPALIVE
+#endif
+
 #include "proxmark3.h"
 #include "cmdmain.h"
 #include "ui.h"
@@ -91,4 +97,16 @@ const char *pm3_grabbed_output_get(pm3_device_t *dev) {
 
 pm3_device_t *pm3_get_current_dev(void) {
     return g_session.current_device;
+}
+
+EMSCRIPTEN_KEEPALIVE int pm3_web_exec(const char *cmd) {
+    return pm3_console(pm3_get_current_dev(), cmd, false, false);
+}
+
+EMSCRIPTEN_KEEPALIVE int pm3_web_exec_opts(const char *cmd, int capture, int quiet) {
+    return pm3_console(pm3_get_current_dev(), cmd, capture != 0, quiet != 0);
+}
+
+EMSCRIPTEN_KEEPALIVE const char *pm3_web_take_output(void) {
+    return pm3_grabbed_output_get(pm3_get_current_dev());
 }

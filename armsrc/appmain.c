@@ -45,6 +45,7 @@
 #include "em4x50.h"
 #include "em4x70.h"
 #include "iclass.h"
+#include "seos.h"
 #include "legicrfsim.h"
 //#include "cryptorfsim.h"
 #include "epa.h"
@@ -100,19 +101,19 @@ uint8_t g_tearoff_skip = 0;
 int tearoff_hook(void) {
     if (g_tearoff_enabled) {
         if (g_tearoff_delay_us == 0) {
-            Dbprintf(_RED_("No tear-off delay configured!"));
+            if (g_dbglevel >= DBG_ERROR) Dbprintf(_RED_("No tear-off delay configured!"));
             g_tearoff_enabled = false;
             return PM3_SUCCESS; // SUCCESS = the hook didn't do anything
         }
         if (g_tearoff_skip > 0) {
-            Dbprintf(_GREEN_("Tear-off skipped!"));
+            if (g_dbglevel >= DBG_INFO) Dbprintf(_GREEN_("Tear-off skipped!"));
             g_tearoff_skip--;
             return PM3_SUCCESS; // SUCCESS = the hook didn't do anything
         }
         SpinDelayUsPrecision(g_tearoff_delay_us);
         FpgaWriteConfWord(FPGA_MAJOR_MODE_OFF);
         g_tearoff_enabled = false;
-        if (g_dbglevel >= DBG_ERROR) Dbprintf(_YELLOW_("Tear-off triggered!"));
+        if (g_dbglevel >= DBG_INFO) Dbprintf(_YELLOW_("Tear-off triggered!"));
         return PM3_ETEAROFF;
     } else {
         return PM3_SUCCESS;     // SUCCESS = the hook didn't do anything
@@ -257,6 +258,86 @@ static uint16_t MeasureAntennaTuningHfData(void) {
 // Measure LF in milliVolt
 static uint32_t MeasureAntennaTuningLfData(void) {
     return (MAX_ADC_LF_VOLTAGE * (SumAdc(ADC_CHAN_LF, 32) >> 1)) >> 14;
+}
+
+// Measure HF antenna decay after field-off.
+// Captures peak-detect capacitor discharge curve via burst ADC sampling.
+static void MeasureAntennaTuningHfDecay(const hf_decay_params_t *params) {
+
+    // Parse parameters with defaults
+    uint16_t stabilize_ms = params->stabilize_ms;
+    uint16_t measure_us = params->measure_us;
+
+    if (stabilize_ms == 0) stabilize_ms = 50;
+    if (measure_us == 0) measure_us = 2000;
+
+    // Response: 8-byte header + up to 252 uint16_t samples = 512 bytes max
+    hf_decay_response_t payload;
+    memset(&payload, 0, sizeof(payload));
+
+    LED_B_ON();
+
+    // Drive HF field and wait for stabilization
+    FpgaDownloadAndGo(FPGA_BITSTREAM_HF);
+    FpgaWriteConfWord(FPGA_MAJOR_MODE_HF_READER);
+    SpinDelay(stabilize_ms);
+
+    // Baseline measurement (averaged)
+    payload.baseline_mv = (MAX_ADC_HF_VOLTAGE * SumAdc(ADC_CHAN_HF, 32)) >> 15;
+
+    // Configure ADC for fast burst mode.
+    // Faster ADC clock + shorter S&H trades absolute accuracy for speed.
+    // Source impedance is ~0.91 MOhm (voltage divider), ADC input cap 12pF,
+    // RC = 10.9us. At SHTIM=3 / ADC_CLK=3MHz, S&H = 1.33us reads ~11.5%
+    // of true voltage. This is fine for relative decay shape measurement.
+    AT91C_BASE_ADC->ADC_CR = AT91C_ADC_SWRST;
+    AT91C_BASE_ADC->ADC_MR =
+        ADC_MODE_PRESCALE(7)               // ADC_CLK = MCK / 16 = 3 MHz
+        | ADC_MODE_STARTUP_TIME(8)          // (8+1)*8 / 3MHz = 24us (> 20us min)
+        | ADC_MODE_SAMPLE_HOLD_TIME(3);     // (3+1) / 3MHz = 1.33us S&H
+    AT91C_BASE_ADC->ADC_CHER = ADC_CHANNEL(ADC_CHAN_HF);
+
+    // Start precise timer (1 tick = MCK/32 = 0.667us)
+    StartTicks();
+
+    // Field OFF — start decay measurement
+    FpgaWriteConfWord(FPGA_MAJOR_MODE_OFF);
+
+    uint32_t start_ticks = GetTicks();
+    uint16_t idx = 0;
+    // Convert us to ticks: 1us = 1.5 ticks
+    uint32_t measure_ticks = (measure_us * 3) / 2;
+
+    // Trigger first conversion
+    AT91C_BASE_ADC->ADC_CR = AT91C_ADC_START;
+
+    while (idx < 252) {
+        if (AT91C_BASE_ADC->ADC_SR & ADC_END_OF_CONVERSION(ADC_CHAN_HF)) {
+            uint16_t raw = AT91C_BASE_ADC->ADC_CDR[ADC_CHAN_HF] & 0x3FF;
+            payload.samples_mv[idx] = (MAX_ADC_HF_VOLTAGE * raw) >> 10;
+            idx++;
+
+            if (GetTicksDelta(start_ticks) >= measure_ticks)
+                break;
+
+            // Trigger next conversion
+            AT91C_BASE_ADC->ADC_CR = AT91C_ADC_START;
+        }
+    }
+
+    uint32_t elapsed_ticks = GetTicksDelta(start_ticks);
+    payload.num_samples = idx;
+    payload.measure_window_us = (elapsed_ticks * 2) / 3;
+    payload.sample_interval_us = (idx > 1) ? payload.measure_window_us / (idx - 1) : 0;
+
+    FpgaWriteConfWord(FPGA_MAJOR_MODE_OFF);
+    StopTicks();
+
+    uint16_t response_size = 8 + (idx * sizeof(uint16_t));
+    reply_ng(CMD_HF_DECAY, PM3_SUCCESS,
+             (uint8_t *)&payload, response_size);
+
+    LEDsoff();
 }
 
 void print_stack_usage(void) {
@@ -421,6 +502,9 @@ static void SendStatus(uint32_t wait) {
 #endif
 #ifdef WITH_ISO14443a
     printHf14aConfig();   // HF 14a config
+#endif
+#ifdef WITH_ISO14443b
+    printHf14bConfig();   // HF 14b config
 #endif
     printConnSpeed(wait);
     DbpString(_CYAN_("Various"));
@@ -626,6 +710,11 @@ static void SendCapabilities(void) {
     capabilities.compiled_with_iclass = true;
 #else
     capabilities.compiled_with_iclass = false;
+#endif
+#ifdef WITH_SEOS
+    capabilities.compiled_with_seos = true;
+#else
+    capabilities.compiled_with_seos = false;
 #endif
 #ifdef WITH_NFCBARCODE
     capabilities.compiled_with_nfcbarcode = true;
@@ -1640,6 +1729,25 @@ static void PacketReceived(PacketCommandNG *packet) {
             SendRawCommand14443B(payload);
             break;
         }
+        case CMD_HF_ISO14443B_PRINT_CONFIG: {
+            printHf14bConfig();
+            break;
+        }
+        case CMD_HF_ISO14443B_GET_CONFIG: {
+            hf14b_config_t *c = getHf14bConfig();
+            reply_ng(CMD_HF_ISO14443B_GET_CONFIG, PM3_SUCCESS, (uint8_t *)c, sizeof(hf14b_config_t));
+            break;
+        }
+        case CMD_HF_ISO14443B_SET_CONFIG: {
+            hf14b_config_t c;
+            memcpy(&c, packet->data.asBytes, sizeof(hf14b_config_t));
+            setHf14bConfig(&c);
+            break;
+        }
+        case CMD_HF_ISO14443B_ST25TB_TEAROFF: {
+            ST25TB_TearOff(packet->data.asBytes);
+            break;
+        }
         case CMD_HF_CRYPTORF_SIM : {
 //            simulate_crf_tag();
             break;
@@ -1755,13 +1863,17 @@ static void PacketReceived(PacketCommandNG *packet) {
                 uint8_t uid[10];
                 uint8_t exitAfter;
                 uint8_t rats[20];
-                bool ulauth_z1;
-                bool ulauth_z2;
+                uint8_t ulauth_1a1_len;
+                uint8_t ulauth_1a2_len;
+                uint8_t ulauth_1a1[16];
+                uint8_t ulauth_1a2[16];
             } PACKED;
             struct p *payload = (struct p *) packet->data.asBytes;
-            SimulateIso14443aTag(payload->tagtype, payload->flags, payload->uid,
-                                 payload->exitAfter, payload->rats, sizeof(payload->rats),
-                                 payload->ulauth_z1, payload->ulauth_z2);  // ## Simulate iso14443a tag - pass tag type & UID
+            SimulateIso14443aTagEx(payload->tagtype, payload->flags, payload->uid,
+                                   payload->exitAfter, payload->rats, sizeof(payload->rats),
+                                   payload->ulauth_1a1, payload->ulauth_1a1_len,
+                                   payload->ulauth_1a2, payload->ulauth_1a2_len
+                                  );  // ## Simulate iso14443a tag - pass tag type & UID
             break;
         }
         case CMD_HF_ISO14443A_SIM_AID: {
@@ -1836,12 +1948,12 @@ static void PacketReceived(PacketCommandNG *packet) {
             MifareUReadBlock((mful_readblock_t *)packet->data.asBytes);
             break;
         }
-        case CMD_HF_MIFAREUC_AUTH: {
-            MifareUC_Auth(packet->oldarg[0], packet->data.asBytes);
+        case CMD_HF_MIFAREU3P_AUTH: {
+            MifareU3PassAuth((mful_3passauth_t *)packet->data.asBytes);
             break;
         }
-        case CMD_HF_MIFAREULAES_AUTH: {
-            MifareUL_AES_Auth((mfulaes_keys_t *)packet->data.asBytes);
+        case CMD_HF_MIFAREU3P_CHKKEY: {
+            MifareU3PassChkKeys((mful_3passchk_t *)packet->data.asBytes);
             break;
         }
         case CMD_HF_MIFAREU_READCARD: {
@@ -1849,7 +1961,7 @@ static void PacketReceived(PacketCommandNG *packet) {
             break;
         }
         case CMD_HF_MIFAREU_SETKEY: {
-            MifareUSetKey(packet->oldarg[0], packet->data.asBytes);
+            MifareUSetKey((mful_setkey_t *)packet->data.asBytes);
             break;
         }
         case CMD_HF_MIFARE_READSC: {
@@ -1921,10 +2033,11 @@ static void PacketReceived(PacketCommandNG *packet) {
                 uint8_t keytype;
                 uint8_t target_block;
                 uint8_t target_keytype;
+                uint8_t force_detect_dist;
                 uint8_t key[6];
             } PACKED;
             struct p *payload = (struct p *) packet->data.asBytes;
-            MifareStaticNested(payload->block, payload->keytype, payload->target_block, payload->target_keytype, payload->key);
+            MifareStaticNested(payload->block, payload->keytype, payload->target_block, payload->target_keytype, payload->key, payload->force_detect_dist);
             break;
         }
         case CMD_HF_MIFARE_CHKKEYS: {
@@ -2263,6 +2376,12 @@ static void PacketReceived(PacketCommandNG *packet) {
             break;
         }
 #endif
+#ifdef WITH_SEOS
+        case CMD_HF_SEOS_SIMULATE: {
+            SimulateSeos((seos_emulate_req_t *)packet->data.asBytes);
+            break;
+        }
+#endif
 
 #ifdef WITH_HFSNIFF
         case CMD_HF_SNIFF: {
@@ -2516,6 +2635,10 @@ static void PacketReceived(PacketCommandNG *packet) {
                     reply_ng(CMD_MEASURE_ANTENNA_TUNING_HF, PM3_EINVARG, NULL, 0);
                     break;
             }
+            break;
+        }
+        case CMD_HF_DECAY: {
+            MeasureAntennaTuningHfDecay((const hf_decay_params_t *)packet->data.asBytes);
             break;
         }
         case CMD_MEASURE_ANTENNA_TUNING_LF: {

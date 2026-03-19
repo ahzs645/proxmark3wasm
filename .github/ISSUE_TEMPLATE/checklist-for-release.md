@@ -17,6 +17,7 @@ assignees: doegox, iceman1001
 - [ ] `tools/build_all_firmwares.sh` check that the script contains all standalone modes then compile all standalone modes (linux only)
 - [ ] `experimental_lib` compilation & tests
 - [ ] `experimental_client_with_swig` compilation & tests
+- [ ] `make hitag2crack && tools/pm3_tests.sh hitag2crack --long --opencl`
 - [ ] GitHub Actions - green across the board ( MacOS, Ubuntu, Windows)
 
 # OS compilation and tests
@@ -29,6 +30,8 @@ Run `tools/release_tests.sh` on:
 - via Docker
   - [ ] Archlinux
   - [ ] Debian Stable
+  - [ ] Debian Stable arm64
+  - [ ] Debian Stable armhf
   - [ ] Debian Testing
   - [ ] Fedora 42 (till 2026-05-13)
   - [ ] Fedora 43 (till 2026-12-02)
@@ -37,8 +40,8 @@ Run `tools/release_tests.sh` on:
   - [ ] OpenSuse Tumbleweed
   - [ ] ParrotOS
   - [ ] Ubuntu 24.04 (LTS)
-  - [ ] Ubuntu 24.10
   - [ ] Ubuntu 25.04
+  - [ ] Ubuntu 25.10
 - [ ] OSX (MacPorts)
 - [ ] OSX (Homebrew)
 - [ ] Termux

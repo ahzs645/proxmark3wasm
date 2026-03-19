@@ -110,6 +110,8 @@ uint16_t mifare_sendcmd(uint8_t cmd, uint8_t *data, uint8_t data_size, uint8_t *
 uint16_t mifare_sendcmd_schann(uint8_t *data, uint8_t data_size, uint8_t *answer, uint16_t answer_len, uint8_t *answer_parity, uint32_t *timing) {
 
     uint8_t dcmd[data_size + 2];
+    memset(dcmd, 0, sizeof(dcmd));
+
     if (data_size > 0) {
         memcpy(dcmd, data, data_size);
     }
@@ -380,12 +382,11 @@ int mifare_ul_ev1_auth(uint8_t *keybytes, uint8_t *pack) {
     return 1;
 }
 
-int mifare_ultra_auth(uint8_t *keybytes) {
+int mifare_ultra_3des_auth(uint8_t *keybytes, bool check_answer) {
 
     /// 3des2k
-    uint8_t random_a[8] = {1, 1, 1, 1, 1, 1, 1, 1};
+    uint8_t random_a[8] = {1, 1, 1, 1, 1, 1, 1, 2};
     uint8_t random_b[8] = {0x00};
-    uint8_t enc_random_b[8] = {0x00};
     uint8_t rnd_ab[16] = {0x00};
     uint8_t IV[8] = {0x00};
     uint8_t key[16] = {0x00};
@@ -398,77 +399,71 @@ int mifare_ultra_auth(uint8_t *keybytes) {
     // REQUEST AUTHENTICATION
     len = mifare_sendcmd_short(NULL, CRYPT_NONE, MIFARE_ULC_AUTH_1, 0x00, resp, sizeof(resp), respPar, NULL);
     if (len != 11) {
-        if (g_dbglevel >= DBG_ERROR) Dbprintf("Cmd Error: %02x", resp[0]);
+        if (g_dbglevel >= DBG_ERROR) Dbprintf("Cmd Error: %02x - expected 11 got " _RED_("%u"), resp[0], len);
         return 0;
     }
 
-    // tag nonce.
-    memcpy(enc_random_b, resp + 1, 8);
-
     // decrypt nonce.
-    tdes_nxp_receive((void *)enc_random_b, (void *)random_b, sizeof(random_b), (const void *)key, IV, 2);
+    tdes_nxp_receive((void *)(resp + 1), (void *)random_b, sizeof(random_b), (const void *)key, IV, 2);
     rol(random_b, 8);
     memcpy(rnd_ab, random_a, 8);
     memcpy(rnd_ab + 8, random_b, 8);
 
     if (g_dbglevel >= DBG_EXTENDED) {
-        Dbprintf("enc_B: %02x %02x %02x %02x %02x %02x %02x %02x",
-                 enc_random_b[0], enc_random_b[1], enc_random_b[2], enc_random_b[3], enc_random_b[4], enc_random_b[5], enc_random_b[6], enc_random_b[7]);
+        Dbprintf("enc_B:");
+        Dbhexdump(8, resp + 1, false);
 
-        Dbprintf("    B: %02x %02x %02x %02x %02x %02x %02x %02x",
-                 random_b[0], random_b[1], random_b[2], random_b[3], random_b[4], random_b[5], random_b[6], random_b[7]);
+        Dbprintf("B:");
+        Dbhexdump(8, random_b, false);
 
-        Dbprintf("rnd_ab: %02x %02x %02x %02x %02x %02x %02x %02x",
-                 rnd_ab[0], rnd_ab[1], rnd_ab[2], rnd_ab[3], rnd_ab[4], rnd_ab[5], rnd_ab[6], rnd_ab[7]);
-
-        Dbprintf("rnd_ab: %02x %02x %02x %02x %02x %02x %02x %02x",
-                 rnd_ab[8], rnd_ab[9], rnd_ab[10], rnd_ab[11], rnd_ab[12], rnd_ab[13], rnd_ab[14], rnd_ab[15]);
+        Dbprintf("rnd_ab:");
+        Dbhexdump(16, rnd_ab, false);
     }
 
-    // encrypt    out, in, length, key, iv
-    tdes_nxp_send(rnd_ab, rnd_ab, sizeof(rnd_ab), key, enc_random_b, 2);
+    // reuse rnd_ab as enc_rnd_ab
+    if (check_answer) {
+        tdes_nxp_send((void *)rnd_ab, (void *)rnd_ab, sizeof(rnd_ab), (const void *)key, resp + 1, 2);
+    } else {
+        tdes_nxp_send((void *)(rnd_ab + sizeof(random_a)), (void *)(rnd_ab + sizeof(random_a)), sizeof(random_b), (const void *)key, rnd_ab, 2);
+        // tdes_nxp_send destroys IV, let's restore it
+        memcpy(rnd_ab, random_a, 8);
+    }
 
     len = mifare_sendcmd(MIFARE_ULC_AUTH_2, rnd_ab, sizeof(rnd_ab), resp, sizeof(resp), respPar, NULL);
+    if ((!check_answer) && (len == 11)) {
+        return 1;
+    }
     if (len != 11) {
-        if (g_dbglevel >= DBG_ERROR) Dbprintf("Cmd Error: %02x", resp[0]);
+        if (g_dbglevel >= DBG_INFO) Dbprintf("Cmd Error: %02x - expected 11 got " _RED_("%u"), resp[0], len);
         return 0;
     }
 
-    uint8_t enc_resp[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };
-    uint8_t resp_random_a[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };
-    memcpy(enc_resp, resp + 1, 8);
-
+    // reuse random_b as resp_random_a
     // decrypt    out, in, length, key, iv
-    tdes_nxp_receive(enc_resp, resp_random_a, 8, key, enc_random_b, 2);
-    if (memcmp(resp_random_a, random_a, 8) != 0) {
+    tdes_nxp_receive(resp + 1, random_b, 8, key, rnd_ab + 8, 2);
+    if (g_dbglevel >= DBG_EXTENDED) {
+        Dbprintf("e_AB:");
+        Dbhexdump(16, rnd_ab, false);
+
+        Dbprintf("A sent:");
+        Dbhexdump(8, random_a, false);
+
+        Dbprintf("A' recv:");
+        Dbhexdump(8, random_b, false);
+    }
+    rol(random_a, 8);
+    if (memcmp(random_b, random_a, 8) != 0) {
         if (g_dbglevel >= DBG_ERROR) Dbprintf("failed authentication");
         return 0;
     }
 
-    if (g_dbglevel >= DBG_EXTENDED) {
-        Dbprintf("e_AB: %02x %02x %02x %02x %02x %02x %02x %02x",
-                 rnd_ab[0], rnd_ab[1], rnd_ab[2], rnd_ab[3],
-                 rnd_ab[4], rnd_ab[5], rnd_ab[6], rnd_ab[7]);
-
-        Dbprintf("e_AB: %02x %02x %02x %02x %02x %02x %02x %02x",
-                 rnd_ab[8], rnd_ab[9], rnd_ab[10], rnd_ab[11],
-                 rnd_ab[12], rnd_ab[13], rnd_ab[14], rnd_ab[15]);
-
-        Dbprintf("a: %02x %02x %02x %02x %02x %02x %02x %02x",
-                 random_a[0], random_a[1], random_a[2], random_a[3],
-                 random_a[4], random_a[5], random_a[6], random_a[7]);
-
-        Dbprintf("b: %02x %02x %02x %02x %02x %02x %02x %02x",
-                 resp_random_a[0], resp_random_a[1], resp_random_a[2], resp_random_a[3],
-                 resp_random_a[4], resp_random_a[5], resp_random_a[6], resp_random_a[7]);
-    }
     return 1;
 }
 
-int mifare_ultra_aes_auth(uint8_t keyno, uint8_t *keybytes, bool schann) {
+int mifare_ultra_aes_auth(uint8_t keyno, uint8_t *keybytes, bool schann, bool check_answer) {
 
     /// aes-128
-    uint8_t random_a[16] = {1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1};
+    uint8_t random_a[16] = {1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 2};
     uint8_t random_b[16] = { 0x00 };
     uint8_t rnd_ab[32] = { 0x00 };
     uint8_t enc_rnd_ab[32] = { 0x00 };
@@ -513,12 +508,20 @@ int mifare_ultra_aes_auth(uint8_t keyno, uint8_t *keybytes, bool schann) {
     }
 
     // encrypt reader response
-    memset(IV, 0, 16);
     mbedtls_aes_setkey_enc(&actx, key, 128);
-    mbedtls_aes_crypt_cbc(&actx, MBEDTLS_AES_ENCRYPT, sizeof(enc_rnd_ab), IV, rnd_ab, enc_rnd_ab);
+    if (check_answer) {
+        memset(IV, 0, 16);
+        mbedtls_aes_crypt_cbc(&actx, MBEDTLS_AES_ENCRYPT, sizeof(rnd_ab), IV, rnd_ab, enc_rnd_ab);
+    } else {
+        memcpy(enc_rnd_ab, rnd_ab, sizeof(rnd_ab));
+        mbedtls_aes_crypt_cbc(&actx, MBEDTLS_AES_ENCRYPT, sizeof(random_b), rnd_ab, rnd_ab + sizeof(random_a), enc_rnd_ab + sizeof(random_a));
+    }
 
     // send & receive
     len = mifare_sendcmd(MIFARE_ULAES_AUTH_2, enc_rnd_ab, sizeof(enc_rnd_ab), resp, sizeof(resp), respPar, NULL);
+    if ((! check_answer) && (len == 19)) {
+        return 1;
+    }
     if (len != 19) {
         if (g_dbglevel >= DBG_INFO) {
             Dbprintf("Cmd Error: %02x - expected 19 got " _RED_("%u"), resp[0], len);
@@ -531,7 +534,17 @@ int mifare_ultra_aes_auth(uint8_t keyno, uint8_t *keybytes, bool schann) {
     uint8_t rec_rnd_a[16] = {0};
     mbedtls_aes_crypt_cbc(&actx, MBEDTLS_AES_DECRYPT, sizeof(rec_rnd_a), IV, resp + 1, rec_rnd_a);
     mbedtls_aes_free(&actx);
+    if (g_dbglevel >= DBG_EXTENDED) {
+        Dbprintf("e_AB:");
+        Dbhexdump(32, rnd_ab, false);
 
+        Dbprintf("A sent:");
+        Dbhexdump(16, random_a, false);
+
+        Dbprintf("A' recv:");
+        Dbhexdump(16, rec_rnd_a, false);
+    }
+    rol(random_a, 16);
     if (memcmp(rec_rnd_a, random_a, 16) != 0) {
         if (g_dbglevel >= DBG_INFO) {
             Dbprintf("failed authentication");
@@ -544,7 +557,7 @@ int mifare_ultra_aes_auth(uint8_t keyno, uint8_t *keybytes, bool schann) {
         return 1;
     }
 
-    // Session key calculation setion
+    // Session key calculation section
 
     // clear global session variable
     init_secure_session();
@@ -555,7 +568,8 @@ int mifare_ultra_aes_auth(uint8_t keyno, uint8_t *keybytes, bool schann) {
     uint8_t *ra = random_a;
     uint8_t *rb = random_b;
 
-    // do we need to unroll it?
+    // we need to unroll randoms
+    ror(ra, 16);
     ror(rb, 16);
 
     uint8_t session_vec[] = {
@@ -583,59 +597,53 @@ static int mifare_ultra_readblockEx(uint8_t blockNo, uint8_t *blockData) {
     uint8_t receivedAnswer[MAX_FRAME_SIZE] = {0x00};
     uint8_t receivedAnswerPar[MAX_PARITY_SIZE] = {0x00};
     uint16_t len = 0;
-    uint8_t offset = 0;
 
-    ulaes_key_t *sobj = get_secure_session_obj();
-
-    if (sobj->use_schann) {
-        offset = 8;
-        uint8_t mac[16] = {0};
-        // counter 2b, cmd, arg,  8byte cmac, 2b crc
-        uint8_t cmd_mac[2 + 2 + 8] = {
-            sobj->counter & 0xFF,
-            (sobj->counter >> 8) & 0xFF,
-            ISO14443A_CMD_READBLOCK, blockNo
-        };
-        ulaes_cmac(sobj->sessionkey, sizeof(sobj->sessionkey), cmd_mac, 4, mac);
-        ulaes_cmac8(mac, cmd_mac + 4);
-
-        increase_session_counter();
-
-        len = mifare_sendcmd_schann(cmd_mac + 2, sizeof(cmd_mac) - 2, receivedAnswer, sizeof(receivedAnswer), receivedAnswerPar, NULL);
+    if (get_session_channel()) {
+        uint8_t cmd[2 + ULAES_CMAC8_SIZE] = { ISO14443A_CMD_READBLOCK, blockNo };
+        append_cmac(cmd, 2);
+        len = mifare_sendcmd_schann(cmd, sizeof(cmd), receivedAnswer, sizeof(receivedAnswer), receivedAnswerPar, NULL);
+        if (len != 16 + ULAES_CMAC8_SIZE + 2) {
+            if (len == 1) {
+                if (g_dbglevel >= DBG_ERROR) {
+                    Dbprintf("Cmd Error: %02x", receivedAnswer[0]);
+                }
+                return PM3_ECARDEXCHANGE;
+            } else {
+                if (g_dbglevel >= DBG_ERROR) {
+                    Dbprintf("Cmd Error: card timeout. len: %x", len);
+                }
+                return PM3_ETIMEOUT;
+            }
+        }
+        int ret = verify_cmac(receivedAnswer, 16, true);
+        if (ret != PM3_SUCCESS) {
+            return ret;
+        }
     } else {
         len = mifare_sendcmd_short(NULL, CRYPT_NONE, ISO14443A_CMD_READBLOCK, blockNo, receivedAnswer, sizeof(receivedAnswer), receivedAnswerPar, NULL);
-    }
-
-    if (len == 1) {
-        if (g_dbglevel >= DBG_ERROR) {
-            Dbprintf("Cmd Error: %02x", receivedAnswer[0]);
+        if (len != 16 + 2) {
+            if (len == 1) {
+                if (g_dbglevel >= DBG_ERROR) {
+                    Dbprintf("Cmd Error: %02x", receivedAnswer[0]);
+                }
+                return PM3_ECARDEXCHANGE;
+            } else {
+                if (g_dbglevel >= DBG_ERROR) {
+                    Dbprintf("Cmd Error: card timeout. len: %x", len);
+                }
+                return PM3_ETIMEOUT;
+            }
         }
-        return PM3_ECARDEXCHANGE;
-    }
-
-    // Ev1 / Ul-C == 18 bytes response
-    // UL-Aes in secure messaging == 26
-    if (len != 18 + offset) {
-        if (g_dbglevel >= DBG_ERROR) {
-            Dbprintf("Cmd Error: card timeout. len: %x", len);
+        uint8_t bt[2] = {0x00, 0x00};
+        memcpy(bt, receivedAnswer + 16, 2);
+        AddCrc14A(receivedAnswer, 16);
+        if (bt[0] != receivedAnswer[16] || bt[1] != receivedAnswer[17]) {
+            if (g_dbglevel >= DBG_ERROR) {
+                Dbprintf("Cmd CRC response error.");
+                return PM3_ECRC;
+            }
         }
-        return PM3_ETIMEOUT;
     }
-
-    uint8_t bt[2] = {0x00, 0x00};
-    memcpy(bt, receivedAnswer + 16 + offset, 2);
-    AddCrc14A(receivedAnswer, 16 + offset);
-    if (bt[0] != receivedAnswer[16 + offset] || bt[1] != receivedAnswer[17 + offset]) {
-        if (g_dbglevel >= DBG_ERROR) {
-            Dbprintf("Cmd CRC response error.");
-        }
-        return PM3_ECRC;
-    }
-
-    // we are skipping verifying the cmac since we don't care.
-
-    // increase counter for the read response
-    increase_session_counter();
 
     memcpy(blockData, receivedAnswer, 16);
     return PM3_SUCCESS;
@@ -821,37 +829,21 @@ int mifare_ultra_writeblock(uint8_t blockNo, uint8_t *blockData) {
     uint8_t receivedAnswerPar[MAX_MIFARE_PARITY_SIZE] = {0x00};
     uint16_t len = 0;
 
-    ulaes_key_t *sobj = get_secure_session_obj();
-
-    if (sobj->use_schann) {
-
-        uint8_t mac[16] = {0};
-        uint8_t cmd_mac[2 + 1 + 1 + 4 + 8] = {
-            sobj->counter & 0xFF,
-            (sobj->counter >> 8) & 0xFF,
-            MIFARE_ULC_WRITE,
-            blockNo
-        };
-        memcpy(cmd_mac + 4, blockData, 4);
-
-        ulaes_cmac(sobj->sessionkey, sizeof(sobj->sessionkey), cmd_mac, 8, mac);
-        ulaes_cmac8(mac, cmd_mac + 8);
-
-        increase_session_counter();
-
-        len = mifare_sendcmd_schann(cmd_mac + 2, sizeof(cmd_mac) - 2, receivedAnswer, sizeof(receivedAnswer), receivedAnswerPar, NULL);
-
-        // we are skipping verifying the cmac,  since we don't care.
-        // increase counter for the write response
-        increase_session_counter();
-
-        if (len != 10) {
+    if (get_session_channel()) {
+        uint8_t cmd[2 + 4 + ULAES_CMAC8_SIZE] = { MIFARE_ULC_WRITE, blockNo };
+        memcpy(cmd + 2, blockData, 4);
+        append_cmac(cmd, 2 + 4);
+        len = mifare_sendcmd_schann(cmd, sizeof(cmd), receivedAnswer, sizeof(receivedAnswer), receivedAnswerPar, NULL);
+        if (len != ULAES_CMAC8_SIZE + 2) {
             if (g_dbglevel >= DBG_INFO) {
                 Dbprintf("Cmd Send Error: " _RED_("%d"), len);
             }
             return PM3_EFAILED;
         }
-
+        int ret = verify_cmac(receivedAnswer, 0, true);
+        if (ret != PM3_SUCCESS) {
+            return ret;
+        }
     } else {
 
         // command MIFARE_CLASSIC_WRITEBLOCK

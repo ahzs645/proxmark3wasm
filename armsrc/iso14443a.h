@@ -142,8 +142,12 @@ RAMFUNC bool MillerDecoding(uint8_t bit, uint32_t non_real_time);
 RAMFUNC int ManchesterDecoding(uint8_t bit, uint16_t offset, uint32_t non_real_time);
 
 void RAMFUNC SniffIso14443a(uint8_t param);
-void SimulateIso14443aTag(uint8_t tagType, uint16_t flags, uint8_t *useruid, uint8_t exitAfterNReads,
-                          uint8_t *ats, size_t ats_len, bool ulauth_z1, bool ulauth_z2);
+void SimulateIso14443aTag(uint8_t tagType, uint16_t flags, uint8_t *useruid, uint8_t exitAfterNReads);
+
+void SimulateIso14443aTagEx(uint8_t tagType, uint16_t flags, uint8_t *useruid, uint8_t exitAfterNReads,
+                            uint8_t *ats, size_t ats_len,
+                            uint8_t *ulauth_1a1, uint8_t ulauth_1a1_len,
+                            uint8_t *ulauth_1a2, uint8_t ulauth_1a2_len);
 
 void SimulateIso14443aTagAID(uint8_t tagType, uint16_t flags, uint8_t *uid,
                              uint8_t *ats, size_t ats_len,  uint8_t *aid, size_t aid_len,
@@ -157,6 +161,7 @@ bool SimulateIso14443aInit(uint8_t tagType, uint16_t flags, uint8_t *data,
 
 bool GetIso14443aCommandFromReader(uint8_t *received, uint16_t received_maxlen, uint8_t *par, int *len);
 void iso14443a_antifuzz(uint32_t flags);
+int GetATQA(uint8_t *resp, uint16_t resp_len, uint8_t *resp_par, const iso14a_polling_parameters_t *polling_parameters);
 void ReaderIso14443a(PacketCommandNG *c);
 void ReaderTransmit(const uint8_t *frame, uint16_t len, uint32_t *timing);
 void ReaderTransmitBitsPar(const uint8_t *frame, uint16_t bits, uint8_t *par, uint32_t *timing);

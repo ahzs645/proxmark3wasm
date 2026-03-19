@@ -26,4 +26,7 @@ const char *pm3_grabbed_output_get(pm3 *dev);
 const char *pm3_name_get(pm3 *dev);
 void pm3_close(pm3 *dev);
 pm3 *pm3_get_current_dev(void);
+int pm3_web_exec(const char *cmd);
+int pm3_web_exec_opts(const char *cmd, int capture, int quiet);
+const char *pm3_web_take_output(void);
 #endif // LIBPM3_H

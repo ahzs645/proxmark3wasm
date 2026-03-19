@@ -37,15 +37,15 @@ vpath %.dic dictionaries
 OBJDIR = obj
 
 ifeq ($(USE_BREW),1)
-	INCLUDES += -I$(BREW_PREFIX)/include
-	LDLIBS += -L$(BREW_PREFIX)/lib
-	PKG_CONFIG_ENV := PKG_CONFIG_PATH=$(BREW_PREFIX)/lib/pkgconfig:$(BREW_PREFIX)/opt/qt@5/lib/pkgconfig:$(BREW_PREFIX)/opt/qt@5/lib/pkgconfig
+    INCLUDES += -I$(BREW_PREFIX)/include
+    LDLIBS += -L$(BREW_PREFIX)/lib
+    PKG_CONFIG_ENV := PKG_CONFIG_PATH=$(BREW_PREFIX)/lib/pkgconfig:$(BREW_PREFIX)/opt/qt@5/lib/pkgconfig:$(BREW_PREFIX)/opt/qt@5/lib/pkgconfig
 endif
 
 ifeq ($(USE_MACPORTS),1)
-	INCLUDES += -I$(MACPORTS_PREFIX)/include
-	LDLIBS += -L$(MACPORTS_PREFIX)/lib
-	PKG_CONFIG_ENV := PKG_CONFIG_PATH=$(MACPORTS_PREFIX)/lib/pkgconfig
+    INCLUDES += -I$(MACPORTS_PREFIX)/include
+    LDLIBS += -L$(MACPORTS_PREFIX)/lib
+    PKG_CONFIG_ENV := PKG_CONFIG_PATH=$(MACPORTS_PREFIX)/lib/pkgconfig
 endif
 
 
@@ -100,10 +100,10 @@ LUALIBINC = -I$(LUALIBPATH)
 LUALIB = $(LUALIBPATH)/liblua.a
 LUALIBLD =
 LUAPLATFORM = generic
-ifneq (,$(findstring MINGW,$(platform)))
+ifdef IS_MINGW
     LUAPLATFORM = mingw
 else
-    ifeq ($(platform),Darwin)
+    ifdef IS_DARWIN
         LUAPLATFORM = macosx
     else
         LUALIBLD +=  -ldl
@@ -112,8 +112,8 @@ else
 endif
 
 ## Winsock2
-ifneq (,$(findstring MINGW,$(platform)))
-	LDLIBS += -lws2_32
+ifdef IS_MINGW
+    LDLIBS += -lws2_32
 endif
 
 ## Reveng
@@ -237,17 +237,17 @@ PM3INCLUDES += $(TINYCBORLIBINC)
 
 ## Whereami
 ifndef EMSCRIPTEN
-    ifneq ($(SKIPWHEREAMISYSTEM),1)
-        ifneq (,$(wildcard /usr/include/whereami.h))
-            WHEREAMILIB =
-            WHEREAMILIBLD = -lwhereami
-            WHEREAMILIBINC =
-            WHEREAMI_FOUND = 1
-        endif
+ifneq ($(SKIPWHEREAMISYSTEM),1)
+    ifneq (,$(wildcard /usr/include/whereami.h))
+        WHEREAMILIB =
+        WHEREAMILIBLD = -lwhereami
+        WHEREAMILIBINC =
+        WHEREAMI_FOUND = 1
     endif
-    STATICLIBS += $(WHEREAMILIB)
-    LDLIBS += $(WHEREAMILIBLD)
-    PM3INCLUDES += $(WHEREAMILIBINC)
+endif
+STATICLIBS += $(WHEREAMILIB)
+LDLIBS += $(WHEREAMILIBLD)
+PM3INCLUDES += $(WHEREAMILIBINC)
 endif
 
 ## MQTT
@@ -264,7 +264,7 @@ PM3INCLUDES += $(MQTTLIBINC)
 # RPi Zero gcc requires -latomic
 # but MacOSX /Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/ld
 # doesn't recognize option --as-needed
-ifneq ($(platform),Darwin)
+ifndef IS_DARWIN
 ifndef EMSCRIPTEN
     LDLIBS += -Wl,--as-needed -latomic -Wl,--no-as-needed
 endif
@@ -276,6 +276,15 @@ LDLIBS += -lbz2
 
 ## LZ4
 LDLIBS += -llz4
+endif
+
+## ZLIB
+ZLIBINCLUDES = $(shell $(PKG_CONFIG_ENV) pkg-config --cflags zlib 2>/dev/null)
+ZLIBLDLIBS = $(shell $(PKG_CONFIG_ENV) pkg-config --libs zlib 2>/dev/null)
+ifneq ($(ZLIBLDLIBS),)
+    LDLIBS += $(ZLIBLDLIBS)
+    PM3INCLUDES += $(ZLIBINCLUDES)
+    ZLIB_FOUND = 1
 endif
 
 ## Bluez (optional)
@@ -322,36 +331,66 @@ endif
 LDLIBS += $(PYTHONLIBLD)
 PM3INCLUDES += $(PYTHONLIBINC)
 
-## QT5 (or QT4 fallback) (optional)
+## QT6 (or QT5 fallback) (optional)
 ifneq ($(SKIPQT),1)
-    # Check for correctly configured Qt5
-    QTINCLUDES = $(shell $(PKG_CONFIG_ENV) pkg-config --cflags Qt5Core Qt5Widgets 2>/dev/null)
-    QTLDLIBS = $(shell $(PKG_CONFIG_ENV) pkg-config --libs Qt5Core Qt5Widgets 2>/dev/null)
-    MOC = $(shell $(PKG_CONFIG_ENV) pkg-config --variable=host_bins Qt5Core)/moc
-    UIC = $(shell $(PKG_CONFIG_ENV) pkg-config --variable=host_bins Qt5Core)/uic
-    QMAKE = $(shell $(PKG_CONFIG_ENV) pkg-config --variable=host_bins Qt5Core)/qmake
-    ifneq ($(QTLDLIBS),)
-        QT5_FOUND = 1
-    else
-        # if Qt5 not found check for correctly configured Qt4
-        QTINCLUDES = $(shell $(PKG_CONFIG_ENV) pkg-config --cflags QtCore QtGui 2>/dev/null)
-        QTLDLIBS = $(shell $(PKG_CONFIG_ENV) pkg-config --libs QtCore QtGui 2>/dev/null)
-        MOC = $(shell $(PKG_CONFIG_ENV) pkg-config --variable=moc_location QtCore)
-        UIC = $(shell $(PKG_CONFIG_ENV) pkg-config --variable=uic_location QtCore)
-        QMAKE = $(shell $(PKG_CONFIG_ENV) pkg-config --variable=exec_prefix QtCore)/bin/qmake
+    ifneq ($(SKIPQT6),1)
+        # Check for correctly configured Qt6
+        QTINCLUDES = $(shell $(PKG_CONFIG_ENV) pkg-config --cflags Qt6Core Qt6Widgets Qt6Gui 2>/dev/null)
+        QTLDLIBS = $(shell $(PKG_CONFIG_ENV) pkg-config --libs Qt6Core Qt6Widgets Qt6Gui 2>/dev/null)
+        MOC = $(shell $(PKG_CONFIG_ENV) pkg-config --variable=libexecdir Qt6Core 2>/dev/null)/moc
+        UIC = $(shell $(PKG_CONFIG_ENV) pkg-config --variable=libexecdir Qt6Core 2>/dev/null)/uic
+        QMAKE = $(shell $(PKG_CONFIG_ENV) pkg-config --variable=bindir Qt6Core 2>/dev/null)/qmake
+        ifeq ($(QTINCLUDES),)
+            # pkg-config not available for Qt6.2.4 (e.g. Ubuntu 22.04), fall back to qmake6
+            QMAKE6 := $(shell command -v qmake6 2>/dev/null)
+            ifneq ($(QMAKE6),)
+                QT6_INCDIR := $(shell $(QMAKE6) -query QT_INSTALL_HEADERS 2>/dev/null)
+                ifneq ($(QT6_INCDIR),)
+                    QTINCLUDES := -I$(QT6_INCDIR) -I$(QT6_INCDIR)/QtCore -I$(QT6_INCDIR)/QtWidgets -I$(QT6_INCDIR)/QtGui
+                endif
+                QT6_LIBDIR := $(shell $(QMAKE6) -query QT_INSTALL_LIBS 2>/dev/null)
+                ifneq ($(QT6_LIBDIR),)
+                    QTLDLIBS := -L$(QT6_LIBDIR) -lQt6Core -lQt6Widgets -lQt6Gui
+                endif
+                QT6_LIBEXECDIR := $(shell $(QMAKE6) -query QT_INSTALL_LIBEXECS 2>/dev/null)
+                ifneq ($(QT6_LIBEXECDIR),)
+                    MOC := $(QT6_LIBEXECDIR)/moc
+                    UIC := $(QT6_LIBEXECDIR)/uic
+                endif
+                QT6_BINDIR := $(shell $(QMAKE6) -query QT_INSTALL_BINS 2>/dev/null)
+                ifneq ($(QT6_BINDIR),)
+                    QMAKE := $(QMAKE6)
+                endif
+            endif
+        endif
+        ifneq ($(QTLDLIBS),)
+            QT6_FOUND = 1
+        endif
+    endif
+    ifneq ($(QT6_FOUND),1)
+        # if Qt6 not found check for correctly configured Qt5
+        QTINCLUDES = $(shell $(PKG_CONFIG_ENV) pkg-config --cflags Qt5Core Qt5Widgets 2>/dev/null)
+        QTLDLIBS = $(shell $(PKG_CONFIG_ENV) pkg-config --libs Qt5Core Qt5Widgets 2>/dev/null)
+        MOC = $(shell $(PKG_CONFIG_ENV) pkg-config --variable=host_bins Qt5Core 2>/dev/null)/moc
+        UIC = $(shell $(PKG_CONFIG_ENV) pkg-config --variable=host_bins Qt5Core 2>/dev/null)/uic
+        QMAKE = $(shell $(PKG_CONFIG_ENV) pkg-config --variable=host_bins Qt5Core 2>/dev/null)/qmake
     endif
     ifeq ($(QTLDLIBS),)
         # if both pkg-config commands failed, search in common places
+        # TODO: to be checked on OSX...
         ifneq ($(QTDIR),)
-            ifneq ($(wildcard $(QTDIR)/include/QtWidgets),)
+            ifneq ($(SKIPQT6),1)
+                ifneq ($(wildcard $(QTDIR)/lib/libQt6Core),)
+                    # QT6
+                    QTINCLUDES = -I$(QTDIR)/include -I$(QTDIR)/include/QtCore -I$(QTDIR)/include/QtGui -I$(QTDIR)/include/QtWidgets
+                    QTLDLIBS = -L$(QTDIR)/lib -lQt6Core -lQt6Gui -lQt6Widgets
+                    QT6_FOUND = 1
+                endif
+            endif
+            ifneq ($(QT6_FOUND),1)
                 # QT5
                 QTINCLUDES = -I$(QTDIR)/include -I$(QTDIR)/include/QtCore -I$(QTDIR)/include/QtGui -I$(QTDIR)/include/QtWidgets
                 QTLDLIBS = -L$(QTDIR)/lib -lQt5Core -lQt5Gui -lQt5Widgets
-                QT5_FOUND = 1
-            else
-                # QT4
-                QTINCLUDES = -I$(QTDIR)/include -I$(QTDIR)/include/QtCore -I$(QTDIR)/include/QtGui
-                QTLDLIBS = -L$(QTDIR)/lib -lQtCore4 -lQtGui4
             endif
             MOC = $(QTDIR)/bin/moc
             UIC = $(QTDIR)/bin/uic
@@ -363,7 +402,10 @@ ifneq ($(SKIPQT),1)
     endif
 endif
 LDLIBS += $(QTLDLIBS)
-CXXINCLUDES += $(QTINCLUDES)
+
+# Treat Qt headers as system headers, to avoid a bug with Qt 6.6.3
+QTINCLUDES_FIX = $(patsubst -I%,-isystem %,$(QTINCLUDES))
+CXXINCLUDES += $(QTINCLUDES_FIX)
 
 ## GD (optional)
 ifneq ($(SKIPGD),1)
@@ -397,7 +439,7 @@ else
             LDLIBS += $(LINENOISELIBLD)
             PM3INCLUDES += $(LINENOISELIBINC)
             LINENOISE_LOCAL_FOUND = 1
-		endif
+        endif
     endif
 endif
 
@@ -433,7 +475,7 @@ PM3CFLAGS += -I./src -I./include -I../include -I../common -I../common_fpga $(PM3
 #PM3CFLAGS += -std=c11 -pedantic
 
 PREFIX ?= /usr/local
-ifneq (,$(findstring MINGW,$(platform)))
+ifdef IS_MINGW
     # Mingw uses by default Microsoft printf, we want the GNU printf (e.g. for %z)
     # and setting _ISOC99_SOURCE sets internally __USE_MINGW_ANSI_STDIO=1
     # FTR __USE_MINGW_ANSI_STDIO seems deprecated in Mingw32
@@ -462,6 +504,10 @@ ifeq ($(GD_FOUND),1)
     PM3CFLAGS += -DHAVE_GD
 endif
 
+ifeq ($(ZLIB_FOUND),1)
+    PM3CFLAGS += -DHAVE_ZLIB
+endif
+
 ifeq ($(SWIG_LUA_FOUND),1)
     PM3CFLAGS += -DHAVE_LUA_SWIG
 endif
@@ -472,7 +518,7 @@ endif
 
 PM3CFLAGS += -DHAVE_SNPRINTF
 
-CXXFLAGS ?= -Wall -Werror
+CXXFLAGS ?= $(DEFCXXFLAGS)
 CXXFLAGS += $(MYDEFS) $(MYCXXFLAGS) $(MYINCLUDES)
 
 ifdef EMSCRIPTEN
@@ -485,9 +531,12 @@ PM3CXXFLAGS += -I../include -I./include
 ifeq ($(QT_FOUND),1)
     PM3CFLAGS += -DHAVE_GUI
     PM3CXXFLAGS += -DQT_NO_DEBUG
-    ifeq ($(QT5_FOUND),1)
-        # On OSX Qt5 is claiming for a C++11 compiler (gnu++14 works too, but if nothing it fails)
-        PM3CXXFLAGS += -fPIC -std=c++11
+    ifeq ($(QT6_FOUND),1)
+        # Qt6 is claiming for a C++17 compiler
+        PM3CXXFLAGS += -std=c++17
+    else
+        # On OSX Qt6 is claiming for a C++11 compiler (gnu++14 works too, but if nothing it fails)
+        PM3CXXFLAGS += -std=c++11
     endif
 endif
 
@@ -497,37 +546,29 @@ LDFLAGS ?= $(DEFLDFLAGS)
 LDFLAGS += $(MYLDFLAGS)
 
 PM3LDFLAGS = $(LDFLAGS)
-ifeq ($(platform),Darwin)
+ifdef IS_IOS
 ifndef EMSCRIPTEN
-    ifeq ($(shell uname -p),arm64)
-        # The platform is iOS
-        PM3LDFLAGS += -framework Foundation -framework UIKit
-    else
-        # M* macOS devices return arm
-        PM3LDFLAGS += -framework Foundation -framework AppKit
-    endif
+    PM3LDFLAGS += -framework Foundation -framework UIKit
+endif
+endif
+ifdef IS_MACOS
+ifndef EMSCRIPTEN
+    # M* macOS devices return arm
+    PM3LDFLAGS += -framework Foundation -framework AppKit
 endif
 endif
 
-# WebAssembly build flags
 ifdef EMSCRIPTEN
-    # Thread configuration
     PM3LDFLAGS += -pthread -sUSE_PTHREADS=1 -sPROXY_TO_PTHREAD=1
-    # Stack sizes (1MB main stack, 1MB per pthread)
     PM3LDFLAGS += -sSTACK_SIZE=1048576
     PM3LDFLAGS += -sDEFAULT_PTHREAD_STACK_SIZE=1048576
-    # Memory configuration (128MB initial, can grow to 512MB)
     PM3LDFLAGS += -sINITIAL_MEMORY=134217728
     PM3LDFLAGS += -sALLOW_MEMORY_GROWTH=1
     PM3LDFLAGS += -sMAXIMUM_MEMORY=536870912
-    # Asyncify for blocking operations
     PM3LDFLAGS += -sASYNCIFY -sASYNCIFY_STACK_SIZE=32768
-    # Debug checks (can be removed for production)
     PM3LDFLAGS += -sASSERTIONS=2 -sSAFE_HEAP=1 -sSTACK_OVERFLOW_CHECK=2
-    # Suppress pthreads + memory growth warning
     PM3LDFLAGS += -Wno-pthreads-mem-growth
-    # Exported functions for ring buffer communication
-    PM3LDFLAGS += -sEXPORTED_FUNCTIONS=_main,_pm3_uart_rx_head_ptr,_pm3_uart_rx_tail_ptr,_pm3_uart_rx_buf_ptr,_pm3_uart_rx_initialized_ptr,_pm3_uart_tx_head_ptr,_pm3_uart_tx_tail_ptr,_pm3_uart_tx_buf_ptr,_pm3_uart_rb_capacity,_pm3_uart_stdin_head_ptr,_pm3_uart_stdin_tail_ptr,_pm3_uart_stdin_buf_ptr
+    PM3LDFLAGS += -sEXPORTED_FUNCTIONS=_main,_pm3_console,_pm3_grabbed_output_get,_pm3_get_current_dev,_pm3_web_exec,_pm3_web_exec_opts,_pm3_web_take_output,_pm3_uart_rx_head_ptr,_pm3_uart_rx_tail_ptr,_pm3_uart_rx_buf_ptr,_pm3_uart_rx_initialized_ptr,_pm3_uart_tx_head_ptr,_pm3_uart_tx_tail_ptr,_pm3_uart_tx_buf_ptr,_pm3_uart_rb_capacity,_pm3_uart_stdin_head_ptr,_pm3_uart_stdin_tail_ptr,_pm3_uart_stdin_buf_ptr
     PM3LDFLAGS += -sEXPORTED_RUNTIME_METHODS=ccall,cwrap,HEAPU8,HEAPU32,wasmMemory
 endif
 
@@ -543,10 +584,10 @@ ifeq ($(SKIPQT),1)
     $(info GUI support:       skipped)
 else
     ifeq ($(QT_FOUND),1)
-        ifeq ($(QT5_FOUND),1)
-            $(info GUI support:       QT5 found, enabled ($(shell QT_SELECT=5 $(QMAKE) -v 2>/dev/null|grep -o 'Qt version.*')))
+        ifeq ($(QT6_FOUND),1)
+            $(info GUI support:       QT6 found, enabled ($(shell QT_SELECT=6 $(QMAKE) -v 2>/dev/null|grep -o 'Qt version.*')))
         else
-            $(info GUI support:       QT4 found, enabled ($(shell QT_SELECT=4 $(QMAKE) -v 2>/dev/null|grep -o 'Qt version.*')))
+            $(info GUI support:       QT5 found, enabled ($(shell QT_SELECT=5 $(QMAKE) -v 2>/dev/null|grep -o 'Qt version.*')))
         endif
     else
         $(info GUI support:       QT not found, disabled)
@@ -599,6 +640,12 @@ else
     else
         $(info GD library:        GD not found, disabled)
     endif
+endif
+
+ifeq ($(ZLIB_FOUND),1)
+    $(info Zlib library:      system library found, enabled)
+else
+    $(info Zlib library:      not found, disabled)
 endif
 
 ifeq ($(SKIPREADLINE),1)
@@ -658,194 +705,201 @@ POSTCOMPILE = $(MV) -f $(OBJDIR)/$*.Td $(OBJDIR)/$*.d && $(TOUCH) $@
 ################
 
 SRCS =  mifare/aiddesfire.c \
-		aidsearch.c \
-		atrs.c \
-		cmdanalyse.c \
-		cmdcrc.c \
-		cmddata.c \
-		cmdflashmem.c \
-		cmdflashmemspiffs.c \
-		cmdhf.c \
-		cmdhf14a.c \
-		cmdhf14b.c \
-		cmdhf15.c \
-		cmdhfcryptorf.c \
-		cmdhfepa.c \
-		cmdhfemrtd.c \
-		cmdhffelica.c \
-		cmdhffido.c \
-		cmdhffudan.c \
-		cmdhfgallagher.c \
-		cmdhfksx6924.c \
-		cmdhfcipurse.c \
-		cmdhficlass.c \
-		cmdhfict.c \
-		cmdhflegic.c \
-		cmdhfjooki.c \
-		cmdhflist.c \
-		cmdhflto.c \
-		cmdhfmf.c \
-		cmdhfmfdes.c \
-		cmdhfmfhard.c \
-		cmdhfmfu.c \
-		cmdhfmfp.c \
-		cmdhfntag424.c \
+        aidsearch.c \
+        atrs.c \
+        cmdanalyse.c \
+        cmdcrc.c \
+        cmddata.c \
+        cmdflashmem.c \
+        cmdflashmemspiffs.c \
+        cmdhf.c \
+        cmdhf14a.c \
+        pla.c \
+        cmdhf14b.c \
+        cmdhf15.c \
+        cmdhfaliro.c \
+        cmdhfcryptorf.c \
+        cmdhfepa.c \
+        cmdhfemrtd.c \
+        cmdhffelica.c \
+        cmdhffido.c \
+        cmdhffudan.c \
+        cmdhfgallagher.c \
+        cmdhfgst.c \
+        cmdhfksx6924.c \
+        cmdhfcipurse.c \
+        cmdhficlass.c \
+        cmdhfict.c \
+        cmdhflegic.c \
+        cmdhfjooki.c \
+        cmdhflist.c \
+        cmdhflto.c \
+        cmdhfmf.c \
+        cmdhfmfdes.c \
+        cmdhfmfhard.c \
+        cmdhfmfu.c \
+        cmdhfmfp.c \
+        cmdhfntag424.c \
         cmdhfsaflok.c \
-		cmdhfseos.c \
-		cmdhfst.c \
-		cmdhfst25ta.c \
-		cmdhftesla.c \
-		cmdhfthinfilm.c \
-		cmdhftopaz.c \
-		cmdhftexkom.c \
-		cmdhfvas.c \
-		cmdhfxerox.c \
-		cmdhw.c \
-		cmdlf.c \
-		cmdlfawid.c \
-		cmdlfcotag.c \
-		cmdlfdestron.c \
-		cmdlfem.c \
-		cmdlfem410x.c \
-		cmdlfem4x05.c \
-		cmdlfem4x50.c \
-		cmdlfem4x70.c \
-		cmdlffdxb.c \
-		cmdlfguard.c \
-		cmdlfgallagher.c \
-		cmdlfhid.c \
-		cmdlfhitag.c \
-		cmdlfhitaghts.c \
-		cmdlfhitagu.c \
-		cmdlfidteck.c \
-		cmdlfindala.c \
-		cmdlfio.c \
-		cmdlfjablotron.c \
-		cmdlfkeri.c \
-		cmdlfmotorola.c \
-		cmdlfnedap.c \
-		cmdlfnexwatch.c \
-		cmdlfnoralsy.c \
-		cmdlfpac.c \
-		cmdlfparadox.c \
-		cmdlfpcf7931.c \
-		cmdlfpresco.c \
-		cmdlfpyramid.c \
-		cmdlfsecurakey.c \
-		cmdlft55xx.c \
-		cmdlfti.c \
-		cmdlfviking.c \
-		cmdlfvisa2000.c \
-		cmdlfzx8211.c \
-		cmdmain.c \
-		cmdmqtt.c \
-		cmdnfc.c \
-		cmdparser.c \
-		cmdpiv.c \
-		cmdscript.c \
-		cmdsmartcard.c \
-		cmdtrace.c \
-		cmdusart.c \
-		cmdwiegand.c \
-		comms.c \
-		crypto/asn1dump.c \
-		crypto/asn1utils.c\
-		crypto/libpcrypto.c\
-		crypto/originality.c\
-		emv/cmdemv.c \
-		emv/crypto.c\
-		emv/crypto_polarssl.c\
-		emv/dol.c \
-		emv/emv_pk.c\
-		emv/emv_pki.c\
-		emv/emv_pki_priv.c\
-		emv/emv_roca.c \
-		emv/emv_tags.c \
-		emv/emvcore.c \
-		emv/emvjson.c\
-		emv/tlv.c \
-		emv/test/crypto_test.c\
-		emv/test/cryptotest.c\
-		emv/test/cda_test.c\
-		emv/test/dda_test.c\
-		emv/test/sda_test.c\
-		fido/additional_ca.c \
-		fido/cose.c \
-		fido/cbortools.c \
-		fido/fidocore.c \
-		ksx6924/ksx6924core.c \
-		cipurse/cipursecore.c \
-		cipurse/cipursecrypto.c \
-		cipurse/cipursetest.c \
-		fileutils.c \
-		flash.c \
-		generator.c \
-		graph.c \
-		hidsio.c \
-		jansson_path.c \
-		iso4217.c \
-		iso7816/apduinfo.c \
-		iso7816/iso7816core.c \
-		loclass/cipher.c \
-		loclass/cipherutils.c \
-		loclass/elite_crack.c \
-		loclass/ikeys.c \
-		lua_bitlib.c \
-		mifare/lrpcrypto.c \
-		mifare/desfirecrypto.c \
-		mifare/desfirecore.c \
-		mifare/desfiresecurechan.c \
-		mifare/desfiretest.c \
-		mifare/gallaghercore.c \
-		mifare/mad.c \
-		mifare/mfkey.c \
-		mifare/mifare4.c \
-		mifare/mifaredefault.c \
-		mifare/mifarehost.c \
-		mifare/gen4.c \
-		nfc/ndef.c \
-		pm3.c \
-		pm3_binlib.c \
-		pm3_bitlib.c \
-		preferences.c \
-		pm3line.c \
-		proxmark3.c \
-		scandir.c \
-		uart/ringbuffer.c \
-		scripting.c \
-		ui.c \
-		util.c \
-		qrcode/qrcode.c \
-		version_pm3.c \
-		wiegand_formats.c \
-		wiegand_formatutils.c
+        cmdhfseos.c \
+        cmdhfst.c \
+        cmdhfst25ta.c \
+        cmdhftesla.c \
+        cmdhfthinfilm.c \
+        cmdhftopaz.c \
+        cmdhftexkom.c \
+        cmdhfvas.c \
+        cmdhfxerox.c \
+        cmdhw.c \
+        cmdlf.c \
+        cmdlfawid.c \
+        cmdlfcotag.c \
+        cmdlfdestron.c \
+        cmdlfem.c \
+        cmdlfem410x.c \
+        cmdlfem4x05.c \
+        cmdlfem4x50.c \
+        cmdlfem4x70.c \
+        cmdlffdxb.c \
+        cmdlfguard.c \
+        cmdlfgallagher.c \
+        cmdlfhid.c \
+        cmdlfhitag.c \
+        cmdlfhitaghts.c \
+        cmdlfhitagu.c \
+        cmdlfidteck.c \
+        cmdlfindala.c \
+        cmdlfio.c \
+        cmdlfjablotron.c \
+        cmdlfkeri.c \
+        cmdlfmotorola.c \
+        cmdlfnedap.c \
+        cmdlfnexwatch.c \
+        cmdlfnoralsy.c \
+        cmdlfpac.c \
+        cmdlfparadox.c \
+        cmdlfpcf7931.c \
+        cmdlfpresco.c \
+        cmdlfpyramid.c \
+        cmdlfsecurakey.c \
+        cmdlft55xx.c \
+        cmdlfti.c \
+        cmdlfviking.c \
+        cmdlfvisa2000.c \
+        cmdlfzx8211.c \
+        cmdmain.c \
+        cmdmqtt.c \
+        cmdnfc.c \
+        cmdparser.c \
+        cmdpiv.c \
+        cmdscript.c \
+        cmdsmartcard.c \
+        cmdtrace.c \
+        cmdusart.c \
+        cmdwiegand.c \
+        comms.c \
+        crypto/asn1dump.c \
+        crypto/asn1utils.c\
+        crypto/libpcrypto.c\
+        crypto/originality.c\
+        emv/cmdemv.c \
+        emv/crypto.c\
+        emv/crypto_polarssl.c\
+        emv/dol.c \
+        emv/emv_pk.c\
+        emv/emv_pki.c\
+        emv/emv_pki_priv.c\
+        emv/emv_roca.c \
+        emv/emv_tags.c \
+        emv/emvcore.c \
+        emv/emvjson.c\
+        emv/tlv.c \
+        emv/test/crypto_test.c\
+        emv/test/cryptotest.c\
+        emv/test/cda_test.c\
+        emv/test/dda_test.c\
+        emv/test/sda_test.c\
+        fido/additional_ca.c \
+        fido/cose.c \
+        fido/cbortools.c \
+        fido/fidocore.c \
+        ksx6924/ksx6924core.c \
+        cipurse/cipursecore.c \
+        cipurse/cipursecrypto.c \
+        cipurse/cipursetest.c \
+        fileutils.c \
+        flash.c \
+        generator.c \
+        graph.c \
+        hidsio.c \
+        jansson_path.c \
+        iso4217.c \
+        iso7816/apduinfo.c \
+        iso7816/iso7816core.c \
+        loclass/cipher.c \
+        loclass/cipherutils.c \
+        loclass/elite_crack.c \
+        loclass/ikeys.c \
+        lua_bitlib.c \
+        mifare/lrpcrypto.c \
+        mifare/desfirecrypto.c \
+        mifare/desfirecore.c \
+        mifare/desfiresecurechan.c \
+        mifare/desfiretest.c \
+        mifare/gallaghercore.c \
+		mifare/gallaghertest.c \
+        mifare/mad.c \
+        mifare/mfkey.c \
+        mifare/mifare4.c \
+        mifare/mifaredefault.c \
+        mifare/mifarehost.c \
+        mifare/gen4.c \
+        nfc/ndef.c \
+        pm3.c \
+        pm3_binlib.c \
+        pm3_bitlib.c \
+        preferences.c \
+        pm3line.c \
+        proxmark3.c \
+        scandir.c \
+        uart/ringbuffer.c \
+        uart/uart_common.c \
+        uart/uart_posix.c \
+        uart/uart_win32.c \
+        scripting.c \
+        ui.c \
+        util.c \
+        qrcode/qrcode.c \
+        version_pm3.c \
+        wiegand_formats.c \
+        wiegand_formatutils.c
 
-# Skip heavy compression-dependent tools for WASM builds
 ifdef EMSCRIPTEN
-SRCS := $(filter-out cmdhfmfhard.c,$(SRCS))
+SRCS := $(filter-out cmdhfmfhard.c uart/uart_common.c uart/uart_posix.c uart/uart_win32.c,$(SRCS))
+SRCS += uart/uart_web.c
 endif
 
 # common
 SRCS += bucketsort.c \
-		bruteforce.c \
-		cardhelper.c \
-		crapto1/crapto1.c \
-		crapto1/crypto1.c \
-		crc.c \
-		crc16.c \
-		crc32.c \
-		crc64.c \
-		commonutil.c \
-		hitag2/hitag2_crypto.c \
-		iso15693tools.c \
-		legic_prng.c \
-		lfdemod.c \
-		util_posix.c
+        bruteforce.c \
+        cardhelper.c \
+        crapto1/crapto1.c \
+        crapto1/crypto1.c \
+        crc.c \
+        crc16.c \
+        crc32.c \
+        crc64.c \
+        commonutil.c \
+        hitag2/hitag2_crypto.c \
+        iso15693tools.c \
+        legic_prng.c \
+        lfdemod.c \
+        util_posix.c
 
 ifeq ($(GD_FOUND),1)
     # electronic shelf labels
     SRCS += imgutils.c \
-	cmdhfwaveshare.c
+            cmdhfwaveshare.c
 endif
 
 # swig
@@ -858,15 +912,6 @@ ifeq ($(SWIG_PYTHON_FOUND),1)
     SWIGSRCS += pm3_pywrap.c
 endif
 
-# UART implementation - WebSerial for Emscripten, native for others
-ifdef EMSCRIPTEN
-SRCS += uart/uart_web.c
-else
-SRCS += uart/uart_common.c \
-		uart/uart_posix.c \
-		uart/uart_win32.c
-endif
-
 # gui
 ifeq ($(QT_FOUND),1)
     CXXSRCS = proxgui.cpp proxguiqt.cpp proxguiqt.moc.cpp
@@ -874,8 +919,8 @@ else
     CXXSRCS = guidummy.cpp
 endif
 
-# OS X
-ifeq ($(platform),Darwin)
+# OS X & iOS
+ifdef IS_DARWIN
 ifndef EMSCRIPTEN
     OBJCSRCS = util_darwin.m
 endif
@@ -896,7 +941,7 @@ CLEAN += flasher *.moc.cpp ui/ui_overlays.h ui/ui_image.h
 # targets #
 ###########
 
-	# need to assign dependancies to build these first...
+# need to assign dependancies to build these first...
 all: $(BINS)
 
 all-static: LDLIBS:=-static $(LDLIBS)
@@ -904,13 +949,13 @@ all-static: $(BINS)
 
 ifdef EMSCRIPTEN
 proxmark3: $(OBJS) $(STATICLIBS) lualibs/pm3_cmd.lua lualibs/mfc_default_keys.lua
-		$(info [=] CXX $@.js)
-		$(Q)$(CXX) $(PM3CFLAGS) $(PM3LDFLAGS) $(OBJS) $(STATICLIBS) $(LDLIBS) -o $@.js
+	$(info [=] CXX $@.js)
+	$(Q)$(CXX) $(PM3CFLAGS) $(PM3LDFLAGS) $(OBJS) $(STATICLIBS) $(LDLIBS) -o $@.js
 else
 proxmark3: $(OBJS) $(STATICLIBS) lualibs/pm3_cmd.lua lualibs/mfc_default_keys.lua
-		$(info [=] CXX $@)
+	$(info [=] CXX $@)
 #	$(Q)$(CXX) $(PM3LDFLAGS) $(OBJS) $(STATICLIBS) $(LDLIBS) -o $@
-		$(Q)$(CXX) $(PM3CFLAGS) $(PM3LDFLAGS) $(OBJS) $(STATICLIBS) $(LDLIBS) -o $@
+	$(Q)$(CXX) $(PM3CFLAGS) $(PM3LDFLAGS) $(OBJS) $(STATICLIBS) $(LDLIBS) -o $@
 endif
 
 src/proxgui.cpp: src/ui/ui_overlays.h src/ui/ui_image.h
@@ -926,6 +971,12 @@ src/proxguiqt.h: src/ui/ui_overlays.h src/ui/ui_image.h
 src/ui/ui_overlays.h: src/ui/overlays.ui
 	$(info [-] UIC $@)
 	$(Q)$(UIC) $^ > $@
+# fix the header generated by some Qt6 versions (seen on 6.4.2 & 6.6.3)
+ifdef IS_DARWIN
+	$(Q)sed -E -i '' 's/&QLabel::setNum);/qOverload<int>(\&QLabel::setNum));/g' $@
+else
+	$(Q)sed -i 's/&QLabel::setNum);/qOverload<int>(\&QLabel::setNum));/g' $@
+endif
 
 src/ui/ui_image.h: src/ui/image.ui
 	$(info [-] UIC $@)
@@ -940,10 +991,10 @@ lualibs/mfc_default_keys.lua : mfc_default_keys.dic
 	$(Q)awk -f default_keys_dic2lua.awk $^ > $@
 
 clean:
-		$(Q)$(RM) $(CLEAN)
-		$(Q)$(RM) proxmark3.js proxmark3.wasm
-		$(Q)$(RMDIR) $(OBJDIR)
-		$(Q)$(MAKE) --no-print-directory -C $(AMIIBOLIBPATH) clean
+	$(Q)$(RM) $(CLEAN)
+	$(Q)$(RM) proxmark3.js proxmark3.wasm
+	$(Q)$(RMDIR) $(OBJDIR)
+	$(Q)$(MAKE) --no-print-directory -C $(AMIIBOLIBPATH) clean
 	$(Q)$(MAKE) --no-print-directory -C $(CLIPARSERLIBPATH) clean
 	$(Q)$(MAKE) --no-print-directory -C $(HARDNESTEDLIBPATH) clean
 	$(Q)$(MAKE) --no-print-directory -C $(ID48LIBPATH) clean
@@ -968,7 +1019,7 @@ endif
 ifneq (,$(INSTALLSHARE))
 	    $(Q)$(INSTALLSUDO) $(MKDIR) $(DESTDIR)$(PREFIX)$(PATHSEP)$(INSTALLSHARERELPATH)
 	    # hack ahead: inject installation path into pm3_resources.py
-    ifeq ($(platform),Darwin)
+    ifdef IS_DARWIN
 	    $(Q)sed -E -i '' 's|^TOOLS_PATH \?= \?None|TOOLS_PATH="$(PREFIX)$(PATHSEP)$(INSTALLTOOLSRELPATH)"|' pyscripts/pm3_resources.py
 	    $(Q)sed -E -i '' 's|^DICTS_PATH \?= \?None|DICTS_PATH="$(PREFIX)$(PATHSEP)$(INSTALLSHARERELPATH)/dictionaries"|' pyscripts/pm3_resources.py
 	    $(Q)$(INSTALLSUDO) $(CP) $(INSTALLSHARE) $(DESTDIR)$(PREFIX)$(PATHSEP)$(INSTALLSHARERELPATH)
@@ -1050,8 +1101,8 @@ $(TINYCBORLIB): .FORCE
 $(WHEREAMILIB): .FORCE
 ifndef EMSCRIPTEN
 ifneq ($(WHEREAMI_FOUND),1)
-		$(info [*] MAKE $@)
-		$(Q)$(MAKE) --no-print-directory -C $(WHEREAMILIBPATH) all
+	$(info [*] MAKE $@)
+	$(Q)$(MAKE) --no-print-directory -C $(WHEREAMILIBPATH) all
 endif
 endif
 

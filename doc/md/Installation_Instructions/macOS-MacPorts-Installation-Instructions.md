@@ -4,10 +4,10 @@
 # macOS - MacPorts automatic installation
 
 # Table of Contents
-- [macOS - MacPorts automatic installation](#macOS---macports-automatic-installation)
+- [macOS - MacPorts automatic installation](#macos---macports-automatic-installation)
 - [Table of Contents](#table-of-contents)
   - [Main prerequisite](#main-prerequisite)
-  - [Installing latest releases](#installing-latest-releases)
+  - [Installing stable releases directly](#installing-stable-releases-directly)
   - [Build from source](#build-from-source)
 - [Clone the Iceman repository](#clone-the-iceman-repository)
   - [Compile the project](#compile-the-project)
@@ -67,24 +67,24 @@ These instructions will show how to setup the environment on OSX to the point wh
 
     ```bash
     sudo port install \
-    	gd2 \
-    	lz4 \
-    	qt5 \
-    	bzip2 \
-    	lua54 \
-    	jansson \
-    	readline \
-    	coreutils \
-    	openssl11 \
-    	pkgconfig \
-    	python312 \
-    	qt5-qtbase \
-    	py312-pexpect \
-    	py312-bitstring \
-    	py312-sslcrypto \
-    	py312-ansicolors \
-    	arm-none-eabi-gcc \
-    	arm-none-eabi-binutils
+        gd2 \
+        lz4 \
+        qt6 \
+        bzip2 \
+        lua54 \
+        jansson \
+        readline \
+        coreutils \
+        openssl11 \
+        pkgconfig \
+        python312 \
+        qt6-qtbase \
+        py312-pexpect \
+        py312-bitstring \
+        py312-sslcrypto \
+        py312-ansicolors \
+        arm-none-eabi-gcc \
+        arm-none-eabi-binutils
     ```
 
 3. Clamp Python version for pkg-config

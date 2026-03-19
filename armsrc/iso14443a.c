@@ -695,7 +695,7 @@ RAMFUNC int ManchesterDecoding(uint8_t bit, uint16_t offset, uint32_t non_real_t
 
 
 // Thinfilm, Kovio mangles ISO14443A in the way that they don't use start bit nor parity bits.
-static RAMFUNC int ManchesterDecoding_Thinfilm(uint8_t bit) {
+static int ManchesterDecoding_Thinfilm(uint8_t bit) {
 
     if (Demod.len == Demod.output_len) {
         // Flush last parity bits
@@ -852,10 +852,19 @@ void RAMFUNC SniffIso14443a(uint8_t param) {
 
     uint32_t rx_samples = 0;
 
+    uint16_t checker = 12000;
+
     // loop and listen
     while (BUTTON_PRESS() == false) {
         WDT_HIT();
         LED_A_ON();
+
+        if (checker-- == 0) {
+            if (data_available()) {
+                break;
+            }
+            checker = 12000;
+        }
 
         register int readBufDataP = data - dma->buf;
         register int dmaBufDataP = DMA_BUFFER_SIZE - AT91C_BASE_PDC_SSC->PDC_RCR;
@@ -1192,7 +1201,10 @@ bool prepare_allocated_tag_modulation(tag_response_info_t *response_info, uint8_
 static void Simulate_read_ulc_key(uint8_t *ulc_key) {
     // copy UL-C key from emulator memory
 
-    mfu_dump_t *mfu_header = (mfu_dump_t *) BigBuf_get_EM_addr();
+    if (ulc_key == NULL) {
+        return;
+    }
+    const mfu_dump_t *mfu_header = (const mfu_dump_t *) BigBuf_get_EM_addr();
     memcpy(ulc_key,      mfu_header->data + (0x2D * 4), 4);
     memcpy(ulc_key +  4, mfu_header->data + (0x2C * 4), 4);
     memcpy(ulc_key +  8, mfu_header->data + (0x2F * 4), 4);
@@ -1207,7 +1219,10 @@ static void Simulate_read_ulc_key(uint8_t *ulc_key) {
 static void Simulate_read_ulaes_key0(uint8_t *ulaes_key0) {
     // copy UL-AES DataProtKey from emulator memory
 
-    mfu_dump_t *mfu_header = (mfu_dump_t *) BigBuf_get_EM_addr();
+    if (ulaes_key0 == NULL) {
+        return;
+    }
+    const mfu_dump_t *mfu_header = (const mfu_dump_t *) BigBuf_get_EM_addr();
     memcpy(ulaes_key0, mfu_header->data + (0x33 * 4), 4);
     memcpy(ulaes_key0 + 4, mfu_header->data + (0x32 * 4), 4);
     memcpy(ulaes_key0 + 8, mfu_header->data + (0x31 * 4), 4);
@@ -1368,6 +1383,7 @@ bool SimulateIso14443aInit(uint8_t tagType, uint16_t flags, uint8_t *data,
         }
         case 12: { // HID Seos 4K card
             rATQA[0] = 0x01;
+            rATS[1] = 0x78; // FSC=256 required
             sak = 0x20;
             break;
         }
@@ -1410,6 +1426,10 @@ bool SimulateIso14443aInit(uint8_t tagType, uint16_t flags, uint8_t *data,
                 memcpy(rVERSION, mfu_header->version, 8);
             }
             AddCrc14A(rVERSION, sizeof(rVERSION) - 2);
+
+            // READ_SIG
+            memcpy(rSIGN, mfu_header->signature, 32);
+            AddCrc14A(rSIGN, sizeof(rSIGN) - 2);
 
             Simulate_read_ulaes_key0(ulc_key);
 
@@ -1616,9 +1636,14 @@ bool SimulateIso14443aInit(uint8_t tagType, uint16_t flags, uint8_t *data,
 // response to send, and send it.
 // 'hf 14a sim'
 //-----------------------------------------------------------------------------
-void SimulateIso14443aTag(uint8_t tagType, uint16_t flags, uint8_t *useruid, uint8_t exitAfterNReads,
-                          uint8_t *ats, size_t ats_len, bool ulauth_z1, bool ulauth_z2) {
+void SimulateIso14443aTag(uint8_t tagType, uint16_t flags, uint8_t *useruid, uint8_t exitAfterNReads) {
+    SimulateIso14443aTagEx(tagType, flags, useruid, exitAfterNReads, NULL, 0, NULL, 0, NULL, 0);
+}
 
+void SimulateIso14443aTagEx(uint8_t tagType, uint16_t flags, uint8_t *useruid, uint8_t exitAfterNReads,
+                            uint8_t *ats, size_t ats_len,
+                            uint8_t *ulauth_1a1, uint8_t ulauth_1a1_len,
+                            uint8_t *ulauth_1a2, uint8_t ulauth_1a2_len) {
 #define ATTACK_KEY_COUNT 16
 #define ULC_TAG_NONCE       "\x01\x02\x03\x04\x05\x06\x07\x08"
 
@@ -1756,6 +1781,12 @@ void SimulateIso14443aTag(uint8_t tagType, uint16_t flags, uint8_t *useruid, uin
                 emlSetMem_xt(receivedCmd, wrblock + MFU_DUMP_PREFIX_LENGTH / 4, 1, 4);
                 // send ACK
                 EmSend4bit(CARD_ACK);
+                if (tagType == 13 && wrblock >= 0x2c && wrblock <= 0x2F) {
+                    ulc_reread_key = true;
+                }
+                if (tagType == 14 && wrblock >= 0x30 && wrblock <= 0x37) {
+                    ulaes_reread_key = true;
+                }
             } else {
                 // send NACK 0x1 == crc/parity error
                 EmSend4bit(CARD_NACK_PA);
@@ -1858,10 +1889,22 @@ void SimulateIso14443aTag(uint8_t tagType, uint16_t flags, uint8_t *useruid, uin
                     // send NACK 0x0 == invalid argument
                     EmSend4bit(CARD_NACK_IV);
                 } else {
+                    // TODO: check if block >= AUTH0 and AUTH1=0 and unauth on ULC/ULAES -> NACK
                     // first blocks of emu are header
                     uint16_t start = (block * 4) + MFU_DUMP_PREFIX_LENGTH;
                     uint8_t emdata[MIFARE_BLOCK_SIZE + CRC16_SIZE] = {0};
                     emlGet(emdata, start, MIFARE_BLOCK_SIZE);
+                    // mask key pages if needed
+                    if ((tagType == 13) && (block >= 0x29) && (block <= 0x2F)) {
+                        uint8_t offset = block >= 0x2C ? 0 : 0x2C - block;
+                        uint8_t length = block >= 0x2C ? 0x30 - block : block - 0x28;
+                        memset(emdata + offset * 4, 0x00, length * 4);
+                    } else if ((tagType == 14) && (block >= 0x2D) && (block <= 0x37)) {
+                        uint8_t offset = block >= 0x30 ? 0 : 0x30 - block;
+                        uint8_t length = block >= 0x30 ? (0x37 - block > 4 ? 4 : 0x37 - block) : block - 0x2C;
+                        memset(emdata + offset * 4, 0x00, length * 4);
+                    }
+                    // TODO: implement cyclic memory if we reach AUTH0 and AUTH1=0 and unauth on ULC/ULAES, or if we reach end of memory
                     AddCrc14A(emdata, MIFARE_BLOCK_SIZE);
                     EmSendCmd(emdata, sizeof(emdata));
                     numReads++;  // Increment number of times reader requested a block
@@ -1917,6 +1960,7 @@ void SimulateIso14443aTag(uint8_t tagType, uint16_t flags, uint8_t *useruid, uin
                     EmSend4bit(CARD_NACK_IV);
                     goto jump;
                 }
+                // TODO: check if block >= AUTH0 and unauth on ULC/ULAES -> NACK
 
                 // OTP sanity check
                 if (block == 0x03) {
@@ -1926,7 +1970,7 @@ void SimulateIso14443aTag(uint8_t tagType, uint16_t flags, uint8_t *useruid, uin
 
                     bool risky = false;
                     for (int i = 0; i < 4; i++) {
-                        risky |= (orig[i] & ~receivedCmd[2 + i]);
+                        risky |= (orig[i] & ~receivedCmd[2 + i]) != 0;
                     }
 
                     if (risky) {
@@ -1958,6 +2002,7 @@ void SimulateIso14443aTag(uint8_t tagType, uint16_t flags, uint8_t *useruid, uin
                 if (wrblock > pages) {
                     // send NACK 0x0 == invalid argument
                     EmSend4bit(CARD_NACK_IV);
+                    // TODO: check if wrblock >= AUTH0 and unauth on ULC/ULAES -> NACK
                 } else {
                     // send ACK
                     EmSend4bit(CARD_ACK);
@@ -1969,7 +2014,7 @@ void SimulateIso14443aTag(uint8_t tagType, uint16_t flags, uint8_t *useruid, uin
                 EmSend4bit(CARD_NACK_PA);
             }
             p_response = NULL;
-        } else if (receivedCmd[0] == MIFARE_ULEV1_READSIG && len == 4 && tagType == 7) {    // Received a READ SIGNATURE --
+        } else if (receivedCmd[0] == MIFARE_ULEV1_READSIG && len == 4 && (tagType == 7 || tagType == 14)) {    // Received a READ SIGNATURE --
             p_response = &responses[RESP_INDEX_SIGNATURE];
         } else if (receivedCmd[0] == MIFARE_ULEV1_READ_CNT && len == 4 && tagType == 7) {    // Received a READ COUNTER --
             uint8_t index = receivedCmd[1];
@@ -2060,8 +2105,8 @@ void SimulateIso14443aTag(uint8_t tagType, uint16_t flags, uint8_t *useruid, uin
             // our very random TAG NONCE
             memcpy(dynamic_response_info.response + 1, ULC_TAG_NONCE, 8);
 
-            if (ulauth_z1) {
-                memset(dynamic_response_info.response + 1, 0, 8);
+            if (ulauth_1a1_len == 8 && ulauth_1a1 != NULL) {
+                memcpy(dynamic_response_info.response + 1, ulauth_1a1, ulauth_1a1_len);
             } else {
                 // encrypt TAG NONCE
                 tdes_nxp_send(dynamic_response_info.response + 1, dynamic_response_info.response + 1, 8, ulc_key, ulc_iv, 2);
@@ -2099,9 +2144,8 @@ void SimulateIso14443aTag(uint8_t tagType, uint16_t flags, uint8_t *useruid, uin
             // OK response
             dynamic_response_info.response[0] = 0x00;
 
-            if (ulauth_z2) {
-                // try empty auth but with correct CRC and 0x00 command
-                memset(dynamic_response_info.response + 1, 0, 8);
+            if (ulauth_1a2_len == 8 && ulauth_1a2 != NULL) {
+                memcpy(dynamic_response_info.response + 1, ulauth_1a2, ulauth_1a2_len);
             } else {
                 // rol RndA
                 rol(rnd_ab, 8);
@@ -2134,8 +2178,8 @@ void SimulateIso14443aTag(uint8_t tagType, uint16_t flags, uint8_t *useruid, uin
             memcpy(dynamic_response_info.response + 1, ULC_TAG_NONCE, 8);
             memcpy(dynamic_response_info.response + 9, ULC_TAG_NONCE, 8);
 
-            if (ulauth_z1) {
-                memset(dynamic_response_info.response + 1, 0, 16);
+            if (ulauth_1a1_len == 16 && ulauth_1a1 != NULL) {
+                memcpy(dynamic_response_info.response + 1, ulauth_1a1, ulauth_1a1_len);
             } else {
                 // encrypt TAG NONCE
                 aes128_nxp_send(dynamic_response_info.response + 1, dynamic_response_info.response + 1, 16, ulc_key, ulc_iv);
@@ -2175,9 +2219,8 @@ void SimulateIso14443aTag(uint8_t tagType, uint16_t flags, uint8_t *useruid, uin
             // OK response
             dynamic_response_info.response[0] = 0x00;
 
-            if (ulauth_z2) {
-                // try empty auth but with correct CRC and 0x00 command
-                memset(dynamic_response_info.response + 1, 0, 16);
+            if (ulauth_1a2_len == 16 && ulauth_1a2 != NULL) {
+                memcpy(dynamic_response_info.response + 1, ulauth_1a2, ulauth_1a2_len);
             } else {
                 // rol RndA
                 rol(rnd_ab, 16);
@@ -2581,7 +2624,7 @@ int EmGetCmd(uint8_t *received, uint16_t received_max_len, uint16_t *len, uint8_
         if (flip == 3) {
             if (data_available()) {
                 Dbprintf("----------- " _GREEN_("Breaking / Data") " ----------");
-                return false;
+                return 1;
             }
             flip = 0;
         }
@@ -2590,7 +2633,7 @@ int EmGetCmd(uint8_t *received, uint16_t received_max_len, uint16_t *len, uint8_
         if (checker-- == 0) {
             if (BUTTON_PRESS()) {
                 Dbprintf("----------- " _GREEN_("Button pressed, user aborted") " ----------");
-                return false;
+                return 1;
             }
 
             flip++;
@@ -3035,7 +3078,7 @@ static void iso14a_set_ATS_times(const uint8_t *ats) {
 }
 
 
-static int GetATQA(uint8_t *resp, uint16_t resp_len, uint8_t *resp_par, const iso14a_polling_parameters_t *polling_parameters) {
+int GetATQA(uint8_t *resp, uint16_t resp_len, uint8_t *resp_par, const iso14a_polling_parameters_t *polling_parameters) {
 #define RETRY_TIMEOUT 10
 
     uint32_t save_iso14a_timeout = iso14a_get_timeout();
@@ -3407,7 +3450,7 @@ int iso14443a_fast_select_card(const uint8_t *uid_ptr, uint8_t num_cascades) {
 }
 
 void iso14443a_setup(uint8_t fpga_minor_mode) {
-
+    set_session_channel(false);
     FpgaDownloadAndGo(FPGA_BITSTREAM_HF);
     // Set up the synchronous serial port
     FpgaSetupSsc(FPGA_MAJOR_MODE_HF_ISO14443A);

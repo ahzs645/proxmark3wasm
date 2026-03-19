@@ -312,6 +312,86 @@
         "Type": "pacs"
     },
     {
+        "AID": "F52100",
+        "Vendor": "Lucid Group / dormakaba",
+        "Country": "US",
+        "Name": "Lucid Motors Valet Card / Kaba evolo - Access",
+        "Description": "Used by both Lucid Motors valet card and Kaba evolo - KabaApplication.Access",
+        "Type": "pacs"
+    },
+    {
+        "AID": "F52130",
+        "Vendor": "dormakaba",
+        "Country": "CH",
+        "Name": "Kaba evolo - Common",
+        "Description": "Kaba evolo - KabaApplication.Common",
+        "Type": "pacs"
+    },
+    {
+        "AID": "F52140",
+        "Vendor": "dormakaba",
+        "Country": "CH",
+        "Name": "Kaba evolo - Biometric",
+        "Description": "Kaba evolo - KabaApplication.Biometric",
+        "Type": "pacs"
+    },
+    {
+        "AID": "F52160",
+        "Vendor": "dormakaba",
+        "Country": "CH",
+        "Name": "Kaba evolo - MasterA",
+        "Description": "Kaba evolo - KabaApplication.MasterA",
+        "Type": "pacs"
+    },
+    {
+        "AID": "F52161",
+        "Vendor": "dormakaba",
+        "Country": "CH",
+        "Name": "Kaba evolo - MasterB",
+        "Description": "Kaba evolo - KabaApplication.MasterB",
+        "Type": "pacs"
+    },
+    {
+        "AID": "F52162",
+        "Vendor": "dormakaba",
+        "Country": "CH",
+        "Name": "Kaba evolo - DealerCode",
+        "Description": "Kaba evolo - KabaApplication.DealerCode",
+        "Type": "pacs"
+    },
+    {
+        "AID": "F52163",
+        "Vendor": "dormakaba",
+        "Country": "CH",
+        "Name": "Kaba evolo - Upgrade",
+        "Description": "Kaba evolo - KabaApplication.Upgrade",
+        "Type": "pacs"
+    },
+    {
+        "AID": "F52164",
+        "Vendor": "dormakaba",
+        "Country": "CH",
+        "Name": "Kaba evolo - MasterC",
+        "Description": "Kaba evolo - KabaApplication.MasterC",
+        "Type": "pacs"
+    },
+    {
+        "AID": "F52165",
+        "Vendor": "dormakaba",
+        "Country": "CH",
+        "Name": "Kaba evolo - MasterTPrimary",
+        "Description": "Kaba evolo - KabaApplication.MasterTPrimary",
+        "Type": "pacs"
+    },
+    {
+        "AID": "F52166",
+        "Vendor": "dormakaba",
+        "Country": "CH",
+        "Name": "Kaba evolo - MasterTSecondary",
+        "Description": "Kaba evolo - KabaApplication.MasterTSecundary",
+        "Type": "pacs"
+    },
+    {
         "AID": "F53280",
         "Vendor": "dormakaba",
         "Country": "CH",
@@ -325,6 +405,78 @@
         "Country": "US",
         "Name": "Schlage Access Credential",
         "Description": "FKA aptiQ Access Credential",
+        "Type": "pacs"
+    },
+    {
+        "AID": "F51CD8",
+        "Vendor": "LEAF",
+        "Country": "N/A",
+        "Name": "LEAF Si Universal",
+        "Description": "LEAF Si Universal",
+        "Type": "pacs"
+    },
+    {
+        "AID": "F51CD9",
+        "Vendor": "LEAF",
+        "Country": "N/A",
+        "Name": "LEAF Si Universal",
+        "Description": "LEAF Si Universal",
+        "Type": "pacs"
+    },
+    {
+        "AID": "F51CDB",
+        "Vendor": "LEAF",
+        "Country": "N/A",
+        "Name": "LEAF Cc Enterprise",
+        "Description": "LEAF Cc Enterprise",
+        "Type": "pacs"
+    },
+    {
+        "AID": "F51CDE",
+        "Vendor": "LEAF",
+        "Country": "N/A",
+        "Name": "LEAF Cc Enterprise (Old)",
+        "Description": "LEAF Cc Enterprise (Old)",
+        "Type": "pacs"
+    },
+    {
+        "AID": "F51CDF",
+        "Vendor": "LEAF",
+        "Country": "N/A",
+        "Name": "LEAF Cc Enterprise (Apple Wallet)",
+        "Description": "LEAF Cc Enterprise app found on Apple Wallet credentials",
+        "Type": "pacs"
+    },
+    {
+        "AID": "F532F0",
+        "Vendor": "LEAF",
+        "Country": "N/A",
+        "Name": "LEAF Backwards Compat",
+        "Description": "LEAF Backwards Compat",
+        "Type": "pacs"
+    },
+    {
+        "AID": "F51CDC",
+        "Vendor": "LEAF",
+        "Country": "N/A",
+        "Name": "LEAF Campus",
+        "Description": "LEAF Campus",
+        "Type": "pacs"
+    },
+    {
+        "AID": "42494F",
+        "Vendor": "LEAF",
+        "Country": "N/A",
+        "Name": "LEAF Biometrics",
+        "Description": "LEAF Biometrics",
+        "Type": "pacs"
+    },
+    {
+        "AID": "F532F1",
+        "Vendor": "LEAF",
+        "Country": "N/A",
+        "Name": "LEAF User Privileges",
+        "Description": "LEAF User Privileges",
         "Type": "pacs"
     },
     {
@@ -781,14 +933,6 @@
         "Country": "DE",
         "Name": "car2go Defunct Membership Card",
         "Description": "car2go Defunct Membership Card // Defunct // Private Application #1",
-        "Type": "vehicle access"
-    },
-    {
-        "AID": "F52100",
-        "Vendor": "Lucid Motors via Lucid Group",
-        "Country": "US",
-        "Name": "Lucid Motors Valet Card",
-        "Description": "Lucid Motors Valet Card",
         "Type": "vehicle access"
     },
     {
@@ -1388,7 +1532,15 @@
         "Vendor": "Helsinki Region Transport (HRT)",
         "Country": "FI",
         "Name": "HSL Card (HEL/TLL/TAY)",
-        "Description": "HEL/TLL/TAY HSL Card",
+        "Description": "HEL/TLL/TAY HSL Card (Old green card before 2016)",
+        "Type": "transport"
+    },
+    {
+        "AID": "EF2014",
+        "Vendor": "Helsinki Region Transport (HRT)",
+        "Country": "FI",
+        "Name": "HSL Card (HEL/TLL/TAY)",
+        "Description": "HEL/TLL/TAY HSL Card (New blue card after 2016)",
         "Type": "transport"
     },
     {

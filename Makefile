@@ -29,12 +29,19 @@ ifneq (,$(DESTDIR))
     endif
 endif
 
-all clean install uninstall check: %: client/% bootrom/% armsrc/% recovery/% mfc_card_only/% mfc_card_reader/% mfd_aes_brute/% fpga_compress/% cryptorf/%
-# hitag2crack toolsuite is not yet integrated in "all", it must be called explicitly: "make hitag2crack"
-#all clean install uninstall check: %: hitag2crack/%
-clean: %: hitag2crack/%
-	find . -type d -name __pycache__ -exec rm -rfv \{\} +
+define submake
+    $(MAKE) $(1)/$(2) || exit 1;
+endef
 
+# hitag2crack toolsuite is not yet integrated in "all", it must be called explicitly: "make hitag2crack"
+HOST_TARGETS := client mfc_card_only mfc_card_reader mfd_aes_brute mfulc_des_brute fpga_compress cryptorf
+TARGETS := bootrom armsrc recovery $(HOST_TARGETS)
+all clean install uninstall check: %:
+	$(foreach target,$(TARGETS),$(call submake,$(target),$*))
+
+host: host/all
+host/all host/clean host/install host/uninstall host/check: %:
+	$(foreach target,$(HOST_TARGETS),$(call submake,$(target),$(notdir $*)))
 
 INSTALLTOOLS=mfc/pm3_eml2lower.sh mfc/pm3_eml2upper.sh mfc/pm3_mfdread.py mfc/pm3_mfd2eml.py mfc/pm3_eml2mfd.py pm3_amii_bin2eml.pl pm3_reblay-emulating.py pm3_reblay-reading.py
 INSTALLSIMFW=sim011.bin sim011.sha512.txt sim013.bin sim013.sha512.txt sim014.bin sim014.sha512.txt
@@ -124,6 +131,9 @@ mfc_card_reader/check: FORCE
 mfd_aes_brute/check: FORCE
 	$(info [*] CHECK $(patsubst %/check,%,$@))
 	$(Q)$(BASH) tools/pm3_tests.sh $(CHECKARGS) $(patsubst %/check,%,$@)
+mfulc_des_brute/check: FORCE
+	$(info [*] CHECK $(patsubst %/check,%,$@))
+	$(Q)$(BASH) tools/pm3_tests.sh $(CHECKARGS) $(patsubst %/check,%,$@)
 fpga_compress/check: FORCE
 	$(info [*] CHECK $(patsubst %/check,%,$@))
 	$(Q)$(BASH) tools/pm3_tests.sh $(CHECKARGS) $(patsubst %/check,%,$@)
@@ -145,8 +155,6 @@ hitag2crack/check: FORCE
 common/check: FORCE
 	$(info [*] CHECK $(patsubst %/check,%,$@))
 	$(Q)$(BASH) tools/pm3_tests.sh $(CHECKARGS) $(patsubst %/check,%,$@)
-check: common/check
-	$(info [*] ALL CHECKS DONE)
 
 cryptorf/%: FORCE
 	$(info [*] MAKE $@)
@@ -157,6 +165,9 @@ mfc_card_only/%: FORCE
 mfc_card_reader/%: FORCE
 	$(info [*] MAKE $@)
 	$(Q)$(MAKE) --no-print-directory -C tools/mfc/card_reader $(patsubst mfc_card_reader/%,%,$@) DESTDIR=$(MYDESTDIR)
+mfulc_des_brute/%: FORCE
+	$(info [*] MAKE $@)
+	$(Q)$(MAKE) --no-print-directory -C tools/mfulc_des_brute $(patsubst mfulc_des_brute/%,%,$@) DESTDIR=$(MYDESTDIR)
 mfd_aes_brute/%: FORCE
 	$(info [*] MAKE $@)
 	$(Q)$(MAKE) --no-print-directory -C tools/mfd_aes_brute $(patsubst mfd_aes_brute/%,%,$@) DESTDIR=$(MYDESTDIR)
@@ -180,15 +191,20 @@ recovery/%: FORCE cleanifplatformchanged
 hitag2crack/%: FORCE
 	$(info [*] MAKE $@)
 	$(Q)$(MAKE) --no-print-directory -C tools/hitag2crack $(patsubst hitag2crack/%,%,$@) DESTDIR=$(MYDESTDIR)
+hitag2crack/clean: FORCE hitag2crack/_clean_pycache
+hitag2crack/_clean_pycache:
+	find . -type d -name __pycache__ -exec rm -rfv \{\} +
+
 FORCE: # Dummy target to force remake in the subdirectories, even if files exist (this Makefile doesn't know about the prerequisites)
 
-.PHONY: all clean install uninstall help _test bootrom fullimage recovery client mfc_card_only mfc_card_reader mfd_aes_brute hitag2crack style miscchecks release FORCE udev accessrights cleanifplatformchanged
+.PHONY: all host clean install uninstall help _test bootrom fullimage recovery client mfc_card_only mfc_card_reader mfulc_des_brute mfd_aes_brute hitag2crack style miscchecks release FORCE udev accessrights cleanifplatformchanged
 
 help:
 	@echo "Multi-OS Makefile"
 	@echo
 	@echo "Possible targets:"
 	@echo "+ all             - Make all targets: bootrom, fullimage and OS-specific host tools"
+	@echo "+ host            - Make all OS-specific host tools"
 	@echo "+ clean           - Clean in all targets"
 	@echo "+ .../clean       - Clean in specified target and its deps, e.g. bootrom/clean"
 	@echo "+ (un)install     - Install/uninstall Proxmark files in the system, default to /usr/local/share,"
@@ -202,6 +218,7 @@ help:
 	@echo "+ cryptorf        - Make tools/cryptorf"
 	@echo "+ mfc_card_only   - Make tools/mfc/card_only"
 	@echo "+ mfc_card_reader - Make tools/mfc/card_reader"
+	@echo "+ mfulc_des_brute        - Make tools/mfulc_des_brute"
 	@echo "+ mfd_aes_brute   - Make tools/mfd_aes_brute"
 	@echo "+ hitag2crack     - Make tools/hitag2crack"
 	@echo "+ fpga_compress   - Make tools/fpga_compress"
@@ -245,6 +262,8 @@ cryptorf: cryptorf/all
 mfc_card_only: mfc_card_only/all
 
 mfc_card_reader: mfc_card_reader/all
+
+mfulc_des_brute: mfulc_des_brute/all
 
 mfd_aes_brute: mfd_aes_brute/all
 
@@ -318,11 +337,17 @@ style: commands
 		-exec perl -pi -e 's/[ \t]+$$//' {} \; \
 		-exec sh -c "tail -c1 {} | xxd -p | tail -1 | grep -q -v 0a$$" \; \
 		-exec sh -c "echo >> {}" \;
-	# Apply astyle on *.c, *.h, *.cpp
-	find . \( -not -path "./cov-int/*" -and -not -path "./venv*" -and \( \( -name "*.[ch]" -and -not -name "ui_overlays.h" \) -or \( -name "*.cpp" -and -not -name "*.moc.cpp" \) \) \) -exec astyle --formatted --mode=c --suffix=none \
+	# Apply astyle on *.c, *.h,
+	find . \( -not -path "./cov-int/*" -and -not -path "./venv*" -and -name "*.[ch]" -and -not -name "ui_overlays.h" \) -exec astyle --formatted --mode=c --suffix=none \
 		--indent=spaces=4 --indent-switches \
 		--keep-one-line-blocks --max-continuation-indent=60 \
 		--style=google --pad-oper --unpad-paren --pad-header \
+		--align-pointer=name {} \;
+	# Apply astyle on *.cpp, *.hpp: no pad-oper as it can cause issues with templates
+	find . \( -not -path "./cov-int/*" -and -not -path "./venv*" -and -name "*.cpp" -and -not -name "*.moc.cpp" \) -exec astyle --formatted --mode=c --suffix=none \
+		--indent=spaces=4 --indent-switches \
+		--keep-one-line-blocks --max-continuation-indent=60 \
+		--style=google --unpad-paren --pad-header \
 		--align-pointer=name {} \;
 
 commands: client

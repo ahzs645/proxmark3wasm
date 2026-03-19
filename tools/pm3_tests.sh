@@ -1,14 +1,18 @@
 #!/usr/bin/env bash
 
+# For Python tests, uv will be used if present.
+# You can forcibly ignore it with
+# SKIPUV=1 ./pm3_tests.sh
+
 # This is used to make sure that the language for the functions is english instead of the system default language.
-LANG=C
+LANG=C.UTF-8
 
 PM3PATH="$(dirname "$0")/.."
 cd "$PM3PATH" || exit 1
 
 PYTHON=python3
-if command -v uv >/dev/null 2>&1; then
-    PYTHON="uv run --script"
+if [ "${SKIPUV:-0}" != "1" ] && command -v uv >/dev/null 2>&1; then
+  PYTHON="uv run --script"
 fi
 
 DICPATH="./client/dictionaries"
@@ -22,6 +26,7 @@ TESTSTATICNESTED=false
 TESTNONCE2KEY=false
 TESTMFNONCEBRUTE=false
 TESTMFDAESBRUTE=false
+TESTMFULCDESBRUTE=false
 TESTHITAG2CRACK=false
 TESTCRYPTORF=false
 TESTFPGACOMPRESS=false
@@ -37,7 +42,7 @@ while (( "$#" )); do
   case "$1" in
     -h|--help)
       echo """
-Usage: $0 [--long] [--opencl] [--clientbin /path/to/proxmark3] [mfkey|nonce2key|mf_nonce_brute|staticnested|mfd_aes_brute|cryptorf|fpga_compress|bootrom|armsrc|client|recovery|common]
+Usage: $0 [--long] [--opencl] [--clientbin /path/to/proxmark3] [mfkey|nonce2key|mf_nonce_brute|staticnested|mfd_aes_brute|mfulc_des_brute|cryptorf|fpga_compress|bootrom|armsrc|client|recovery|common]
     --long:          Enable slow tests
     --opencl:        Enable tests requiring OpenCL (preferably a Nvidia GPU)
     --clientbin ...: Specify path to proxmark3 binary to test
@@ -90,6 +95,11 @@ Usage: $0 [--long] [--opencl] [--clientbin /path/to/proxmark3] [mfkey|nonce2key|
     mfd_aes_brute)
       TESTALL=false
       TESTMFDAESBRUTE=true
+      shift
+      ;;
+    mfulc_des_brute)
+      TESTALL=false
+      TESTMFULCDESBRUTE=true
       shift
       ;;
     fpga_compress)
@@ -350,7 +360,16 @@ while true; do
       if ! CheckExecute      "mfd_aes_brute test 1/2"         "$MFDASEBRUTEBIN 1629394800 bb6aea729414a5b1eff7b16328ce37fd 82f5f498dbc29f7570102397a2e5ef2b6dc14a864f665b3c54d11765af81e95c" "key.................... .*261C07A23F2BC8262F69F10A5BDF3764"; then break; fi
       if ! CheckExecute slow "mfd_aes_brute test 2/2"         "$MFDASEBRUTEBIN 1546300800 3fda933e2953ca5e6cfbbf95d1b51ddf 97fe4b5de24188458d102959b888938c988e96fb98469ce7426f50f108eaa583" "key.................... .*E757178E13516A4F3171BC6EA85E165A"; then break; fi
     fi
-
+    if $TESTALL || $TESTMFULCDESBRUTE; then
+      echo -e "\n${C_BLUE}Testing mfulc_des_brute:${C_NC} ${MFULCDESBRUTEBIN:=./tools/mfulc_des_brute/mfulc_des_brute}"
+      if ! CheckFileExist "mfulc_des_brute exists"        "$MFULCDESBRUTEBIN"; then break; fi
+      # USCUID-UL
+      if ! CheckExecute "mfulc_des_brute test 1/3"        "$MFULCDESBRUTEBIN -c F35C740106ECED87 E9E0DC67B35919FC 00000000000000000000000000000000 2 4" "00000000404452420000000000000000"; then break; fi
+      # ULCG
+      if ! CheckExecute "mfulc_des_brute test 2/3"        "$MFULCDESBRUTEBIN -c 49C1603621CCAA72 8122262EF5FA8DEB 48444C4A4044524200000000544E5846 3 4" "48444C4A40445242204E4042544E5846"; then break; fi
+      # Reader RndB nonce key recovery
+      if ! CheckExecute "mfulc_des_brute test 2/3"        "$MFULCDESBRUTEBIN -r EC9C5CF763244367 2283BFE8DEBE1780922327794D0706EF 48444C4A4044524200000000544E5846 3 4" "48444C4A40445242204E4042544E5846"; then break; fi
+    fi
     if $TESTALL || $TESTCRYPTORF; then
       echo -e "\n${C_BLUE}Testing CryptoRF sma:${C_NC} ${CRYPTRFBRUTEBIN:=./tools/cryptorf/sma} ${CRYPTRF_MULTI_BRUTEBIN:=./tools/cryptorf/sma_multi}"
       if ! CheckFileExist "sma exists"               "$CRYPTRFBRUTEBIN"; then break; fi
@@ -455,8 +474,25 @@ while true; do
       if ! CheckExecute "nfc decode test - signature"    "$CLIENTBIN -c 'nfc decode -d 03FF010194113870696C65742E65653A656B616172743A3266195F26063132303832325904202020205F28033233335F2701316E1B5A13333038363439303039303030323636343030355304EBF2CE704103000000AC536967010200803A2448FCA7D354A654A81BD021150D1A152D1DF4D7A55D2B771F12F094EAB6E5E10F2617A2F8DAD4FD38AFF8EA39B71C19BD42618CDA86EE7E144636C8E0E7CFC4096E19C3680E09C78A0CDBC05DA2D698E551D5D709717655E56FE3676880B897D2C70DF5F06ECE07C71435255144F8EE41AF110E7B180DA0E6C22FB8FDEF61800025687474703A2F2F70696C65742E65652F6372742F33303836343930302D303030312E637274FE'" "30864900-0001.crt"; then break; fi
       if ! CheckExecute "nfc decode test - openprinter tag"  "$CLIENTBIN -c 'nfc decode -d 03FF012F91013A55046E756D616B6572732E636F6D2F70726F64756374732F6162732D66696C616D656E743F76617269616E743D3436393434323937333836323932521CD26170706C69636174696F6E2F766E642E6F70656E7072696E74746167A10218AFBF041B000007D0FCAB45F9080009020A70414253204C656D6F6E2059656C6C6F770B684E756D616B6572730E1A69094200101903E81119041A1218F01343F9A800181DF93C29182218F01823190104182418AA1825185A18261864FF00'" "application/vnd.openprinttag"; then break; fi
 
+      if ! CheckExecute "wiegand encode test - new"  "$CLIENTBIN -c 'wiegand encode -w H10301 --fc 123 --cn 4567 --new'" "New PACS\\.{9} 0x 06BD88EB80"; then break; fi
+      if ! CheckExecute "wiegand encode test - bin"  "$CLIENTBIN -c 'wiegand encode --bin 1'" "Wiegand raw\\.{4} 03"; then break; fi
+      if ! CheckExecute "wiegand encode test - new bin"  "$CLIENTBIN -c 'wiegand encode --bin 1 --new'" "New PACS\\.{9} 0x 0780"; then break; fi
+      if ! CheckExecute "wiegand encode test - new bin verbose hdr"  "$CLIENTBIN -c 'wiegand encode --bin 1 --new --verbose'" "New PACS"; then break; fi
+      if ! CheckExecute "wiegand encode test - new bin verbose pad"  "$CLIENTBIN -c 'wiegand encode --bin 1 --new --verbose'" "With Sentinel\\.{4} 0b 00000011 \\(8-bit\\)"; then break; fi
+      if ! CheckExecute "wiegand encode test - new bin verbose raw"  "$CLIENTBIN -c 'wiegand encode --bin 1 --new --verbose'" "Wiegand --raw\\.{4} 0x 03"; then break; fi
+      if ! CheckExecute "wiegand encode test - new bin verbose bin"  "$CLIENTBIN -c 'wiegand encode --bin 1 --new --verbose'" "Without Sentinel\\. 0b 1 \\(1-bit\\)"; then break; fi
+      if ! CheckExecute "wiegand encode test - bin 96-bit"  "PAT=\$(printf '01%.0s' {1..48}); $CLIENTBIN -c \"wiegand encode --bin \$PAT\"" "Wiegand raw\\.{4} 01555555555555555555555555"; then break; fi
+      if ! CheckExecute "wiegand encode test - new bin 96-bit"  "PAT=\$(printf '01%.0s' {1..48}); $CLIENTBIN -c \"wiegand encode --bin \$PAT --new\"" "New PACS\\.{9} 0x 00555555555555555555555555"; then break; fi
+      if ! CheckExecute "wiegand encode test - new bin 96-bit verbose pad"  "PAT=\$(printf '01%.0s' {1..48}); $CLIENTBIN -c \"wiegand encode --bin \$PAT --new --verbose\"" "With Sentinel\\.{4} 0b 00000001010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101 \\(104-bit\\)"; then break; fi
+      if ! CheckExecute "wiegand encode test - new bin 96-bit verbose raw"  "PAT=\$(printf '01%.0s' {1..48}); $CLIENTBIN -c \"wiegand encode --bin \$PAT --new --verbose\"" "Wiegand --raw\\.{4} 0x 01555555555555555555555555"; then break; fi
+      if ! CheckExecute "wiegand encode test - new 48-bit"  "$CLIENTBIN -c 'wiegand encode -w C1k48s --fc 42069 --cn 42069 --new'" "New PACS\\.{9} 0x 0000A4550148AB"; then break; fi
+      if ! CheckExecute "wiegand decode test - raw over 96-bit"  "$CLIENTBIN -c 'wiegand decode --raw 01555555555555555555555555' 2>&1" "Raw hex decode supports up to 96 Wiegand bits"; then break; fi
       if ! CheckExecute "wiegand decode test - raw"  "$CLIENTBIN -c 'wiegand decode --raw 2006F623AE'" "FC: 123  CN: 4567  parity \( ok \)"; then break; fi
+      if ! CheckExecute "wiegand decode test - bin over 96-bit"  "PAT=\$(printf '01%.0s' {1..49}); $CLIENTBIN -c \"wiegand decode --bin \$PAT\" 2>&1" "Binary decode supports up to 96 Wiegand bits"; then break; fi
       if ! CheckExecute "wiegand decode test - new"  "$CLIENTBIN -c 'wiegand decode --new 06BD88EB80'" "FC: 123  CN: 4567  parity \( ok \)"; then break; fi
+      if ! CheckExecute "wiegand decode test - new no padded bin"  "if ! $CLIENTBIN -c 'wiegand decode --new 06BD88EB80' 2>&1 | grep -q 'padded bin'; then echo OK; fi" "OK"; then break; fi
+      if ! CheckExecute "wiegand decode test - new 96-bit"  "$CLIENTBIN -c 'wiegand decode --new 00555555555555555555555555'" "hex\\.{14} 555555555555555555555555"; then break; fi
+      if ! CheckExecute "wiegand decode test - new 48-bit"  "$CLIENTBIN -c 'wiegand decode --new 0000A4550148AB'" "C1k48s.*FC: 42069  CN: 42069  parity \( ok \)"; then break; fi
       if ! CheckExecute "wiegand Verkada40 encode test 1" "$CLIENTBIN -c 'wiegand encode -w Verkada40 --fc 50 --cn 1001'" "86400007D3"; then break; fi
       if ! CheckExecute "wiegand Verkada40 decode test 1" "$CLIENTBIN -c 'wiegand decode --raw 86400007D3'" "Verkada40.*FC: 50  CN: 1001  parity \( ok \)"; then break; fi
       if ! CheckExecute "wiegand Verkada40 encode test 2" "$CLIENTBIN -c 'wiegand encode -w Verkada40 --fc 50 --cn 1004'" "86400007D9"; then break; fi
@@ -591,6 +627,7 @@ while true; do
       if ! CheckExecute "emv test"                       "$CLIENTBIN -c 'emv test'" "Tests \( ok"; then break; fi
       if ! CheckExecute "hf cipurse test"                "$CLIENTBIN -c 'hf cipurse test'" "Tests \( ok"; then break; fi
       if ! CheckExecute "hf mfdes test"                  "$CLIENTBIN -c 'hf mfdes test'"   "Tests \( ok"; then break; fi
+      if ! CheckExecute "hf gst test"                    "$CLIENTBIN -c 'hf gst test'"     "Tests \( ok"; then break; fi
       if ! CheckExecute "hf waveshare load"              "$CLIENTBIN -c 'hf waveshare load -m 6 -f tools/lena.bmp -s dither.bmp' && echo '34ff55fe7257876acf30dae00eb0e439 dither.bmp' | md5sum -c -" "dither.bmp: OK"; then break; fi
     fi
   echo -e "\n------------------------------------------------------------"

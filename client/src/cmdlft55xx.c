@@ -948,9 +948,9 @@ static int CmdT55xxReadBlock(const char *Cmd) {
                   _CYAN_("Use of read with password on a tag not configured") "\n"
                   _CYAN_("for a password can damage the tag") "\n"
                   _RED_("           * * * * * * * * * *"),
-                  "lf t55xx read -b 0                   --> read data from block 0\n"
-                  "lf t55xx read -b 0 --pwd 01020304    --> read data from block 0, pwd 01020304\n"
-                  "lf t55xx read -b 0 --pwd 01020304 -o --> read data from block 0, pwd 01020304, override\n"
+           "lf t55xx read -b 0                   --> read data from block 0\n"
+           "lf t55xx read -b 0 --pwd 01020304    --> read data from block 0, pwd 01020304\n"
+           "lf t55xx read -b 0 --pwd 01020304 -o --> read data from block 0, pwd 01020304, override\n"
                  );
 
     // 1 (help) + 4(four user specified params) + (5 T55XX_DLMODE_SINGLE)
@@ -1112,7 +1112,7 @@ static int CmdT55xxWakeUp(const char *Cmd) {
     CLIExecWithReturn(ctx, Cmd, argtable, true);
 
     uint32_t password = 0;
-    int res = arg_get_u32_hexstr_def_nlen(ctx, 2, 0, &password, 4, true);
+    int res = arg_get_u32_hexstr_def_nlen(ctx, 1, 0, &password, 4, true);
     if (res == 0 || res == 2) {
         PrintAndLogEx(ERR, "Password should be 4 hex bytes");
         CLIParserFree(ctx);

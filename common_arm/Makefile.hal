@@ -98,6 +98,7 @@ endef
 PLTNAME = Unknown Platform
 PLATFORM_FPGA = fpga-undefined
 
+PLATFORM_DEFS =
 ifeq ($(PLATFORM),PM3RDV4)
     # FPGA bitstream files, the order doesn't matter anymore
     FPGA_BITSTREAMS = fpga_pm3_hf.bit
@@ -232,6 +233,9 @@ endif
 ifneq ($(SKIP_ICLASS),1)
     PLATFORM_DEFS += -DWITH_ICLASS
 endif
+ifneq ($(SKIP_SEOS),1)
+    PLATFORM_DEFS += -DWITH_SEOS
+endif
 ifneq ($(SKIP_FELICA),1)
     PLATFORM_DEFS += -DWITH_FELICA
 endif
@@ -302,7 +306,7 @@ ifneq ($(PLATFORM), $(CACHED_PLATFORM))
     PLATFORM_CHANGED=true
 else ifneq ($(PLATFORM_EXTRAS), $(CACHED_PLATFORM_EXTRAS))
     PLATFORM_CHANGED=true
-else ifneq ($(PLATFORM_DEFS), $(CACHED_PLATFORM_DEFS))
+else ifneq ($(strip $(PLATFORM_DEFS)), $(strip $(CACHED_PLATFORM_DEFS)))
     PLATFORM_CHANGED=true
 endif
 

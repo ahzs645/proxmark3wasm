@@ -36,6 +36,7 @@
 #include "iclass_cmd.h"         // picopass defines
 #include "cmdhf.h"              // handle HF plot
 #include "atrs.h"               // atqbToEmulatedAtr
+#include "pla.h"                // ECP parsing
 
 #define MAX_14B_TIMEOUT_MS (4949U)
 
@@ -397,7 +398,7 @@ uint8_t *get_uid_from_filename(const char *filename) {
         return uid;
     }
 
-    char *found = strstr(filename, "hf-14b-");
+    const char *found = strstr(filename, "hf-14b-");
     if (found == NULL) {
         PrintAndLogEx(ERR, "can't get uid from filename `" _YELLOW_("%s") "` expected format is hf-14b-<uid>...", filename);
         return uid;
@@ -877,6 +878,120 @@ static void print_sr_blocks(uint8_t *data, size_t len, const uint8_t *uid, bool 
 // 0200a404000cd2760001354b414e4d30310000 (resp 02 6a 82 [4b 4c])
 // 0200a404000ca000000063504b43532d313500 (resp 02 6a 82 [4b 4c])
 // 0200a4040010a000000018300301000000000000000000 (resp 02 6a 82 [4b 4c])
+
+static int hf14b_setconfig(hf14b_config_t *config, bool verbose) {
+    if (!g_session.pm3_present) return PM3_ENOTTY;
+
+    clearCommandBuffer();
+    if (config != NULL) {
+        SendCommandNG(CMD_HF_ISO14443B_SET_CONFIG, (uint8_t *)config, sizeof(hf14b_config_t));
+        if (verbose) {
+            SendCommandNG(CMD_HF_ISO14443B_PRINT_CONFIG, NULL, 0);
+        }
+    } else {
+        SendCommandNG(CMD_HF_ISO14443B_PRINT_CONFIG, NULL, 0);
+    }
+
+    return PM3_SUCCESS;
+}
+
+static int CmdHf14BConfig(const char *Cmd) {
+    if (!g_session.pm3_present) return PM3_ENOTTY;
+
+    CLIParserContext *ctx;
+    CLIParserInit(&ctx, "hf 14b config",
+                  "Configure 14b settings (use with caution)\n",
+                  "hf 14b config                      -> Print current configuration\n"
+                  "hf 14b config --std                -> Reset default configuration\n"
+                  "hf 14b config --pla <hex>          -> Set polling loop annotation (max 22 bytes)\n"
+                  "hf 14b config --pla off            -> Disable polling loop annotation\n"
+                  "hf 14b config --pla ecp.access     -> Set ECP Access (default)\n"
+                  "hf 14b config --pla ecp.transit.emv -> Set ECP Transit for EMV\n");
+    void *argtable[] = {
+        arg_param_begin,
+        arg_str0(NULL, "pla", "<hex|off>", "Configure polling loop annotation"),
+        arg_lit0(NULL, "std", "Reset default configuration"),
+        arg_lit0("v", "verbose", "verbose output"),
+        arg_param_end
+    };
+    CLIExecWithReturn(ctx, Cmd, argtable, true);
+    bool defaults = arg_get_lit(ctx, 2);
+    bool verbose = arg_get_lit(ctx, 3);
+
+    int vlen = 0;
+    char value[64];
+
+    // Handle polling loop annotation parameter
+    iso14b_polling_frame_t pla = {
+        // 0 signals that PLA has to be disabled, -1 signals that no change has to be made
+        .frame_length = defaults ? 0 : -1,
+        .last_byte_bits = 8,
+        .extra_delay = 30
+    };
+
+    // Get main --pla value
+    CLIParamStrToBuf(arg_get_str(ctx, 1), (uint8_t *)value, sizeof(value), &vlen);
+    str_lower((char *)value);
+
+    if (vlen > 0) {
+        if (strncmp((char *)value, "std", 3) == 0) pla.frame_length = 0;
+        else if (strncmp((char *)value, "skip", 4) == 0) pla.frame_length = 0;
+        else if (strncmp((char *)value, "disable", 3) == 0) pla.frame_length = 0;
+        else if (strncmp((char *)value, "off", 3) == 0) pla.frame_length = 0;
+        else if (strncmp((char *)value, "ecp", 3) == 0) {
+            // Parse ECP subcommand
+            int length = pla_parse_ecp_subcommand((char *)value, pla.frame, sizeof(pla.frame));
+            if (length < 0) {
+                CLIParserFree(ctx);
+                return PM3_EINVARG;
+            }
+            pla.frame_length = length;
+
+            // Add CRC
+            uint8_t first, second;
+            compute_crc(CRC_14443_B, pla.frame, pla.frame_length, &first, &second);
+            pla.frame[pla.frame_length++] = first;
+            pla.frame[pla.frame_length++] = second;
+            PrintAndLogEx(INFO, "Set polling loop annotation to ECP: %s", sprint_hex(pla.frame, pla.frame_length));
+        } else {
+            // Convert hex string to bytes
+            int length = 0;
+            if (param_gethex_to_eol((char *)value, 0, pla.frame, sizeof(pla.frame), &length) != 0) {
+                PrintAndLogEx(ERR, "Error parsing polling loop annotation bytes");
+                CLIParserFree(ctx);
+                return PM3_EINVARG;
+            }
+            pla.frame_length = length;
+
+            // Validate length before adding CRC
+            if (pla.frame_length < 1 || pla.frame_length > 22) {
+                PrintAndLogEx(ERR, "Polling loop annotation length invalid: min %d; max %d", 1, 22);
+                CLIParserFree(ctx);
+                return PM3_EINVARG;
+            }
+
+            uint8_t first, second;
+            compute_crc(CRC_14443_B, pla.frame, pla.frame_length, &first, &second);
+            pla.frame[pla.frame_length++] = first;
+            pla.frame[pla.frame_length++] = second;
+            PrintAndLogEx(INFO, "Set polling loop annotation to: %s", sprint_hex(pla.frame, pla.frame_length));
+        }
+    }
+
+    CLIParserFree(ctx);
+
+    // Handle empty command
+    if (strlen(Cmd) == 0) {
+        return hf14b_setconfig(NULL, verbose);
+    }
+
+    // Initialize config with all parameters
+    hf14b_config_t config = {
+        .polling_loop_annotation = pla
+    };
+
+    return hf14b_setconfig(&config, verbose);
+}
 
 static int CmdHF14BList(const char *Cmd) {
     return CmdTraceListAlias(Cmd, "hf 14b", "14b -c");
@@ -2629,17 +2744,15 @@ int CmdHF14BNdefRead(const char *Cmd) {
         switch_off_field_14b();
         return res;
     }
-    // take offset from response
-    uint8_t offset = response[1];
-    
+
     // Parse CC data
     uint8_t cc_data[resplen - 2];
     memcpy(cc_data, response, sizeof(cc_data));
     uint8_t file_id[2] = {cc_data[9], cc_data[10]};
-    
+
 
     uint16_t max_rapdu_size = (cc_data[3] << 8 | cc_data[4]) - 2;
-    
+
     max_rapdu_size = max_rapdu_size < sizeof(response) - 2 ? max_rapdu_size : sizeof(response) - 2;
     // ---------------  NDEF file reading ----------------
     uint8_t aSELECT_FILE_NDEF[30];
@@ -2677,7 +2790,7 @@ int CmdHF14BNdefRead(const char *Cmd) {
     }
 
     uint16_t ndef_size = (response[0] << 8) + response[1];
-    offset = 2;
+    uint8_t offset = 2;
 
     uint8_t *ndef_file = calloc(ndef_size, sizeof(uint8_t));
     if (ndef_file == NULL) {
@@ -2739,7 +2852,7 @@ int CmdHF14BNdefRead(const char *Cmd) {
         PrintAndLogEx(HINT, "Hint: Try " _YELLOW_("`hf 14b ndefread -v`") " for more details"); // So far this prints absolutely nothing
     }
 
-    
+
     // get total NDEF length before save. If fails, we save it all
     size_t n = 0;
     if (NDEFGetTotalLength(response + 2, resplen - 4, &n) != PM3_SUCCESS)
@@ -3079,6 +3192,135 @@ static int CmdHF14BMobibRead(const char *Cmd) {
     return PM3_SUCCESS;
 }
 
+static int CmdHF14BSriTearoff(const char *Cmd) {
+
+    CLIParserContext *ctx;
+    CLIParserInit(&ctx, "hf 14b tearoff",
+                  "Use tear-off technique to manipulate ST25TB/SRx monotonic counter blocks.\n"
+                  "This exploits EEPROM tearing to increment counters that normally can only\n"
+                  "be decremented. Based on the near-field-chaos project by SecLabz.\n"
+                  "\n"
+                  "The attack works by sending a write command and cutting the RF field at\n"
+                  "a precise moment, causing a partial write that can raise the counter value.\n"
+                  "The operation usually takes a few seconds to a few minutes.\n"
+                  "\n"
+                  " NOTE: 0xFFFFFFFE values may be unstable due to tag internals.\n"
+                  "       Keep the tag positioned steadily on the antenna.\n",
+                  "hf 14b tearoff -b 5 -d FFFFFFFE\n"
+                  "hf 14b tearoff -b 6 -d FFFFFFFE\n"
+                  "hf 14b tearoff -b 5 -d FFFFFFFE --start 5000 --adj 50\n"
+                  "hf 14b tearoff -b 5 -d FFFFFFFE --safety 1000\n"
+                 );
+
+    void *argtable[] = {
+        arg_param_begin,
+        arg_int1("b", "block",   "<dec>", "block number (typically 5 or 6 for ST25TB counters)"),
+        arg_str1("d", "data",    "<hex>", "target counter value (4 hex bytes, e.g. FFFFFFFE)"),
+        arg_int0(NULL, "adj",    "<dec>", "tear-off timing step in us (default: 25)"),
+        arg_int0(NULL, "safety", "<dec>", "safety threshold value (default: 0x1000)"),
+        arg_int0(NULL, "start",  "<dec>", "initial tear-off delay in us (default: 150)"),
+        arg_param_end
+    };
+    CLIExecWithReturn(ctx, Cmd, argtable, false);
+
+    int blockno = arg_get_int_def(ctx, 1, -1);
+
+    int dlen = 0;
+    uint8_t data[4] = {0};
+    int res = CLIParamHexToBuf(arg_get_str(ctx, 2), data, sizeof(data), &dlen);
+    if (res) {
+        CLIParserFree(ctx);
+        return PM3_EINVARG;
+    }
+
+    int adj = arg_get_int_def(ctx, 3, 0);
+    int safety = arg_get_int_def(ctx, 4, 0x1000);
+    int start = arg_get_int_def(ctx, 5, 0);
+    CLIParserFree(ctx);
+
+    if (dlen != 4) {
+        PrintAndLogEx(FAILED, "target value must be 4 hex bytes, got %d", dlen);
+        return PM3_EINVARG;
+    }
+
+    if (blockno < 0 || blockno > 255) {
+        PrintAndLogEx(FAILED, "block number must be 0-255, got %d", blockno);
+        return PM3_EINVARG;
+    }
+
+    // Convert data bytes to uint32_t (little-endian as per ST25TB convention)
+    uint32_t target_value = (uint32_t)data[0] << 24 |
+                            (uint32_t)data[1] << 16 |
+                            (uint32_t)data[2] << 8  |
+                            (uint32_t)data[3];
+
+    PrintAndLogEx(INFO, "");
+    PrintAndLogEx(INFO, "--- " _CYAN_("ST25TB Tear-off Attack") " ---------");
+    PrintAndLogEx(INFO, " block............. " _YELLOW_("%d"), blockno);
+    PrintAndLogEx(INFO, " target value...... " _YELLOW_("0x%08X"), target_value);
+    PrintAndLogEx(INFO, " start delay....... " _YELLOW_("%d") " us", start > 0 ? start : 150);
+    PrintAndLogEx(INFO, " timing step....... " _YELLOW_("%d") " us", adj > 0 ? adj : 25);
+    PrintAndLogEx(INFO, " safety threshold.. " _YELLOW_("0x%04X"), safety);
+    PrintAndLogEx(INFO, "");
+    PrintAndLogEx(INFO, "Press " _GREEN_("pm3 button") " or " _GREEN_("Enter") " to abort");
+    PrintAndLogEx(INFO, "");
+
+    // Build payload (must match st25tb_tearoff_params_t on ARM side)
+    struct {
+        uint8_t  block_address;
+        uint32_t target_value;
+        uint32_t tear_off_adjustment_us;
+        uint32_t safety_value;
+        uint32_t start_time_us;
+    } PACKED payload;
+
+    payload.block_address = (uint8_t)blockno;
+    payload.target_value = target_value;
+    payload.tear_off_adjustment_us = (uint32_t)adj;
+    payload.safety_value = (uint32_t)safety;
+    payload.start_time_us = (uint32_t)start;
+
+    clearCommandBuffer();
+    SendCommandNG(CMD_HF_ISO14443B_ST25TB_TEAROFF, (uint8_t *)&payload, sizeof(payload));
+
+    // Wait for response with generous timeout.
+    // The ARM side sends periodic CMD_WTX keepalive packets to extend
+    // the timeout, so the attack can run as long as needed.
+    // Use -1 for infinite wait (extended via WTX), abort with Enter key.
+    PacketResponseNG resp;
+    if (WaitForResponseTimeout(CMD_HF_ISO14443B_ST25TB_TEAROFF, &resp, -1) == false) {
+        PrintAndLogEx(WARNING, "command failed or connection lost");
+        return PM3_ETIMEOUT;
+    }
+
+    if (resp.status == PM3_SUCCESS) {
+        uint32_t final_value = 0;
+        if (resp.length >= sizeof(uint32_t)) {
+            memcpy(&final_value, resp.data.asBytes, sizeof(uint32_t));
+        }
+        PrintAndLogEx(SUCCESS, "Tear-off attack " _GREEN_("successful"));
+        PrintAndLogEx(SUCCESS, "Final block value: " _GREEN_("0x%08X"), final_value);
+    } else if (resp.status == PM3_EOPABORTED) {
+        uint32_t final_value = 0;
+        if (resp.length >= sizeof(uint32_t)) {
+            memcpy(&final_value, resp.data.asBytes, sizeof(uint32_t));
+        }
+        PrintAndLogEx(WARNING, "Tear-off attack " _YELLOW_("aborted by user"));
+        PrintAndLogEx(INFO, "Last known value: 0x%08X", final_value);
+    } else {
+        PrintAndLogEx(FAILED, "Tear-off attack " _RED_("failed"));
+        if (resp.length >= sizeof(uint32_t)) {
+            uint32_t final_value = 0;
+            memcpy(&final_value, resp.data.asBytes, sizeof(uint32_t));
+            PrintAndLogEx(INFO, "Last known value: 0x%08X", final_value);
+        }
+    }
+
+    PrintAndLogEx(INFO, "");
+    PrintAndLogEx(HINT, "Hint: use " _YELLOW_("`hf 14b rdbl -b %d`") " to verify the block", blockno);
+    return PM3_SUCCESS;
+}
+
 static int CmdHF14BSetUID(const char *Cmd) {
 
     CLIParserContext *ctx;
@@ -3161,6 +3403,7 @@ static int CmdHF14BSetUID(const char *Cmd) {
 static command_t CommandTable[] = {
     {"---------", CmdHelp,             AlwaysAvailable, "----------------------- " _CYAN_("General") " -----------------------"},
     {"help",      CmdHelp,             AlwaysAvailable, "This help"},
+    {"config",    CmdHf14BConfig,      IfPm3Iso14443b,  "Configure 14b settings (use with caution)"},
     {"list",      CmdHF14BList,        AlwaysAvailable, "List ISO-14443-B history"},
     {"---------", CmdHelp,             AlwaysAvailable, "----------------------- " _CYAN_("Operations") " -----------------------"},
     {"apdu",      CmdHF14BAPDU,        IfPm3Iso14443b,  "Send ISO 14443-4 APDU to tag"},
@@ -3174,6 +3417,7 @@ static command_t CommandTable[] = {
     {"sim",       CmdHF14BSim,         IfPm3Iso14443b,  "Fake ISO ISO-14443-B tag"},
     {"sniff",     CmdHF14BSniff,       IfPm3Iso14443b,  "Eavesdrop ISO-14443-B"},
     {"wrbl",      CmdHF14BSriWrbl,     IfPm3Iso14443b,  "Write data to a SRI512/SRIX4 tag"},
+    {"tearoff",   CmdHF14BSriTearoff,  IfPm3Iso14443b,  "Tear-off attack on ST25TB/SRx counter blocks"},
     {"view",      CmdHF14BView,        AlwaysAvailable, "Display content from tag dump file"},
     {"valid",     CmdSRIX4kValid,      AlwaysAvailable, "SRIX4 checksum test"},
     {"---------", CmdHelp,             AlwaysAvailable, "------------------ " _CYAN_("Calypso / Mobib") " ------------------"},

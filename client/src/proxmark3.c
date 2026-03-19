@@ -33,9 +33,10 @@
 #ifndef __EMSCRIPTEN__
 #include "whereami.h"
 #else
-// Stub for EMSCRIPTEN - no executable path concept in WASM
 static inline int wai_getExecutablePath(char *out, int capacity, int *dirname_length) {
-    (void)out; (void)capacity; (void)dirname_length;
+    (void)out;
+    (void)capacity;
+    (void)dirname_length;
     return -1;
 }
 #endif
@@ -373,8 +374,6 @@ static bool pop_cmdscriptfile(void) {
 }
 
 #if defined(__EMSCRIPTEN__)
-
-// External function from uart_web.c
 extern int uart_read_stdin(void);
 
 static int js_getchar(void) {
@@ -422,6 +421,7 @@ main_loop(const char *script_cmds_file, char *script_cmd, bool stayInCommandLoop
         script_cmd_len = strlen(script_cmd);
         str_creplace(script_cmd, script_cmd_len, ';', '\0');
     }
+
 #ifdef __EMSCRIPTEN__
     bool stdinOnPipe = true;
 #else
@@ -897,7 +897,7 @@ static int dumpmem_pm3(char *serial_port_name, const char *filename, uint32_t ad
             PrintAndLogEx(INFO, "Device is running the bootloader.");
         } else {
             PrintAndLogEx(ERR, "Device is running the bootloader, but the bootloader"
-                          " doesn't understand the READ MEM command.");
+                               " doesn't understand the READ MEM command.");
             goto finish2;
         }
     }

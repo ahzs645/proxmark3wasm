@@ -47,6 +47,7 @@
 #include "pm3_cmd.h"
 #include "mbedtls/cmac.h"
 #include "jansson.h"             // JSON parsing
+#include "pla.h"                 // ECP parsing
 
 static bool g_apdu_in_framing_enable = true;
 bool Get_apdu_in_framing(void) {
@@ -232,15 +233,17 @@ const char *getTagInfo(uint8_t uid) {
 }
 
 static const hintAIDList_t hintAIDList[] = {
-    // AID, AID len, name, hint - how to use
-    { "\xA0\x00\x00\x06\x47\x2F\x00\x01", 8, "FIDO", "hf fido" },
-    { "\xA0\x00\x00\x03\x08\x00\x00\x10\x00\x01\x00", 11, "PIV", "" },
-    { "\xD2\x76\x00\x01\x24\x01", 8, "OpenPGP", "" },
-    { "\x31\x50\x41\x59\x2E\x53\x59\x53\x2E\x44\x44\x46\x30\x31", 14, "EMV (pse)", "emv" },
-    { "\x32\x50\x41\x59\x2E\x53\x59\x53\x2E\x44\x44\x46\x30\x31", 14, "EMV (ppse)", "emv" },
-    { "\x41\x44\x20\x46\x31", 5, "CIPURSE", "hf cipurse" },
-    { "\xd2\x76\x00\x00\x85\x01\x00", 7, "desfire", "hf mfdes" },
-    { "\x4F\x53\x45\x2E\x56\x41\x53\x2E\x30\x31", 10, "Apple VAS", "hf vas"},
+    { "\xA0\x00\x00\x06\x47\x2F\x00\x01", 8, "", 0, "FIDO", "hf fido" },
+    { "\xA0\x00\x00\x03\x08\x00\x00\x10\x00\x01\x00", 11, "", 0, "PIV", "" },
+    { "\xD2\x76\x00\x01\x24\x01", 8, "", 0, "OpenPGP", "" },
+    { "\x31\x50\x41\x59\x2E\x53\x59\x53\x2E\x44\x44\x46\x30\x31", 14, "", 0, "EMV (pse)", "emv" },
+    { "\x32\x50\x41\x59\x2E\x53\x59\x53\x2E\x44\x44\x46\x30\x31", 14, "", 0, "EMV (ppse)", "emv" },
+    { "\x41\x44\x20\x46\x31", 5, "", 0, "CIPURSE", "hf cipurse" },
+    { "\xA0\x00\x00\x09\x09\xAC\xCE\x55\x01", 9, "", 0, "Aliro", "hf aliro" },
+    { "\xd2\x76\x00\x00\x85\x01\x00", 7, "", 0, "desfire", "hf mfdes" },
+    { "\x4F\x53\x45\x2E\x56\x41\x53\x2E\x30\x31", 10, "ApplePay", 8, "OSE.VAS (Apple Wallet)", "hf vas" },
+    { "\x4F\x53\x45\x2E\x56\x41\x53\x2E\x30\x31", 10, "AndroidPay", 10, "OSE.VAS (Google Wallet)", "hf gst" },
+    { "\xA0\x00\x00\x04\x76\xD0\x00\x01\x11", 9, "", 0, "Google Smart Tap v2", "hf gst" },
 };
 
 // iso14a apdu input frame length
@@ -328,381 +331,6 @@ int hf14a_setconfig(hf14a_config_t *config, bool verbose) {
     }
 
     return PM3_SUCCESS;
-}
-
-// Load ecplist.json file
-static json_t *load_ecplist(void) {
-    json_error_t error;
-    char *path;
-
-    int res = searchFile(&path, RESOURCES_SUBDIR, "ecplist", ".json", false);
-    if (res != PM3_SUCCESS) {
-        PrintAndLogEx(ERR, "Cannot find ecplist.json");
-        return NULL;
-    }
-
-    json_t *root = json_load_file(path, 0, &error);
-    free(path);
-
-    if (!root) {
-        PrintAndLogEx(ERR, "json error on line %d: %s", error.line, error.text);
-        return NULL;
-    }
-
-    if (!json_is_array(root)) {
-        PrintAndLogEx(ERR, "Invalid ecplist.json format. Root must be an array.");
-        json_decref(root);
-        return NULL;
-    }
-
-    return root;
-}
-
-// Search ecplist for an entry matching the given type, subtype and/or key
-// If type is not NULL, only search entries with matching "type" field (supports string or array)
-// If subtype is not NULL, searches in "subtype" field (supports string or array)
-// If key is not NULL, searches in "key" field (supports string or array)
-static json_t *search_ecplist_by_key(json_t *root, const char *type, const char *subtype, const char *key) {
-    size_t index;
-    json_t *entry;
-
-    json_array_foreach(root, index, entry) {
-        // If type filter is specified, check if entry has matching type
-        if (type != NULL) {
-            json_t *type_obj = json_object_get(entry, "type");
-            if (!type_obj) {
-                continue; // Skip entries without type field
-            }
-
-            bool type_matched = false;
-            if (json_is_string(type_obj)) {
-                const char *type_str = json_string_value(type_obj);
-                if (type_str && strcmp(type_str, type) == 0) {
-                    type_matched = true;
-                }
-            } else if (json_is_array(type_obj)) {
-                size_t type_index;
-                json_t *type_value;
-                json_array_foreach(type_obj, type_index, type_value) {
-                    const char *type_str = json_string_value(type_value);
-                    if (type_str && strcmp(type_str, type) == 0) {
-                        type_matched = true;
-                        break;
-                    }
-                }
-            }
-
-            if (!type_matched) {
-                continue; // Type doesn't match
-            }
-        } else {
-            // If no type filter, skip entries that have a type field
-            if (json_object_get(entry, "type")) {
-                continue;
-            }
-        }
-
-        bool key_matched = (key == NULL); // If no key specified, consider it matched
-        bool subtype_matched = (subtype == NULL); // If no subtype specified, consider it matched
-
-        // Check if the subtype matches the "subtype" field (string or array)
-        if (subtype != NULL) {
-            json_t *subtype_obj = json_object_get(entry, "subtype");
-            if (subtype_obj) {
-                if (json_is_string(subtype_obj)) {
-                    const char *subtype_str = json_string_value(subtype_obj);
-                    if (subtype_str && strcmp(subtype_str, subtype) == 0) {
-                        subtype_matched = true;
-                    }
-                } else if (json_is_array(subtype_obj)) {
-                    size_t subtype_index;
-                    json_t *subtype_value;
-                    json_array_foreach(subtype_obj, subtype_index, subtype_value) {
-                        const char *subtype_str = json_string_value(subtype_value);
-                        if (subtype_str && strcmp(subtype_str, subtype) == 0) {
-                            subtype_matched = true;
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-
-        // Check if the key matches the "key" field (string or array)
-        if (key != NULL) {
-            json_t *key_obj = json_object_get(entry, "key");
-            if (key_obj) {
-                if (json_is_string(key_obj)) {
-                    const char *key_str = json_string_value(key_obj);
-                    if (key_str && strcmp(key_str, key) == 0) {
-                        key_matched = true;
-                    }
-                } else if (json_is_array(key_obj)) {
-                    size_t key_index;
-                    json_t *key_value;
-                    json_array_foreach(key_obj, key_index, key_value) {
-                        const char *key_str = json_string_value(key_value);
-                        if (key_str && strcmp(key_str, key) == 0) {
-                            key_matched = true;
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-
-        // Entry must match both key and subtype criteria (if specified)
-        if (key_matched && subtype_matched) {
-            return entry;
-        }
-    }
-
-    return NULL; // Not found
-}
-
-// Helper function to parse ECP (Enhanced Contactless Polling) subcommands
-// Returns the length of the generated frame (without CRC), or -1 on error
-static int parse_ecp_subcommand(const char *cmd, uint8_t *frame, size_t frame_size) {
-    if (cmd == NULL || frame == NULL || frame_size < 22) {
-        return -1;
-    }
-
-    // Make a mutable copy of the command and replace dots/colons with spaces
-    char *cmd_copy = strdup(cmd);
-    if (!cmd_copy) {
-        return -1;
-    }
-
-    for (char *p_char = cmd_copy; *p_char != '\0'; p_char++) {
-        if (*p_char == '.' || *p_char == ':') {
-            *p_char = ' ';
-        }
-    }
-
-    // Load ecplist.json
-    json_t *ecplist = load_ecplist();
-    if (!ecplist) {
-        PrintAndLogEx(ERR, "Failed to load ecplist.json");
-        free(cmd_copy);
-        return -1;
-    }
-
-    // Skip "ecp" prefix and any whitespace
-    const char *p = cmd_copy;
-    if (strncmp(p, "ecp", 3) == 0) {
-        p += 3;
-    }
-    while (*p == ' ' || *p == '\t') {
-        p++;
-    }
-
-    int result = -1;
-    const char *type = NULL;
-    const char *search_term = p;
-
-    // Check if first term is a type ("transit" or "access")
-    if (strncmp(p, "transit", 7) == 0) {
-        type = "transit";
-        p += 7;
-        while (*p == ' ' || *p == '\t') {
-            p++;
-        }
-        search_term = p;
-
-        // If second term provided, search by key in transit entries
-        if (*p != '\0') {
-            json_t *entry = search_ecplist_by_key(ecplist, type, NULL, search_term);
-            if (entry) {
-                // Found matching entry, use its value
-                json_t *value_obj = json_object_get(entry, "value");
-                if (value_obj) {
-                    const char *hex_str = json_string_value(value_obj);
-                    if (hex_str) {
-                        size_t hex_len = strlen(hex_str);
-                        if (hex_len % 2 == 0 && hex_len <= frame_size * 2) {
-                            for (size_t i = 0; i < hex_len / 2; i++) {
-                                sscanf(hex_str + i * 2, "%2hhx", &frame[i]);
-                            }
-                            result = hex_len / 2;
-                        }
-                    }
-                }
-            }
-
-            // If not found, try interpreting as hex TCI
-            if (result == -1) {
-                char *endptr;
-                uint32_t tci = strtoul(search_term, &endptr, 16);
-                if (search_term != endptr) {
-                    // Build frame: 6a02c801000300{tci as 3 bytes}0000000000
-                    frame[0] = 0x6a;
-                    frame[1] = 0x02;
-                    frame[2] = 0xc8;
-                    frame[3] = 0x01;
-                    frame[4] = 0x00;
-                    frame[5] = (tci >> 16) & 0xff;
-                    frame[6] = (tci >> 8) & 0xff;
-                    frame[7] = tci & 0xff;
-                    frame[8] = 0x00;
-                    frame[9] = 0x00;
-                    frame[10] = 0x00;
-                    frame[11] = 0x00;
-                    frame[12] = 0x00;
-                    result = 13;
-                } else {
-                    PrintAndLogEx(ERR, "Unknown transit key or invalid TCI: %s", search_term);
-                }
-            }
-        } else {
-            PrintAndLogEx(ERR, "Transit type requires a key or TCI value");
-        }
-
-    } else if (strncmp(p, "access", 6) == 0) {
-        type = "access";
-        p += 6;
-        while (*p == ' ' || *p == '\t') {
-            p++;
-        }
-
-        // Parse second term
-        const char *second_term = p;
-
-        // Skip to end of second term
-        while (*p != '\0' && *p != ' ' && *p != '\t') {
-            p++;
-        }
-
-        // Extract second term
-        size_t second_term_len = p - second_term;
-        char *second = NULL;
-        if (second_term_len > 0) {
-            second = str_ndup(second_term, second_term_len);
-        }
-
-        // Skip whitespace
-        while (*p == ' ' || *p == '\t') {
-            p++;
-        }
-
-        // Parse third term if present
-        const char *third_term = p;
-        char *third = NULL;
-        if (*p != '\0') {
-            // Skip to end of third term
-            while (*p != '\0' && *p != ' ' && *p != '\t') {
-                p++;
-            }
-            size_t third_term_len = p - third_term;
-            if (third_term_len > 0) {
-                third = str_ndup(third_term, third_term_len);
-            }
-        }
-
-        // Default TCI is 02ffff if not provided
-        uint32_t tci = 0x02ffff;
-
-        // If terms provided, try to parse them
-        if (second != NULL && *second != '\0') {
-            json_t *entry = NULL;
-
-            if (third != NULL && *third != '\0') {
-                // Two terms: second is subtype, third is key
-                entry = search_ecplist_by_key(ecplist, type, second, third);
-            } else {
-                // One term: try as subtype first, then as key
-                entry = search_ecplist_by_key(ecplist, type, second, NULL);
-
-                if (!entry) {
-                    entry = search_ecplist_by_key(ecplist, type, NULL, second);
-                }
-            }
-
-            if (entry) {
-                // Found matching entry, use its value
-                json_t *value_obj = json_object_get(entry, "value");
-                if (value_obj) {
-                    const char *hex_str = json_string_value(value_obj);
-                    if (hex_str) {
-                        size_t hex_len = strlen(hex_str);
-                        if (hex_len % 2 == 0 && hex_len <= frame_size * 2) {
-                            for (size_t i = 0; i < hex_len / 2; i++) {
-                                sscanf(hex_str + i * 2, "%2hhx", &frame[i]);
-                            }
-                            result = hex_len / 2;
-                        }
-                    }
-                }
-            }
-
-            // If not found and no third term, try interpreting second term as hex TCI
-            if (result == -1 && third == NULL) {
-                char *endptr;
-                tci = strtoul(second, &endptr, 16);
-                if (second == endptr) {
-                    PrintAndLogEx(ERR, "Unknown access subtype/key or invalid TCI: %s", second);
-                    free(second);
-                    if (third) free(third);
-                    json_decref(ecplist);
-                    free(cmd_copy);
-                    return -1;
-                }
-            } else if (result == -1 && third != NULL) {
-                PrintAndLogEx(ERR, "No matching access entry for subtype '%s' and key '%s'", second, third);
-                free(second);
-                free(third);
-                json_decref(ecplist);
-                free(cmd_copy);
-                return -1;
-            }
-        }
-
-        if (second) {
-            free(second);
-        }
-        if (third) {
-            free(third);
-        }
-
-        // Build frame with TCI if we didn't find a matching entry
-        if (result == -1) {
-            // Build frame: 6a02c30200{tci as 3 bytes}
-            frame[0] = 0x6a;
-            frame[1] = 0x02;
-            frame[2] = 0xc3;
-            frame[3] = 0x02;
-            frame[4] = 0x00;
-            frame[5] = (tci >> 16) & 0xff;
-            frame[6] = (tci >> 8) & 0xff;
-            frame[7] = tci & 0xff;
-            result = 8;
-        }
-
-    } else {
-        // No type specified, search for entries without type field by key
-        json_t *entry = search_ecplist_by_key(ecplist, search_term, NULL, NULL);
-        if (entry) {
-            json_t *value_obj = json_object_get(entry, "value");
-            if (value_obj) {
-                const char *hex_str = json_string_value(value_obj);
-                if (hex_str) {
-                    size_t hex_len = strlen(hex_str);
-                    if (hex_len % 2 == 0 && hex_len <= frame_size * 2) {
-                        for (size_t i = 0; i < hex_len / 2; i++) {
-                            sscanf(hex_str + i * 2, "%2hhx", &frame[i]);
-                        }
-                        result = hex_len / 2;
-                    }
-                }
-            }
-        } else {
-            PrintAndLogEx(ERR, "Unknown ECP type: %s", search_term);
-            PrintAndLogEx(HINT, "Available types: access, transit, vasorpay, vasandpay, vasonly, payonly, gymkit, identity, aidrop");
-        }
-    }
-
-    json_decref(ecplist);
-    free(cmd_copy);
-    return result;
 }
 
 static int hf_14a_config_example(void) {
@@ -891,7 +519,7 @@ static int CmdHf14AConfig(const char *Cmd) {
         else if (strncmp((char *)value, "off", 3) == 0) pla.frame_length = 0;
         else if (strncmp((char *)value, "ecp", 3) == 0) {
             // Parse ECP subcommand
-            int length = parse_ecp_subcommand((char *)value, pla.frame, sizeof(pla.frame));
+            int length = pla_parse_ecp_subcommand((char *)value, pla.frame, sizeof(pla.frame));
             if (length < 0) {
                 CLIParserFree(ctx);
                 return PM3_EINVARG;
@@ -1258,12 +886,7 @@ static int CmdHF14ACUIDs(const char *Cmd) {
         if (resp.oldarg[0] == 0) {
             PrintAndLogEx(WARNING, "card select failed.");
         } else {
-            char uid_string[20];
-            for (uint16_t m = 0; m < card->uidlen; m++) {
-                int offset = 2 * m;
-                snprintf(uid_string + offset, sizeof(uid_string) - offset, "%02X", card->uid[m]);
-            }
-            PrintAndLogEx(SUCCESS, "%s", uid_string);
+            PrintAndLogEx(SUCCESS, "%s", sprint_hex_inrow(card->uid, card->uidlen));
         }
     }
     PrintAndLogEx(SUCCESS, "end: %" PRIu64 " seconds", (msclock() - t1) / 1000);
@@ -1300,8 +923,8 @@ int CmdHF14ASim(const char *Cmd) {
         arg_lit0("x",  NULL, "Performs the 'reader attack', nr/ar attack against a reader"),
         arg_lit0(NULL, "sk", "Fill simulator keys from found keys"),
         arg_lit0("v", "verbose", "verbose output"),
-        arg_lit0(NULL, "z1", "ULC/ULAES Auth - all zero handshake part 1"),
-        arg_lit0(NULL, "z2", "ULC/ULAES Auth - all zero handshake part 2"),
+        arg_str0(NULL, "1a1", "<hex>", "<8|16> hex bytes ULC/ULAES Auth reply step1: ek(RndB)"),
+        arg_str0(NULL, "1a2", "<hex>", "<8|16> hex bytes ULC/ULAES Auth reply step2: ek(RndA')"),
         arg_param_end
     };
     CLIExecWithReturn(ctx, Cmd, argtable, false);
@@ -1335,10 +958,52 @@ int CmdHF14ASim(const char *Cmd) {
     bool setEmulatorMem = arg_get_lit(ctx, 5);
     bool verbose = arg_get_lit(ctx, 6);
 
-    bool ulauth_z1 = arg_get_lit(ctx, 7);
-    bool ulauth_z2 = arg_get_lit(ctx, 8);
-
+    int ulauth_1a1_len = 0;
+    int ulauth_1a2_len = 0;
+    uint8_t ulauth_1a1[16] = {0};
+    uint8_t ulauth_1a2[16] = {0};
+    CLIGetHexWithReturn(ctx, 7, ulauth_1a1, &ulauth_1a1_len);
+    CLIGetHexWithReturn(ctx, 8, ulauth_1a2, &ulauth_1a2_len);
     CLIParserFree(ctx);
+
+    if (ulauth_1a1_len > 0) {
+        switch (tagtype) {
+            case 13: // ULC
+                if (ulauth_1a1_len != 8) {
+                    PrintAndLogEx(ERR, "ULC --1a1 length must be 8 bytes");
+                    return PM3_EINVARG;
+                }
+                break;
+            case 14: // ULAES
+                if (ulauth_1a1_len != 16) {
+                    PrintAndLogEx(ERR, "ULAES --1a1 length must be 16 bytes");
+                    return PM3_EINVARG;
+                }
+                break;
+            default:
+                PrintAndLogEx(ERR, "--1a1 option is only valid for tag types 13 (ULC) and 14 (ULAES)");
+                return PM3_EINVARG;
+        }
+    }
+    if (ulauth_1a2_len > 0) {
+        switch (tagtype) {
+            case 13: // ULC
+                if (ulauth_1a2_len != 8) {
+                    PrintAndLogEx(ERR, "ULC --1a2 length must be 8 bytes");
+                    return PM3_EINVARG;
+                }
+                break;
+            case 14: // ULAES
+                if (ulauth_1a2_len != 16) {
+                    PrintAndLogEx(ERR, "ULAES --1a2 length must be 16 bytes");
+                    return PM3_EINVARG;
+                }
+                break;
+            default:
+                PrintAndLogEx(ERR, "--1a2 option is only valid for tag types 13 (ULC) and 14 (ULAES)");
+                return PM3_EINVARG;
+        }
+    }
 
     if (tagtype > 14) {
         PrintAndLogEx(ERR, "Undefined tag %d", tagtype);
@@ -1355,16 +1020,20 @@ int CmdHF14ASim(const char *Cmd) {
         uint8_t uid[10];
         uint8_t exitAfter;
         uint8_t rats[20];
-        bool ulauth_z1;
-        bool ulauth_z2;
+        uint8_t ulauth_1a1_len;
+        uint8_t ulauth_1a2_len;
+        uint8_t ulauth_1a1[16];
+        uint8_t ulauth_1a2[16];
     } PACKED payload;
 
     payload.tagtype = tagtype;
     payload.flags = flags;
     payload.exitAfter = exitAfterNReads;
-    payload.ulauth_z1 = ulauth_z1;
-    payload.ulauth_z2 = ulauth_z2;
+    payload.ulauth_1a1_len = ulauth_1a1_len;
+    payload.ulauth_1a2_len = ulauth_1a2_len;
     memcpy(payload.uid, uid, uid_len);
+    memcpy(payload.ulauth_1a1, ulauth_1a1, ulauth_1a1_len);
+    memcpy(payload.ulauth_1a2, ulauth_1a2, ulauth_1a2_len);
 
     clearCommandBuffer();
     SendCommandNG(CMD_HF_ISO14443A_SIMULATE, (uint8_t *)&payload, sizeof(payload));
@@ -1373,9 +1042,10 @@ int CmdHF14ASim(const char *Cmd) {
     sector_t *k_sector = NULL;
     size_t k_sectors_cnt = MIFARE_4K_MAXSECTOR;
 
-    PrintAndLogEx(INFO, "Press " _GREEN_("pm3 button") " to abort simulation");
+    PrintAndLogEx(INFO, "Press " _GREEN_("pm3 button") " or " _GREEN_("<Enter>") " to abort simulation");
     bool keypress = kbd_enter_pressed();
     while (keypress == false) {
+        keypress = kbd_enter_pressed();
 
         if (WaitForResponseTimeout(CMD_HF_MIFARE_SIMULATE, &resp, 1500) == false) {
             continue;
@@ -1391,15 +1061,11 @@ int CmdHF14ASim(const char *Cmd) {
 
         const nonces_t *data = (nonces_t *)resp.data.asBytes;
         readerAttack(k_sector, k_sectors_cnt, data[0], setEmulatorMem, verbose);
-
-        keypress = kbd_enter_pressed();
     }
 
     if (keypress) {
-        if ((flags & FLAG_NR_AR_ATTACK) == FLAG_NR_AR_ATTACK) {
-            // inform device to break the sim loop since client has exited
-            SendCommandNG(CMD_BREAK_LOOP, NULL, 0);
-        }
+        // inform device to break the sim loop since client has exited
+        SendCommandNG(CMD_BREAK_LOOP, NULL, 0);
     }
 
     PrintAndLogEx(INFO, "Done!");
@@ -1438,14 +1104,31 @@ int CmdHF14ASniff(const char *Cmd) {
     clearCommandBuffer();
     SendCommandNG(CMD_HF_ISO14443A_SNIFF, (uint8_t *)&param, sizeof(uint8_t));
 
-    PrintAndLogEx(INFO, "Press " _GREEN_("pm3 button") " to abort sniffing");
-
     if (interactive) {
+        PrintAndLogEx(INFO, "Press " _GREEN_("pm3 button") " or " _GREEN_("<Enter>") " to abort sniffing");
+
         PacketResponseNG resp;
-        WaitForResponse(CMD_HF_ISO14443A_SNIFF, &resp);
+
+        bool keypress = kbd_enter_pressed();
+        while (keypress == false) {
+            keypress = kbd_enter_pressed();
+
+            if (WaitForResponseTimeout(CMD_HF_ISO14443A_SNIFF, &resp, 500)) {
+                break;
+            }
+        }
+
+        if (keypress) {
+            // inform device to break the sim loop since client has exited
+            SendCommandNG(CMD_BREAK_LOOP, NULL, 0);
+            WaitForResponse(CMD_HF_ISO14443A_SNIFF, &resp);
+        }
+
         PrintAndLogEx(INFO, "Done!");
         PrintAndLogEx(HINT, "Hint: Try `" _YELLOW_("hf 14a list")"` to view captured tracelog");
         PrintAndLogEx(HINT, "Hint: Try `" _YELLOW_("trace save -h") "` to save tracelog for later analysing");
+    } else {
+        PrintAndLogEx(INFO, "Press " _GREEN_("pm3 button") " to abort sniffing");
     }
     return PM3_SUCCESS;
 }
@@ -3322,7 +3005,7 @@ int infoHF14A(bool verbose, bool do_nack_test, bool do_aid_search) {
                 int16_t fsci = card.ats[1] & 0x0f;
 
                 PrintAndLogEx(INFO, "     ..." _YELLOW_("%02X") "............  T0    TA1 is%s present, TB1 is%s present, "
-                              "TC1 is%s present, FSCI is %d (FSC = %d)",
+                                    "TC1 is%s present, FSCI is %d (FSC = %d)",
                               card.ats[1],
                               (ta1 ? "" : _RED_(" NOT")),
                               (tb1 ? "" : _RED_(" NOT")),
@@ -3344,7 +3027,7 @@ int infoHF14A(bool verbose, bool do_nack_test, bool do_aid_search) {
                 if (strlen(ds) != 0) ds[strlen(ds) - 2] = '\0';
                 if (strlen(dr) != 0) dr[strlen(dr) - 2] = '\0';
                 PrintAndLogEx(INFO, "     ......" _YELLOW_("%02X") ".........  TA1   different divisors are%s supported, "
-                              "DR: [%s], DS: [%s]",
+                                    "DR: [%s], DS: [%s]",
                               card.ats[pos],
                               ((card.ats[pos] & 0x80) ? _RED_(" NOT") : ""),
                               dr,
@@ -3724,6 +3407,18 @@ int infoHF14A(bool verbose, bool do_nack_test, bool do_aid_search) {
     return select_status;
 }
 
+static bool hint_aid_match_select_response(const hintAIDList_t *entry, const uint8_t *select_response, size_t select_response_len) {
+    if (entry->select_response_match_length == 0) {
+        return true;
+    }
+
+    if ((entry->select_response_match == NULL) || (select_response == NULL) || (select_response_len < entry->select_response_match_length)) {
+        return false;
+    }
+
+    return byte_strstr(select_response, select_response_len, (const uint8_t *)entry->select_response_match, entry->select_response_match_length) != -1;
+}
+
 int infoHF14A4Applications(bool verbose) {
     bool cardFound[ARRAYLEN(hintAIDList)] = {0};
     bool ActivateField = true;
@@ -3738,6 +3433,10 @@ int infoHF14A4Applications(bool verbose) {
             break;
 
         if (sw == ISO7816_OK || sw == ISO7816_INVALID_DF || sw == ISO7816_FILE_TERMINATED) {
+            if (!hint_aid_match_select_response(&hintAIDList[i], result, resultlen)) {
+                continue;
+            }
+
             if (!found) {
                 if (verbose)
                     PrintAndLogEx(INFO, "----------------- " _CYAN_("Short AID search") " -----------------");
@@ -3748,9 +3447,8 @@ int infoHF14A4Applications(bool verbose) {
                 if (verbose)
                     PrintAndLogEx(SUCCESS, "Application " _CYAN_("%s") " ( " _GREEN_("ok") " )", hintAIDList[i].desc);
                 cardFound[i] = true;
-            } else {
-                if (verbose)
-                    PrintAndLogEx(WARNING, "Application " _CYAN_("%s") " ( " _RED_("blocked") " )", hintAIDList[i].desc);
+            } else if (verbose) {
+                PrintAndLogEx(WARNING, "Application " _CYAN_("%s") " ( " _RED_("blocked") " )", hintAIDList[i].desc);
             }
         }
     }

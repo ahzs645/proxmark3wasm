@@ -23,6 +23,8 @@
 #include "BigBuf.h"
 #include "dbprint.h"
 #include "mbedtls/aes.h"
+#include "pm3_cmd.h"
+#include "iso14443a.h"
 
 static ulaes_key_t g_secure_session = {
     .counter = 0,
@@ -44,6 +46,10 @@ void increase_session_counter(void) {
 
 void set_session_channel(bool use_schann) {
     g_secure_session.use_schann = use_schann;
+}
+
+bool get_session_channel(void) {
+    return g_secure_session.use_schann;
 }
 
 ulaes_key_t *get_secure_session_obj(void) {
@@ -89,11 +95,9 @@ static void generate_subkeys(mbedtls_aes_context *ctx, uint8_t *K1, uint8_t *K2)
 
 // Pad the last block (adds 0x80 followed by zeros)
 static void padding(const uint8_t *lastb, uint8_t *pad, size_t len) {
+    memset(pad, 0x00, len);
     memcpy(pad, lastb, len);
     pad[len] = 0x80;
-    for (size_t i = len + 1; i < 16; i++) {
-        pad[i] = 0x00;
-    }
 }
 
 // CMAC implementation
@@ -163,11 +167,35 @@ void append_cmac(uint8_t *d, size_t n) {
     cmd_mac[1] = (g_secure_session.counter >> 8) & 0xFF;
     memcpy(cmd_mac + 2, d, n);
 
-    print_result("cmd mac", cmd_mac, (2 + n));
+    // print_result("cmd mac", cmd_mac, (2 + n));
 
     ulaes_cmac(g_secure_session.sessionkey, sizeof(g_secure_session.sessionkey), cmd_mac, (2 + n), mac);
     // append CMAC to end of the command we are trying to send
     ulaes_cmac8(mac, d + n);
 
     increase_session_counter();
+}
+
+int verify_cmac(uint8_t *d, size_t n, bool verify_crc) {
+    // n = data size without cmac and without crc
+    uint8_t chk_d[n + ULAES_CMAC8_SIZE + 2];
+    memcpy(chk_d, d, n);
+    memset(chk_d + n, 0, sizeof(chk_d) - n);
+    append_cmac(chk_d, n);
+    if (memcmp(chk_d + n, d + n, ULAES_CMAC8_SIZE) != 0) {
+        if (g_dbglevel >= DBG_ERROR) {
+            Dbprintf("CMAC response error.");
+        }
+        return PM3_ECRC;
+    }
+    if (verify_crc) {
+        AddCrc14A(chk_d, n + ULAES_CMAC8_SIZE);
+        if (memcmp(chk_d + n + ULAES_CMAC8_SIZE, d + n + ULAES_CMAC8_SIZE, 2) != 0) {
+            if (g_dbglevel >= DBG_ERROR) {
+                Dbprintf("CRC response error.");
+            }
+            return PM3_ECRC;
+        }
+    }
+    return PM3_SUCCESS;
 }

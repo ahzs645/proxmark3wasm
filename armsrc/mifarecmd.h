@@ -26,16 +26,16 @@ void MifareReadSector(uint8_t sector_no, uint8_t key_type, uint8_t *key);
 void MifareValue(uint8_t arg0, uint8_t arg1, uint8_t arg2, uint8_t *datain);
 
 void MifareUReadBlock(mful_readblock_t *packet);
-void MifareUC_Auth(uint8_t arg0, uint8_t *keybytes);
-
-void MifareUL_AES_Auth(mfulaes_keys_t *packet);
 void MifareUReadCard(mful_readblock_t *packet);
 
 void MifareUWriteBlockCompat(mful_writeblock_t *packet);
 void MifareUWriteBlock(mful_writeblock_t *packet);
 
+void MifareU3PassAuth(mful_3passauth_t *packet);
+void MifareU3PassChkKeys(mful_3passchk_t *packet);
+
 void MifareNested(uint8_t blockNo, uint8_t keyType, uint8_t targetBlockNo, uint8_t targetKeyType, bool calibrate, uint8_t *key);
-void MifareStaticNested(uint8_t blockNo, uint8_t keyType, uint8_t targetBlockNo, uint8_t targetKeyType, uint8_t *key);
+void MifareStaticNested(uint8_t blockNo, uint8_t keyType, uint8_t targetBlockNo, uint8_t targetKeyType, uint8_t *key, uint8_t forceDetectDist);
 
 void MifareAcquireEncryptedNonces(uint32_t arg0, uint32_t arg1, uint32_t flags, uint8_t *datain);
 int MifareAcquireStaticEncryptedNonces(uint32_t flags, const uint8_t *key, bool reply, uint8_t first_block_no, uint8_t first_key_type);
@@ -67,7 +67,7 @@ void MifareG4WriteBlk(uint8_t blockno, uint8_t *pwd, uint8_t *data, uint8_t work
 void MifareSetMod(uint8_t *datain);
 void MifarePersonalizeUID(uint8_t keyType, uint8_t perso_option, uint64_t key);
 
-void MifareUSetKey(uint8_t arg0, uint8_t *datain);
+void MifareUSetKey(mful_setkey_t *packet);
 void OnSuccessMagic(void);
 void OnErrorMagic(uint8_t reason);
 
