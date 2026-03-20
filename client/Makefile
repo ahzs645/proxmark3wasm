@@ -256,6 +256,10 @@ STATICLIBS += $(MQTTLIB)
 LDLIBS += $(MQTTLIBLD)
 PM3INCLUDES += $(MQTTLIBINC)
 
+ifdef EMSCRIPTEN
+PM3INCLUDES += -Ideps/lz4/lib
+endif
+
 ####################
 # system libraries #
 ####################
@@ -569,6 +573,8 @@ ifdef EMSCRIPTEN
     PM3LDFLAGS += -sASYNCIFY -sASYNCIFY_STACK_SIZE=32768
     PM3LDFLAGS += -sASSERTIONS=2 -sSTACK_OVERFLOW_CHECK=2
     PM3LDFLAGS += -Wno-pthreads-mem-growth
+    PM3LDFLAGS += --embed-file resources/hardnested_bf_bench_data.bin@/home/web_user/.proxmark3/resources/hardnested_bf_bench_data.bin
+    PM3LDFLAGS += --embed-file resources/hardnested_tables@/home/web_user/.proxmark3/resources/hardnested_tables
     PM3LDFLAGS += -sEXPORTED_FUNCTIONS=_main,_pm3_console,_pm3_grabbed_output_get,_pm3_get_current_dev,_pm3_web_exec,_pm3_web_exec_opts,_pm3_web_take_output,_pm3_uart_rx_head_ptr,_pm3_uart_rx_tail_ptr,_pm3_uart_rx_buf_ptr,_pm3_uart_rx_initialized_ptr,_pm3_uart_tx_head_ptr,_pm3_uart_tx_tail_ptr,_pm3_uart_tx_buf_ptr,_pm3_uart_rb_capacity,_pm3_uart_stdin_head_ptr,_pm3_uart_stdin_tail_ptr,_pm3_uart_stdin_buf_ptr
     PM3LDFLAGS += -sEXPORTED_RUNTIME_METHODS=ccall,cwrap,HEAPU8,HEAPU32,wasmMemory
 endif
@@ -878,6 +884,10 @@ SRCS =  mifare/aiddesfire.c \
 ifdef EMSCRIPTEN
 SRCS := $(filter-out uart/uart_common.c uart/uart_posix.c uart/uart_win32.c,$(SRCS))
 SRCS += uart/uart_web.c
+SRCS += deps/lz4/lib/lz4.c \
+        deps/lz4/lib/lz4frame.c \
+        deps/lz4/lib/lz4hc.c \
+        deps/lz4/lib/xxhash.c
 endif
 
 # common
@@ -1143,6 +1153,12 @@ $(OBJDIR)/%wrap.o : %wrap.c $(OBJDIR)/%.d
 	$(info [-] CC $<)
 	$(Q)$(MKDIR) $(dir $@)
 	$(Q)$(CC) $(DEPFLAGS) $(PM3CFLAGS) -Wno-missing-prototypes -Wno-missing-declarations -Wno-missing-field-initializers -c -o $@ $<
+	$(Q)$(POSTCOMPILE)
+
+$(OBJDIR)/deps/lz4/lib/%.o : deps/lz4/lib/%.c $(OBJDIR)/deps/lz4/lib/%.d
+	$(info [-] CC $<)
+	$(Q)$(MKDIR) $(dir $@)
+	$(Q)$(CC) $(DEPFLAGS) $(PM3CFLAGS) -Wno-missing-prototypes -Wno-missing-declarations -Wno-unused-function -Wno-bad-function-cast -c -o $@ $<
 	$(Q)$(POSTCOMPILE)
 
 %.o: %.c

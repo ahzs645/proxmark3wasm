@@ -52,7 +52,24 @@ int g_numCPUs = 0;
 
 #define MAX_BIN_BREAK_LENGTH   (3072 + 384 + 1)
 
-#ifndef _WIN32
+#if defined(__EMSCRIPTEN__)
+
+#include <unistd.h>
+
+extern int uart_read_stdin(void);
+
+int kbd_enter_pressed(void) {
+    int c;
+    int ret = 0;
+
+    while ((c = uart_read_stdin()) != 0) {
+        ret |= (c == '\n') || (c == 3);
+    }
+
+    return ret;
+}
+
+#elif !defined(_WIN32)
 #include <unistd.h>
 #include <fcntl.h>
 
