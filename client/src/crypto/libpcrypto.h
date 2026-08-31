@@ -38,6 +38,7 @@ typedef struct {
 int pcrypto_rng_init(pcrypto_rng_t *rng, const uint8_t *personalization, size_t personalization_len);
 void pcrypto_rng_free(pcrypto_rng_t *rng);
 int pcrypto_rng_fill(pcrypto_rng_t *rng, uint8_t *out, size_t out_len);
+int pcrypto_rng_fill_oneshot(uint8_t *out, size_t out_len, const char *personalization);
 
 void des_encrypt(void *out, const void *in, const void *key);
 void des_decrypt(void *out, const void *in, const void *key);
@@ -48,14 +49,14 @@ void des_decrypt_cbc(void *out, const void *in, const int length, const void *ke
 void des3_encrypt(void *out, const void *in, const void *key, uint8_t keycount);
 void des3_decrypt(void *out, const void *in, const void *key, uint8_t keycount);
 
-int aes_encode(uint8_t *iv, uint8_t *key, uint8_t *input, uint8_t *output, int length);
-int aes_decode(uint8_t *iv, uint8_t *key, uint8_t *input, uint8_t *output, int length);
+int aes_encode(uint8_t *iv, const uint8_t *key, uint8_t *input, uint8_t *output, int length);
+int aes_decode(uint8_t *iv, const uint8_t *key, uint8_t *input, uint8_t *output, int length);
 
-int aes256_encode(uint8_t *iv, uint8_t *key, uint8_t *input, uint8_t *output, int length);
-int aes256_decode(uint8_t *iv, uint8_t *key, uint8_t *input, uint8_t *output, int length);
+int aes256_encode(uint8_t *iv, const uint8_t *key, uint8_t *input, uint8_t *output, int length);
+int aes256_decode(uint8_t *iv, const uint8_t *key, uint8_t *input, uint8_t *output, int length);
 
-int aes_cmac(uint8_t *iv, uint8_t *key, uint8_t *input, uint8_t *mac, int length);
-int aes_cmac8(uint8_t *iv, uint8_t *key, uint8_t *input, uint8_t *mac, int length);
+int aes_cmac(uint8_t *iv, const uint8_t *key, uint8_t *input, uint8_t *mac, int length);
+int aes_cmac8(uint8_t *iv, const uint8_t *key, uint8_t *input, uint8_t *mac, int length);
 
 int sha1hash(uint8_t *input, int length, uint8_t *hash);
 int sha256hash(uint8_t *input, int length, uint8_t *hash);
@@ -67,6 +68,7 @@ int ecdsa_signature_create(mbedtls_ecp_group_id curveid, uint8_t *key_d, uint8_t
 int ecdsa_signature_verify(mbedtls_ecp_group_id curveid, uint8_t *key_xy, uint8_t *input, int length, uint8_t *signature, size_t signaturelen, bool hash);
 int ecdsa_signature_r_s_verify(mbedtls_ecp_group_id curveid, uint8_t *key_xy, uint8_t *input, int length, uint8_t *r_s, size_t r_s_len, bool hash);
 int ensure_ec_private_key(const char *input_or_path, mbedtls_ecp_group_id curveid, uint8_t *out_priv, size_t out_priv_len);
+int ensure_ec_public_key(const char *input_or_path, mbedtls_ecp_group_id curveid, uint8_t *out_pub, size_t out_pub_len);
 
 char *ecdsa_get_error(int ret);
 

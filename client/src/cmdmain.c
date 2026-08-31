@@ -32,6 +32,7 @@
 #include "cmddata.h"
 #include "cmdhw.h"
 #include "cmdlf.h"
+#include "cmdmad.h"
 #include "cmdnfc.h"
 #include "cmdtrace.h"
 #include "cmdscript.h"
@@ -173,8 +174,15 @@ static int CmdAuto(const char *Cmd) {
     PrintAndLogEx(INFO, "Trying " _YELLOW_("`lf read`") " and save a trace for you");
 
     CmdPlot("");
+
     lf_read(false, 40000);
+
     char *fname = calloc(100, sizeof(uint8_t));
+    if (fname == NULL) {
+        PrintAndLogEx(WARNING, "Failed to allocate memory");
+        return PM3_EMALLOC;
+    }
+
     AppendDate(fname, 100, "-f lf_unknown_%Y-%m-%d_%H:%M");
     CmdSave(fname);
     free(fname);
@@ -338,6 +346,7 @@ static command_t CommandTable[] = {
     {"hf",           CmdHF,        AlwaysAvailable,         "{ High frequency commands... }"},
     {"hw",           CmdHW,        AlwaysAvailable,         "{ Hardware commands... }"},
     {"lf",           CmdLF,        AlwaysAvailable,         "{ Low frequency commands... }"},
+    {"mad",          CmdMAD,       AlwaysAvailable,         "{ MAD commands... }"},
     {"mem",          CmdFlashMem,  IfPm3Flash,              "{ Flash memory manipulation... }"},
     {"mqtt",         CmdMqtt,      AlwaysAvailable,         "{ MQTT commmands... }"},
     {"nfc",          CmdNFC,       AlwaysAvailable,         "{ NFC commands... }"},

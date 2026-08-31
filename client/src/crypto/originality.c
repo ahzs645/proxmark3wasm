@@ -131,7 +131,7 @@ const ecdsa_publickey_ng_t manufacturer_public_keys[] = {
     },
 
     {
-        PK_15,      MBEDTLS_ECP_DP_SECP128R1, 33, "NXP ICODE DNA, ICODE SLIX2",
+        PK_15,      MBEDTLS_ECP_DP_SECP128R1, 33, "NXP ICODE DNA, ICODE 3, ICODE SLIX2",
         "048878A2A2D3EEC336B4F261A082BD71F9BE11C4E2E896648B32EFA59CEA6E59F0"
     },
     {
@@ -195,6 +195,7 @@ int originality_check_verify_ex(uint8_t *data, uint8_t data_len, uint8_t *signat
 
 int originality_check_print(uint8_t *signature, int signature_len, int index) {
 
+    // sanity check
     if ((index < 0) || (index >= ARRAYLEN(manufacturer_public_keys))) {
 
         PrintAndLogEx(INFO, "             TAG IC Signature: %s", sprint_hex_inrow(signature, 16));

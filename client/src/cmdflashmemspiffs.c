@@ -467,7 +467,7 @@ static int CmdFlashMemSpiFFSWipe(const char *Cmd) {
     CLIParserInit(&ctx, "mem spiffs wipe",
                   _RED_("* * *  Warning  * * *") " \n"
                   _CYAN_("This command wipes all files on the device SPIFFS file system"),
-           "mem spiffs wipe");
+                  "mem spiffs wipe");
 
     void *argtable[] = {
         arg_param_begin,
@@ -512,11 +512,11 @@ static int CmdFlashMemSpiFFSUpload(const char *Cmd) {
     CLIParamStrToBuf(arg_get_str(ctx, 1), (uint8_t *)src, FILE_PATH_SIZE, &slen);
 
     int dlen = 0;
-    char dest[32] = {0};
-    CLIParamStrToBuf(arg_get_str(ctx, 2), (uint8_t *)dest, 32, &dlen);
+    char dst[32] = {0};
+    CLIParamStrToBuf(arg_get_str(ctx, 2), (uint8_t *)dst, 32, &dlen);
     CLIParserFree(ctx);
 
-    PrintAndLogEx(DEBUG, "Upload `" _YELLOW_("%s") "` -> `" _YELLOW_("%s") "`", src, dest);
+    PrintAndLogEx(DEBUG, "Upload `" _YELLOW_("%s") "` -> `" _YELLOW_("%s") "`", src, dst);
 
     size_t datalen = 0;
     uint8_t *data = NULL;
@@ -527,11 +527,12 @@ static int CmdFlashMemSpiFFSUpload(const char *Cmd) {
         return PM3_EFILE;
     }
 
-    res = flashmem_spiffs_load(dest, data, datalen);
+    res = flashmem_spiffs_load(dst, data, datalen);
     free(data);
 
-    if (res == PM3_SUCCESS)
-        PrintAndLogEx(SUCCESS, "Wrote "_GREEN_("%zu") " bytes to file "_GREEN_("%s"), datalen, dest);
+    if (res == PM3_SUCCESS) {
+        PrintAndLogEx(SUCCESS, "Wrote "_GREEN_("%zu") " bytes to file "_GREEN_("%s"), datalen, dst);
+    }
 
     PrintAndLogEx(HINT, "Hint: Try `" _YELLOW_("mem spiffs tree") "` to verify");
     return res;
@@ -575,21 +576,22 @@ static int CmdFlashMemSpiFFSView(const char *Cmd) {
 }
 
 static command_t CommandTable[] = {
-    {"help",    CmdHelp,                  AlwaysAvailable, "This help"},
-    {"-----------", CmdHelp,                  IfPm3Flash,      "------------------- " _CYAN_("Operations") " -------------------"},
-    {"copy",    CmdFlashMemSpiFFSCopy,    IfPm3Flash, "Copy a file to another (destructively) in SPIFFS file system"},
-    {"check",   CmdFlashMemSpiFFSCheck,   IfPm3Flash, "Check/try to defrag faulty/fragmented file system"},
-    {"dump",    CmdFlashMemSpiFFSDump,    IfPm3Flash, "Dump a file from SPIFFS file system"},
-    {"info",        CmdFlashMemSpiFFSInfo,    IfPm3Flash,      "File system information and usage statistics"},
-    {"mount",   CmdFlashMemSpiFFSMount,   IfPm3Flash, "Mount the SPIFFS file system if not already mounted"},
-    {"remove",  CmdFlashMemSpiFFSRemove,  IfPm3Flash, "Remove a file from SPIFFS file system"},
-    {"rename",  CmdFlashMemSpiFFSRename,  IfPm3Flash, "Rename/move a file in SPIFFS file system"},
-    {"test",    CmdFlashMemSpiFFSTest,    IfPm3Flash, "Test SPIFFS Operations"},
-    {"tree",    CmdFlashMemSpiFFSTree,    IfPm3Flash, "Print the Flash memory file system tree"},
-    {"unmount", CmdFlashMemSpiFFSUnmount, IfPm3Flash, "Un-mount the SPIFFS file system"},
-    {"upload",  CmdFlashMemSpiFFSUpload,  IfPm3Flash, "Upload file into SPIFFS file system"},
-    {"view",    CmdFlashMemSpiFFSView,    IfPm3Flash, "View file on SPIFFS file system"},
-    {"wipe",    CmdFlashMemSpiFFSWipe,    IfPm3Flash, "Wipe all files from SPIFFS file system   * " _RED_("dangerous") " *" },
+    {"-----------", CmdHelp,                  IfPm3Flash, "------------------- " _CYAN_("General") " -------------------"},
+    {"help",        CmdHelp,                  AlwaysAvailable, "This help"},
+    {"test",        CmdFlashMemSpiFFSTest,    IfPm3Flash,      "Perform SPIFFS Operations tests"},
+    {"-----------", CmdHelp,                  IfPm3Flash, "------------------- " _CYAN_("Operations") " -------------------"},
+    {"copy",        CmdFlashMemSpiFFSCopy,    IfPm3Flash, "Copy a file to another (destructively) in SPIFFS file system"},
+    {"check",       CmdFlashMemSpiFFSCheck,   IfPm3Flash, "Check/try to defrag faulty/fragmented file system"},
+    {"dump",        CmdFlashMemSpiFFSDump,    IfPm3Flash, "Dump a file from SPIFFS file system"},
+    {"info",        CmdFlashMemSpiFFSInfo,    IfPm3Flash, "File system information and usage statistics"},
+    {"mount",       CmdFlashMemSpiFFSMount,   IfPm3Flash, "Mount the SPIFFS file system if not already mounted"},
+    {"remove",      CmdFlashMemSpiFFSRemove,  IfPm3Flash, "Remove a file from SPIFFS file system"},
+    {"rename",      CmdFlashMemSpiFFSRename,  IfPm3Flash, "Rename/move a file in SPIFFS file system"},
+    {"tree",        CmdFlashMemSpiFFSTree,    IfPm3Flash, "Print the Flash memory file system tree"},
+    {"unmount",     CmdFlashMemSpiFFSUnmount, IfPm3Flash, "Un-mount the SPIFFS file system"},
+    {"upload",      CmdFlashMemSpiFFSUpload,  IfPm3Flash, "Upload file into SPIFFS file system"},
+    {"view",        CmdFlashMemSpiFFSView,    IfPm3Flash, "View file on SPIFFS file system"},
+    {"wipe",        CmdFlashMemSpiFFSWipe,    IfPm3Flash, "Wipe all files from SPIFFS file system   * " _RED_("dangerous") " *" },
     {NULL, NULL, NULL, NULL}
 };
 

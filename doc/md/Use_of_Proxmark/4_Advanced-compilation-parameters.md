@@ -61,7 +61,10 @@ These features make it very different from all other Proxmark3 devices, there is
 **Recommendation**: if you don't have a RDV4, we strongly recommend your device to have at least a 512KB arm chip, since this repo is crossing 256KB limit. There is still a way to skip parts to make it fit on a 256KB device, see below.
 
 If you need to tune things and save the configuration, create a file `Makefile.platform` in the root directory of the repository, see `Makefile.platform.sample`.
-For an up-to-date exhaustive list of options, you can run `make PLATFORM=`.
+
+If you need to maintain several `Makefile.platform` files for different Proxmark3 devices, you can specify which file to use with e.g. `make PLATFORM_FILE=mydevice_platform`.
+
+For an up-to-date exhaustive list of options to use in a `Makefile.platform` file, you can run `make PLATFORM=`.
 
 ## PLATFORM
 ^[Top](#top)
@@ -114,48 +117,49 @@ The Iceman repository gives you to easily choose which standalone mode to embed 
 Documentation for each standalone mode can be found in the [Standalone Modes Index](../../armsrc/Standalone/readme.md#individual-mode-documentation).
 Here are the supported values you can assign to `STANDALONE` in `Makefile.platform`:
 
-| STANDALONE      | DESCRIPTION                            |
-|-----------------|----------------------------------------|
-|                 | No standalone mode
-| LF_EM4100EMUL   | LF EM4100 simulator standalone mode - temskiy
-| LF_EM4100RSWB   | LF EM4100 read/write/clone/brute mode - Monster1024
-| LF_EM4100RSWW   | LF EM4100 read/write/clone/validate/wipe mode - Łukasz "zabszk" Jurczyk
-| LF_EM4100RWC    | LF EM4100 read/write/clone mode - temskiy
-| LF_HIDBRUTE     | HID corporate 1000 bruteforce - Federico dotta & Maurizio Agazzini
-| LF_HIDFCBRUTE   | LF HID facility code bruteforce - ss23
-| LF_ICEHID       | LF HID collector to flashmem - Iceman1001
-| LF_MULTIHID     | LF HID 26 Bit (H1031) multi simulator - Shain Lakin
-| LF_NEDAP_SIM    | LF Nedap ID simulator
-| LF_NEXID        | Nexwatch credentials detection mode - jrjgjk & Zolorah
-| LF_PROXBRUTE    | HID ProxII bruteforce - Brad Antoniewicz
-| LF_PROX2BRUTE   | HID ProxII bruteforce v2 - Yann Gascuel
-| LF_SAMYRUN (def)| HID26 read/clone/sim - Samy Kamkar
-| LF_SKELETON     | standalone mode skeleton - Iceman1001
-| LF_THAREXDE     | LF EM4x50 simulator/read standalone mode - tharexde
-| HF_14ASNIFF     | 14a sniff storing to flashmem - Micolous
-| HF_14BSNIFF     | 14b sniff - jacopo-j
-| HF_15SNIFF      | 15693 sniff storing to flashmem - Glaser
-| HF_15SIM        | 15693 simulator - lnv42
-| HF_AVEFUL       | MIFARE Ultralight read/simulation - Ave Ozkal
-| HF_BOG          | 14a sniff with ULC/ULEV1/NTAG auth storing in flashmem - Bogito
-| HF_CARDHOPPER   | Long distance (over IP) relay of 14a protocols - Sam Haskins
-| HF_COLIN        | Mifare ultra fast sniff/sim/clone - Colin Brigato
-| HF_CRAFTBYTE    | UID stealer - Emulates scanned 14a UID - Anze Jensterle
-| HF_DOEGOX_AUTH0 | UL-C / UL-AES unlocker - Philippe Teuwen (doegox)
-| HF_ICECLASS     | iCLASS 4-1 mode  sim/read & dump/loclass/glitch & config to flashmem - Iceman1001
-| HF_LEGIC        | HF Legic Prime Read/Store/Sim standalone - uhei
-| HF_LEGICSIM     | HF Legic Prime Simulate standalone - uhei
-| HF_MATTYRUN     | Mifare sniff/clone - Matías A. Ré Medina
-| HF_MFCSIM       | Simulate Mifare Classic 1k card storing in flashmem - Ray Lee
-| HF_MSDSAL       | EMV Read and emulation - Salvador Mendoza
-| HF_REBLAY       | 14A relay over BT  - Salvador Mendoza
-| HF_ST25_TEAROFF | Store/restore ST25TB tags with tear-off for counters - SecLabz 
-| HF_TCPRST       | IKEA Rothult ST25TA, Standalone Master Key Dump/Emulation - Nick Draffen
-| HF_TMUDFORD     | Read and emulate ISO15693 card UID - Tim Mudford
-| HF_UNISNIFF     | Combined 14a/14b/15 sniffer with runtime selection & extra save options
-| HF_YOUNG        | Mifare sniff/simulation - Craig Young
-| HF_EMVPNG       | EMV Read and emulation - Davi Mikael (Penegui)
-| DANKARMULTI     | Standalone mode that bakes together multiple other standalone modes. - dankar
+| STANDALONE       | DESCRIPTION                            |
+|------------------|----------------------------------------|
+|                  | No standalone mode
+| LF_EM4100EMUL    | LF EM4100 simulator standalone mode - temskiy
+| LF_EM4100RSWB    | LF EM4100 read/write/clone/brute mode - Monster1024
+| LF_EM4100RSWW    | LF EM4100 read/write/clone/validate/wipe mode - Łukasz "zabszk" Jurczyk
+| LF_EM4100RWC     | LF EM4100 read/write/clone mode - temskiy
+| LF_HIDBRUTE      | HID corporate 1000 bruteforce - Federico dotta & Maurizio Agazzini
+| LF_HIDFCBRUTE    | LF HID facility code bruteforce - ss23
+| LF_ICEHID        | LF HID collector to flashmem - Iceman1001
+| LF_MULTIHID      | LF HID 26 Bit (H1031) multi simulator - Shain Lakin
+| LF_NEDAP_SIM     | LF Nedap ID simulator
+| LF_NEXID         | Nexwatch credentials detection mode - jrjgjk & Zolorah
+| LF_PROXBRUTE     | HID ProxII bruteforce - Brad Antoniewicz
+| LF_PROX2BRUTE    | HID ProxII bruteforce v2 - Yann Gascuel
+| LF_SAMYRUN (def) | HID26 read/clone/sim - Samy Kamkar
+| LF_SKELETON      | standalone mode skeleton - Iceman1001
+| LF_THAREXDE      | LF EM4x50 simulator/read standalone mode - tharexde
+| HF_14ASNIFF      | 14a sniff storing to flashmem - Micolous
+| HF_14BSNIFF      | 14b sniff - jacopo-j
+| HF_15SNIFF       | 15693 sniff storing to flashmem - Glaser
+| HF_15SIM         | 15693 simulator - lnv42
+| HF_AVEFUL        | MIFARE Ultralight read/simulation - Ave Ozkal
+| HF_BOG           | 14a sniff with ULC/ULEV1/NTAG auth storing in flashmem - Bogito
+| HF_CARDHOPPER    | Long distance (over IP) relay of 14a protocols - Sam Haskins
+| HF_COLIN         | Mifare ultra fast sniff/sim/clone - Colin Brigato
+| HF_CRAFTBYTE     | UID stealer - Emulates scanned 14a UID - Anze Jensterle
+| HF_DOEGOX_AUTH0  | UL-C / UL-AES unlocker - Philippe Teuwen (doegox)
+| HF_DOEGOX_COMMIT | DESFire suspended commit - Philippe Teuwen (doegox)
+| HF_ICECLASS      | iCLASS 4-1 mode  sim/read & dump/loclass/glitch & config to flashmem - Iceman1001
+| HF_LEGIC         | HF Legic Prime Read/Store/Sim standalone - uhei
+| HF_LEGICSIM      | HF Legic Prime Simulate standalone - uhei
+| HF_MATTYRUN      | Mifare sniff/clone - Matías A. Ré Medina
+| HF_MFCSIM        | Simulate Mifare Classic 1k card storing in flashmem - Ray Lee
+| HF_MSDSAL        | EMV Read and emulation - Salvador Mendoza
+| HF_REBLAY        | 14A relay over BT  - Salvador Mendoza
+| HF_ST25_TEAROFF  | Store/restore ST25TB tags with tear-off for counters - SecLabz
+| HF_TCPRST        | IKEA Rothult ST25TA, Standalone Master Key Dump/Emulation - Nick Draffen
+| HF_TMUDFORD      | Read and emulate ISO15693 card UID - Tim Mudford
+| HF_UNISNIFF      | Combined 14a/14b/15 sniffer with runtime selection & extra save options
+| HF_YOUNG         | Mifare sniff/simulation - Craig Young
+| HF_EMVPNG        | EMV Read and emulation - Davi Mikael (Penegui)
+| DANKARMULTI      | Standalone mode that bakes together multiple other standalone modes. - dankar
 
 By default `STANDALONE=LF_SAMYRUN`.
 
@@ -167,7 +171,7 @@ If you own a Proxmark3 Easy with only 256KB, you can use a few definitions to he
 First thing is of course to use the `PLATFORM=PM3GENERIC`.
 Adding `PLATFORM_SIZE=256` will provoke an error during compilation of the recovery image if your image is too big, so you can detect the problem before trying to flash the Proxmark3, e.g.
 ```
-[=] GEN proxmark3_recovery.bin
+[=] GEN recovery.bin
 !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
 ERROR: Firmware image too large for your platform! 262768 > 262144
 !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!

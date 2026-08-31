@@ -56,6 +56,14 @@
 #define MIFARE_2K_MAX_KEY_SIZE      (MIFARE_2K_MAXSECTOR * 2 * MIFARE_KEY_SIZE)
 #define MIFARE_4K_MAX_KEY_SIZE      (MIFARE_4K_MAXSECTOR * 2 * MIFARE_KEY_SIZE)
 
+typedef struct {
+    uint8_t key_a[MIFARE_KEY_SIZE];
+    uint8_t access[3];
+    uint8_t gpb;
+    uint8_t key_b[MIFARE_KEY_SIZE];
+} PACKED mf_trailer_t;
+
+_Static_assert(sizeof(mf_trailer_t) == MFBLOCK_SIZE, "mf_trailer_t must be one block");
 
 static const uint64_t g_mifare_default_keys[] = {
     0xffffffffffff, // Default key (first key used by program if no user defined key)
@@ -115,6 +123,8 @@ static const uint64_t g_mifare_default_keys[] = {
     0x587ee5f9350f,
     0xa0478cc39091,
     0x533cb6c723f6,
+    0x717273747555,
+    0x434445464733,
     0x8fd0a4f256e9,
     0x0000014b5c31,
     0xb578f38a5c61,

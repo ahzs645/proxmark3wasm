@@ -129,6 +129,8 @@ void setHf14aConfig(const hf14a_config_t *hc);
 hf14a_config_t *getHf14aConfig(void);
 void iso14a_set_timeout(uint32_t timeout);
 uint32_t iso14a_get_timeout(void);
+// Rebase absolute reader-transfer schedule after a caller restarts the SSP clock counter.
+void iso14a_rebase_transfer_time(void);
 
 void GetParity(const uint8_t *pbtCmd, uint16_t len, uint8_t *par);
 
@@ -141,21 +143,26 @@ void Uart14aInit(uint8_t *d, uint16_t n, uint8_t *par);
 RAMFUNC bool MillerDecoding(uint8_t bit, uint32_t non_real_time);
 RAMFUNC int ManchesterDecoding(uint8_t bit, uint16_t offset, uint32_t non_real_time);
 
-void RAMFUNC SniffIso14443a(uint8_t param);
+int RAMFUNC SniffIso14443a(uint8_t param);
 void SimulateIso14443aTag(uint8_t tagType, uint16_t flags, uint8_t *useruid, uint8_t exitAfterNReads);
 
 void SimulateIso14443aTagEx(uint8_t tagType, uint16_t flags, uint8_t *useruid, uint8_t exitAfterNReads,
                             uint8_t *ats, size_t ats_len,
                             uint8_t *ulauth_1a1, uint8_t ulauth_1a1_len,
-                            uint8_t *ulauth_1a2, uint8_t ulauth_1a2_len);
+                            uint8_t *ulauth_1a2, uint8_t ulauth_1a2_len,
+                            bool ulauth_1a2_mirror);
 
 void SimulateIso14443aTagAID(uint8_t tagType, uint16_t flags, uint8_t *uid,
                              uint8_t *ats, size_t ats_len,  uint8_t *aid, size_t aid_len,
                              uint8_t *selectaid_response, size_t selectaid_response_len,
                              uint8_t *getdata_response, size_t getdata_response_len);
 
+void iso14a_set_atqa_sak_override(uint16_t atqa, uint8_t sak);
+uint8_t iso14a_get_pcb_blocknum(void);
+void iso14a_toggle_pcb_blocknum(void);
 bool SimulateIso14443aInit(uint8_t tagType, uint16_t flags, uint8_t *data,
-                           uint8_t *ats, size_t ats_len, tag_response_info_t **responses,
+                           uint8_t *ats, size_t ats_len,
+                           tag_response_info_t **responses,
                            uint32_t *cuid, uint8_t *pages,
                            uint8_t *ulc_key);
 
@@ -201,5 +208,21 @@ bool GetIso14443aAnswerFromTag_Thinfilm(uint8_t *receivedResponse, uint16_t rec_
 
 extern iso14a_polling_parameters_t WUPA_POLLING_PARAMETERS;
 extern iso14a_polling_parameters_t REQA_POLLING_PARAMETERS;
+
+// Sniffer timing delays (carrier clock cycles), for use by external sniff loops.
+#define DELAY_TAG_AIR2ARM_AS_SNIFFER    (3 + 14 + 8)
+
+// When the PM acts as sniffer and is receiving reader data, it takes
+// 2 ticks delay in analogue RF receiver (for the falling edge of the
+// start bit, which marks the start of the communication)
+// 3 ticks A/D conversion
+// 8 ticks on average until the data is stored in to_arm.
+// + the delays in transferring data - which is the same for
+// sniffing reader and tag data and therefore not relevant
+#define DELAY_READER_AIR2ARM_AS_SNIFFER (2 + 3 + 8)
+
+// Maximum ISO 14443A protocol timeout in field cycles (1/13.56 MHz).
+#define MAX_ISO14A_TIMEOUT 524288
+// this timeout is in MS
 
 #endif /* __ISO14443A_H */

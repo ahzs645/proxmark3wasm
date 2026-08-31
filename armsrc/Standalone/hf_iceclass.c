@@ -26,9 +26,10 @@
 #include "proxmark3_arm.h"
 #include "appmain.h"
 #include "BigBuf.h"
-#include "fpgaloader.h"
+#include "fpga_apis.h"
+#include "fpga_loader.h"
 #include "util.h"
-#include "ticks.h"
+#include "ticks_apis.h"
 #include "dbprint.h"
 #include "spiffs.h"
 #include "iclass.h"
@@ -217,7 +218,7 @@ static int fullsim_mode(void) {
         Dbprintf("loaded " _GREEN_(HF_ICLASS_FULLSIM_ORIG_BIN) " (%u bytes)", fsize);
     }
 
-    iclass_simulate(ICLASS_SIM_MODE_FULL, 0, false, NULL, NULL, NULL);
+    iclass_simulate(ICLASS_SIM_MODE_FULL, 0, false, false, NULL, NULL, NULL);
 
     LED_B_ON();
     rdv40_spiffs_lazy_mount();
@@ -240,7 +241,7 @@ static int reader_attack_mode(void) {
     uint16_t mac_response_len = 0;
     uint8_t *mac_responses = BigBuf_calloc(MAC_RESPONSES_SIZE);
 
-    iclass_simulate(ICLASS_SIM_MODE_READER_ATTACK, NUM_CSNS, false, csns, mac_responses, &mac_response_len);
+    iclass_simulate(ICLASS_SIM_MODE_READER_ATTACK, NUM_CSNS, false, false, csns, mac_responses, &mac_response_len);
 
     if (mac_response_len > 0) {
 
@@ -584,7 +585,7 @@ static int dump_sim_mode(void) {
     }
 
     Dbprintf("simming " _GREEN_(HF_ICALSSS_READSIM_TEMP_BIN));
-    iclass_simulate(ICLASS_SIM_MODE_FULL, 0, false, NULL, NULL, NULL);
+    iclass_simulate(ICLASS_SIM_MODE_FULL, 0, false, false, NULL, NULL, NULL);
 
     LED_B_ON();
     rdv40_spiffs_lazy_mount();
@@ -614,7 +615,7 @@ static int config_sim_mode(void) {
 
         if (res == SPIFFS_OK) {
             Dbprintf("loaded " _GREEN_("%s") " (%u bytes) to emulator memory", cc_files[i], fsize);
-            iclass_simulate(ICLASS_SIM_MODE_FULL, 0, false, NULL, NULL, NULL);
+            iclass_simulate(ICLASS_SIM_MODE_FULL, 0, false, false, NULL, NULL, NULL);
         }
     }
 

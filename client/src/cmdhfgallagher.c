@@ -32,6 +32,7 @@
 #include "common.h"
 #include "commonutil.h"
 #include "cmdparser.h"
+#include "cmdhf14a.h"
 #include "cliparser.h"
 #include "comms.h"
 #include "ui.h"
@@ -381,7 +382,7 @@ static int hfgal_create_creds_app(DesfireContext_t *ctx, uint8_t *site_key, uint
     // UID is required for key diversification
     if (ctx->uidlen == 0) {
         PM3_RET_ERR(PM3_EINVARG, "UID is required for key diversification. "
-                                 "Please fetch it before calling `hfgal_create_creds_app`");
+                    "Please fetch it before calling `hfgal_create_creds_app`");
     }
 
     // Create application
@@ -871,11 +872,11 @@ static int hfgal_read_desfire_card(uint32_t aid, uint8_t *site_key, bool verbose
         PM3_RET_IF_ERR_MAYBE_MSG(res, !quiet, "Failed reading card application credentials");
 
         PrintAndLogEx(SUCCESS, "Gallagher (AID %06X) - region: " _GREEN_("%c") " ( " _GREEN_("%u") " )"
-                               ", facility: " _GREEN_("%u")
-                               ", card number: " _GREEN_("%u")
-                               ", issue level: " _GREEN_("%u"),
+                      ", facility: " _GREEN_("%u")
+                      ", card number: " _GREEN_("%u")
+                      ", issue level: " _GREEN_("%u"),
                       current_aid,
-                               'A' + creds.region_code,
+                      'A' + creds.region_code,
                       creds.region_code,
                       creds.facility_code,
                       creds.card_number,
@@ -992,36 +993,33 @@ static int hfgal_update_mad(uint8_t cred_sector, uint8_t cad_sector,
                             const uint8_t *mad_key, uint8_t mad_key_type,
                             bool verbose) {
     // Read current MAD (sector 0)
-    uint8_t sector0[4 * MFBLOCK_SIZE] = {0};
-    int res = mf_read_sector(0, mad_key_type, mad_key, sector0);
+    mad1_sector_t sector0 = {0};
+    int res = mf_read_sector(0, mad_key_type, mad_key, (uint8_t *)&sector0);
     if (res != PM3_SUCCESS) {
         PrintAndLogEx(ERR, "Failed reading MAD sector 0");
         return res;
     }
 
     // Set AID for credential sector (0x4812)
-    if (cred_sector >= 1 && cred_sector <= 15) {
-        sector0[16 + 2 + (cred_sector - 1) * 2]     = CLASSIC_CRED_AID & 0xFF;
-        sector0[16 + 2 + (cred_sector - 1) * 2 + 1]  = (CLASSIC_CRED_AID >> 8) & 0xFF;
+    if (cred_sector >= 1 && cred_sector <= MAD1_NUM_AIDS) {
+        sector0.mad.aid[cred_sector - 1] = CLASSIC_CRED_AID;
     }
 
     // Set AID for CAD sector (0x4811)
-    if (cad_sector >= 1 && cad_sector <= 15) {
-        sector0[16 + 2 + (cad_sector - 1) * 2]     = CLASSIC_CAD_AID & 0xFF;
-        sector0[16 + 2 + (cad_sector - 1) * 2 + 1]  = (CLASSIC_CAD_AID >> 8) & 0xFF;
+    if (cad_sector >= 1 && cad_sector <= MAD1_NUM_AIDS) {
+        sector0.mad.aid[cad_sector - 1] = CLASSIC_CAD_AID;
     }
 
-    // Recalculate CRC over bytes 17..47 (info byte + 15 AID entries)
-    sector0[16] = CRC8Mad(&sector0[16 + 1], 15 + 16);
+    sector0.mad.crc = CRC8Mad((uint8_t *)&sector0.mad.info, sizeof(mad1_t) - 1);
 
     // Write blocks 1 and 2 of sector 0 back (block 0 is manufacturer block, don't touch)
-    res = mf_write_block(1, mad_key_type, mad_key, &sector0[MFBLOCK_SIZE]);
+    res = mf_write_block(1, mad_key_type, mad_key, MF_SECTOR_BLOCK(sector0, 1));
     if (res != PM3_SUCCESS) {
         PrintAndLogEx(ERR, "Failed writing MAD block 1");
         return res;
     }
 
-    res = mf_write_block(2, mad_key_type, mad_key, &sector0[2 * MFBLOCK_SIZE]);
+    res = mf_write_block(2, mad_key_type, mad_key, MF_SECTOR_BLOCK(sector0, 2));
     if (res != PM3_SUCCESS) {
         PrintAndLogEx(ERR, "Failed writing MAD block 2");
         return res;
@@ -1048,9 +1046,10 @@ static int hfgal_write_classic_card(GallagherCredentials_t *creds, uint8_t cred_
     clearCommandBuffer();
 
     // Select card to get UID
-    SendCommandMIX(CMD_HF_ISO14443A_READER, ISO14A_CONNECT, 0, 0, NULL, 0);
+    SendIso14aReader(ISO14A_CONNECT | ISO14A_CLEARTRACE, NULL, 0);
     PacketResponseNG resp;
-    if (WaitForResponseTimeout(CMD_ACK, &resp, 2500) == false) {
+    uint8_t sel_1051 = 0;
+    if (WaitForIso14aReply(&resp, 2500, NULL, &sel_1051) == false) {
         PrintAndLogEx(ERR, "Card select timeout");
         return PM3_ETIMEOUT;
     }
@@ -1058,7 +1057,7 @@ static int hfgal_write_classic_card(GallagherCredentials_t *creds, uint8_t cred_
     iso14a_card_select_t card;
     memcpy(&card, (iso14a_card_select_t *)resp.data.asBytes, sizeof(iso14a_card_select_t));
 
-    uint64_t select_status = resp.oldarg[0];
+    uint64_t select_status = sel_1051;
     if (select_status == 0) {
         PrintAndLogEx(ERR, "Card select failed");
         return PM3_EFAILED;
@@ -1177,9 +1176,10 @@ static int hfgal_read_classic_card(uint8_t *site_key, bool verbose, bool quiet) 
     GallagherCredentials_t creds = {0};
 
     // Select card
-    SendCommandMIX(CMD_HF_ISO14443A_READER, ISO14A_CONNECT, 0, 0, NULL, 0);
+    SendIso14aReader(ISO14A_CONNECT | ISO14A_CLEARTRACE, NULL, 0);
     PacketResponseNG resp;
-    if (WaitForResponseTimeout(CMD_ACK, &resp, 2500) == false) {
+    uint8_t sel_1181 = 0;
+    if (WaitForIso14aReply(&resp, 2500, NULL, &sel_1181) == false) {
         if (!quiet) {
             PrintAndLogEx(DEBUG, "iso14443a card select timeout");
         }
@@ -1195,7 +1195,7 @@ static int hfgal_read_classic_card(uint8_t *site_key, bool verbose, bool quiet) 
         2: OK, no ATS
         3: proprietary Anticollision
     */
-    uint64_t select_status = resp.oldarg[0];
+    uint64_t select_status = sel_1181;
 
     if (select_status == 0) {
         if (!quiet) {
@@ -1696,10 +1696,10 @@ static int CmdGallagherDecode(const char *cmd) {
     gallagher_decode_creds(data_buf, &creds);
 
     PrintAndLogEx(SUCCESS, "Gallagher - region: " _GREEN_("%c") " ( " _GREEN_("%u") " )"
-                           ", facility: " _GREEN_("%u")
-                           ", card number: " _GREEN_("%u")
-                           ", issue level: " _GREEN_("%u"),
-                           'A' + creds.region_code,
+                  ", facility: " _GREEN_("%u")
+                  ", card number: " _GREEN_("%u")
+                  ", issue level: " _GREEN_("%u"),
+                  'A' + creds.region_code,
                   creds.region_code,
                   creds.facility_code,
                   creds.card_number,
@@ -1775,14 +1775,16 @@ static int CmdGallagherTest(const char *cmd) {
 
 
 static command_t CommandTable[] = {
+    {"-----------",  CmdHelp,               AlwaysAvailable, "----------------------- " _CYAN_("General") " -----------------------"},
     {"help",         CmdHelp,               AlwaysAvailable, "This help"},
-    {"reader",       CmdGallagherReader,    IfPm3Iso14443,   "Read & decode all Gallagher credentials on a DESFire or Classic card"},
+    {"test",         CmdGallagherTest,      AlwaysAvailable, "Test the function of Gallagher Mifare Core"},
+    {"-----------",  CmdHelp,               AlwaysAvailable, "----------------------- " _CYAN_("Operations") " -----------------------"},
     {"clone",        CmdGallagherClone,     IfPm3Iso14443,   "Clone Gallagher credentials to a DESFire or Classic card"},
     {"delete",       CmdGallagherDelete,    IfPm3Iso14443,   "Delete Gallagher credentials from a DESFire card"},
     {"diversifykey", CmdGallagherDiversify, AlwaysAvailable, "Diversify Gallagher key"},
     {"decode",       CmdGallagherDecode,    AlwaysAvailable, "Decode Gallagher credential block"},
     {"encode",       CmdGallagherEncode,    AlwaysAvailable, "Encode Gallagher credential block"},
-    {"test",         CmdGallagherTest,      AlwaysAvailable, "Test the function of Gallagher Mifare Core"},
+    {"reader",       CmdGallagherReader,    IfPm3Iso14443,   "Read & decode all Gallagher credentials on a DESFire or Classic card"},
     {NULL, NULL, NULL, NULL}
 };
 

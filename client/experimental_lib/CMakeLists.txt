@@ -23,8 +23,8 @@
 #  On ProxSpace 3.4:
 #    cmake -G"MSYS Makefiles" ..
 #  On Proxspace 3.3 or less, you need to install cmake:
-#    pacman -S mingw-w64-x86_64-cmake
-#    /mingw64/bin/cmake -G"MSYS Makefiles" ..
+#    pacman -S mingw-w64-ucrt-x86_64-cmake
+#    /ucrt64/bin/cmake -G"MSYS Makefiles" ..
 #
 # Android cross-compilation: (ANDROID_ABI=arm64-v8a for a 64b version)
 # cmake \
@@ -212,6 +212,21 @@ if (NOT SKIPWHEREAMISYSTEM EQUAL 1)
     endif (WHEREAMI_INCLUDE_DIRS AND WHEREAMI_LIBRARIES)
 endif (NOT SKIPWHEREAMISYSTEM EQUAL 1)
 
+# These must be set BEFORE add_subdirectory(deps): CMake copies the
+# current variable scope into a subdirectory at that point, so flags set
+# further down never reach the bundled deps and jansson fails the
+# -Werror=stringop-overflow false positive on its own.
+# GCC 10 has issues with false positives on stringop-overflow,
+# let's disable them for now (cf https://gcc.gnu.org/bugzilla/show_bug.cgi?id=92955, https://gcc.gnu.org/bugzilla/show_bug.cgi?id=94335)
+# beware these flags didn't exist for GCC < 7
+if(CMAKE_COMPILER_IS_GNUCXX)
+    execute_process(COMMAND ${CMAKE_C_COMPILER} -dumpversion OUTPUT_VARIABLE GCC_VERSION)
+    if (GCC_VERSION VERSION_GREATER 10.0 OR GCC_VERSION VERSION_EQUAL 10.0)
+        set(CMAKE_C_FLAGS "-Wno-stringop-overflow -Wno-error=stringop-overflow ${CMAKE_C_FLAGS}")
+        set(CMAKE_CXX_FLAGS "-Wno-stringop-overflow -Wno-error=stringop-overflow ${CMAKE_CXX_FLAGS}")
+    endif()
+endif(CMAKE_COMPILER_IS_GNUCXX)
+
 add_subdirectory(${PM3_ROOT}/client/deps deps)
 
 set (TARGET_SOURCES
@@ -233,8 +248,11 @@ set (TARGET_SOURCES
         ${PM3_ROOT}/common/hitag2/hitag2_crypto.c
         ${PM3_ROOT}/client/src/crypto/asn1dump.c
         ${PM3_ROOT}/client/src/crypto/asn1utils.c
+        ${PM3_ROOT}/client/src/crypto/duoxcrypto.c
         ${PM3_ROOT}/client/src/crypto/libpcrypto.c
         ${PM3_ROOT}/client/src/crypto/originality.c
+        ${PM3_ROOT}/client/src/emrtd/emrtd_pace.c
+        ${PM3_ROOT}/client/src/emrtd/emrtd_pacetest.c
         ${PM3_ROOT}/client/src/emv/test/cda_test.c
         ${PM3_ROOT}/client/src/emv/test/crypto_test.c
         ${PM3_ROOT}/client/src/emv/test/cryptotest.c
@@ -263,18 +281,23 @@ set (TARGET_SOURCES
         ${PM3_ROOT}/client/src/cipurse/cipursecore.c
         ${PM3_ROOT}/client/src/cipurse/cipursetest.c
         ${PM3_ROOT}/client/src/loclass/cipher.c
+        ${PM3_ROOT}/client/src/loclass/cipher_bs.c
+        ${PM3_ROOT}/client/src/loclass/cipher_bs_avx2.c
+        ${PM3_ROOT}/client/src/loclass/cipher_bs_avx512.c
+        ${PM3_ROOT}/client/src/loclass/cipher_bs_dispatch.c
+        ${PM3_ROOT}/client/src/loclass/cipher_bs_neon.c
         ${PM3_ROOT}/client/src/loclass/cipherutils.c
         ${PM3_ROOT}/client/src/loclass/elite_crack.c
         ${PM3_ROOT}/client/src/loclass/hash1_brute.c
         ${PM3_ROOT}/client/src/loclass/ikeys.c
         ${PM3_ROOT}/client/src/mifare/mad.c
+        ${PM3_ROOT}/client/src/mifare/mad_test.c
         ${PM3_ROOT}/client/src/mifare/aiddesfire.c
         ${PM3_ROOT}/client/src/mifare/mfkey.c
         ${PM3_ROOT}/client/src/mifare/mifare4.c
         ${PM3_ROOT}/client/src/mifare/mifaredefault.c
         ${PM3_ROOT}/client/src/mifare/mifarehost.c
         ${PM3_ROOT}/client/src/mifare/gen4.c
-        ${PM3_ROOT}/client/src/nfc/ndef.c
         ${PM3_ROOT}/client/src/mifare/lrpcrypto.c
         ${PM3_ROOT}/client/src/mifare/desfirecrypto.c
         ${PM3_ROOT}/client/src/mifare/desfiresecurechan.c
@@ -282,9 +305,15 @@ set (TARGET_SOURCES
         ${PM3_ROOT}/client/src/mifare/desfiretest.c
         ${PM3_ROOT}/client/src/mifare/gallaghercore.c
         ${PM3_ROOT}/client/src/mifare/gallaghertest.c
+        ${PM3_ROOT}/client/src/mifare/prime.c
+        ${PM3_ROOT}/client/src/nfc/ndef.c
+        ${PM3_ROOT}/client/src/qrcode/qrcode.c
+        ${PM3_ROOT}/client/src/relay/relay_posix.c
+        ${PM3_ROOT}/client/src/relay/relay_win32.c
         ${PM3_ROOT}/client/src/uart/ringbuffer.c
         ${PM3_ROOT}/client/src/uart/uart_common.c
         ${PM3_ROOT}/client/src/uart/uart_posix.c
+        ${PM3_ROOT}/client/src/uart/ble_posix.c
         ${PM3_ROOT}/client/src/uart/uart_win32.c
         ${PM3_ROOT}/client/src/ui/overlays.ui
         ${PM3_ROOT}/client/src/ui/image.ui
@@ -295,20 +324,23 @@ set (TARGET_SOURCES
         ${PM3_ROOT}/client/src/cmddata.c
         ${PM3_ROOT}/client/src/cmdflashmem.c
         ${PM3_ROOT}/client/src/cmdflashmemspiffs.c
+        ${PM3_ROOT}/client/src/cmdfpga.c
         ${PM3_ROOT}/client/src/cmdhf.c
         ${PM3_ROOT}/client/src/cmdhf14a.c
         ${PM3_ROOT}/client/src/cmdhf14b.c
         ${PM3_ROOT}/client/src/cmdhf15.c
         ${PM3_ROOT}/client/src/cmdhfaliro.c
+        ${PM3_ROOT}/client/src/cmdhfcalypso.c
+        ${PM3_ROOT}/client/src/cmdhfcipurse.c
         ${PM3_ROOT}/client/src/cmdhfcryptorf.c
         ${PM3_ROOT}/client/src/cmdhfemrtd.c
         ${PM3_ROOT}/client/src/cmdhfepa.c
         ${PM3_ROOT}/client/src/cmdhffelica.c
         ${PM3_ROOT}/client/src/cmdhffido.c
+        ${PM3_ROOT}/client/src/cmdhffmcos.c
         ${PM3_ROOT}/client/src/cmdhffudan.c
         ${PM3_ROOT}/client/src/cmdhfgallagher.c
         ${PM3_ROOT}/client/src/cmdhfgst.c
-        ${PM3_ROOT}/client/src/cmdhfcipurse.c
         ${PM3_ROOT}/client/src/cmdhficlass.c
         ${PM3_ROOT}/client/src/cmdhfict.c
         ${PM3_ROOT}/client/src/cmdhfjooki.c
@@ -320,9 +352,11 @@ set (TARGET_SOURCES
         ${PM3_ROOT}/client/src/cmdhfmfdes.c
         ${PM3_ROOT}/client/src/cmdhfmfhard.c
         ${PM3_ROOT}/client/src/cmdhfmfp.c
+        ${PM3_ROOT}/client/src/cmdhfmfsen.c
         ${PM3_ROOT}/client/src/cmdhfmfu.c
         ${PM3_ROOT}/client/src/cmdhfntag424.c
         ${PM3_ROOT}/client/src/cmdhfsaflok.c
+        ${PM3_ROOT}/client/src/cmdhfsecc.c
         ${PM3_ROOT}/client/src/cmdhfseos.c
         ${PM3_ROOT}/client/src/cmdhfst.c
         ${PM3_ROOT}/client/src/cmdhfst25ta.c
@@ -366,9 +400,11 @@ set (TARGET_SOURCES
         ${PM3_ROOT}/client/src/cmdlfsecurakey.c
         ${PM3_ROOT}/client/src/cmdlft55xx.c
         ${PM3_ROOT}/client/src/cmdlfti.c
+        ${PM3_ROOT}/client/src/cmdlftrovan.c
         ${PM3_ROOT}/client/src/cmdlfviking.c
         ${PM3_ROOT}/client/src/cmdlfvisa2000.c
         ${PM3_ROOT}/client/src/cmdlfzx8211.c
+        ${PM3_ROOT}/client/src/cmdmad.c
         ${PM3_ROOT}/client/src/cmdmain.c
         ${PM3_ROOT}/client/src/cmdmqtt.c
         ${PM3_ROOT}/client/src/cmdnfc.c
@@ -382,18 +418,24 @@ set (TARGET_SOURCES
         ${PM3_ROOT}/client/src/comms.c
         ${PM3_ROOT}/client/src/fileutils.c
         ${PM3_ROOT}/client/src/flash.c
+        ${PM3_ROOT}/client/src/frame_progress.c
         ${PM3_ROOT}/client/src/graph.c
         ${PM3_ROOT}/client/src/hidsio.c
         ${PM3_ROOT}/client/src/iso4217.c
         ${PM3_ROOT}/client/src/jansson_path.c
+        ${PM3_ROOT}/client/src/jsonutils.c
         ${PM3_ROOT}/client/src/lua_bitlib.c
+        ${PM3_ROOT}/client/src/parsers/parsehrt.c
+        ${PM3_ROOT}/client/src/parsers/hrtparser/hrtparser.c
         ${PM3_ROOT}/client/src/pla.c
         ${PM3_ROOT}/client/src/preferences.c
         ${PM3_ROOT}/client/src/pm3.c
         ${PM3_ROOT}/client/src/pm3_binlib.c
         ${PM3_ROOT}/client/src/pm3_bitlib.c
+        ${PM3_ROOT}/client/src/pm3_dsp.c
+        ${PM3_ROOT}/client/src/pm3_fit.c
         ${PM3_ROOT}/client/src/pm3line.c
-        ${PM3_ROOT}/client/src/qrcode/qrcode.c
+        ${PM3_ROOT}/client/src/pm3line_vocabulary.c
         ${PM3_ROOT}/client/src/scandir.c
         ${PM3_ROOT}/client/src/scripting.c
         ${PM3_ROOT}/client/src/ui.c
@@ -645,11 +687,18 @@ add_definitions(-DHAVE_SNPRINTF)
 
 add_library(pm3rrg_rdv4 SHARED
         ${PM3_ROOT}/client/src/proxmark3.c
+        ${PM3_ROOT}/client/src/guidummy.cpp
         ${TARGET_SOURCES}
         ${ADDITIONAL_SRC}
 )
 
 target_compile_definitions(pm3rrg_rdv4 PRIVATE LIBPM3)
+
+if (UNIX AND NOT APPLE)
+    # Fail the build if a client source file is missing from TARGET_SOURCES.
+    # Otherwise Linux may defer unresolved shared-library symbols until import.
+    set_property(TARGET pm3rrg_rdv4 APPEND_STRING PROPERTY LINK_FLAGS " -Wl,--no-undefined")
+endif()
 
 target_compile_options(pm3rrg_rdv4 PUBLIC -Wall -Werror -O3)
 if (EMBED_READLINE)
@@ -677,17 +726,6 @@ if (MINGW)
     # link Winsock2
     set(ADDITIONAL_LNK ws2_32 ${ADDITIONAL_LNK})
 endif (MINGW)
-
-# GCC 10 has issues with false positives on stringop-overflow,
-# let's disable them for now (cf https://gcc.gnu.org/bugzilla/show_bug.cgi?id=92955, https://gcc.gnu.org/bugzilla/show_bug.cgi?id=94335)
-# beware these flags didn't exist for GCC < 7
-if(CMAKE_COMPILER_IS_GNUCXX)
-    execute_process(COMMAND ${CMAKE_C_COMPILER} -dumpversion OUTPUT_VARIABLE GCC_VERSION)
-    if (GCC_VERSION VERSION_GREATER 10.0 OR GCC_VERSION VERSION_EQUAL 10.0)
-        set(CMAKE_C_FLAGS "-Wno-stringop-overflow -Wno-error=stringop-overflow ${CMAKE_C_FLAGS}")
-        set(CMAKE_CXX_FLAGS "-Wno-stringop-overflow -Wno-error=stringop-overflow ${CMAKE_CXX_FLAGS}")
-    endif()
-endif(CMAKE_COMPILER_IS_GNUCXX)
 
 target_include_directories(pm3rrg_rdv4 PRIVATE
         ${PM3_ROOT}/common
@@ -732,6 +770,7 @@ target_link_libraries(pm3rrg_rdv4 PRIVATE
         pm3rrg_rdv4_hardnested
         pm3rrg_rdv4_id48
         pm3rrg_rdv4_mqtt
+        pm3rrg_rdv4_vec
         ${ADDITIONAL_LNK})
 
 if (NOT SKIPPTHREAD EQUAL 1)

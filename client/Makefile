@@ -15,7 +15,8 @@
 #-----------------------------------------------------------------------------
 
 ifeq ($(PLTNAME),)
-    -include ../Makefile.platform
+    PLATFORM_FILE ?= ../Makefile.platform
+    -include $(PLATFORM_FILE)
     -include ../.Makefile.options.cache
 # Default platform if no platform specified
     PLATFORM?=PM3RDV4
@@ -27,6 +28,10 @@ include ../Makefile.defs
 
 ifeq ($(PLATFORM),PM3ICOPYX)
   INCLUDES += -DICOPYX
+endif
+
+ifeq ($(PLATFORM),PM5)
+  INCLUDES += -DDEFAULT_PM5
 endif
 
 INSTALLBIN = proxmark3
@@ -122,6 +127,12 @@ REVENGLIBINC = -I$(REVENGLIBPATH)
 REVENGLIB = $(REVENGLIBPATH)/libreveng.a
 REVENGLIBLD =
 
+## OpenJPEG  (JPEG2000 decoding for the picture viewer)
+OPENJPEGLIBPATH = ./deps/openjpeg
+OPENJPEGLIBINC = -I$(OPENJPEGLIBPATH)
+OPENJPEGLIB = $(OPENJPEGLIBPATH)/openjpeg.a
+OPENJPEGLIBLD =
+
 ## Tinycbor
 TINYCBORLIBPATH = ./deps/tinycbor
 TINYCBORLIBINC = -I$(TINYCBORLIBPATH)
@@ -139,6 +150,10 @@ MQTTLIBPATH = ./deps/mqtt
 MQTTLIBINC = -I$(MQTTLIBPATH)
 MQTTLIB = $(MQTTLIBPATH)/mqtt.a
 MQTTLIBLD =
+
+## VEC
+VECLIBPATH = ./deps/vec
+VECLIBINC = -I$(VECLIBPATH)
 
 ##########################
 # common local libraries #
@@ -229,6 +244,11 @@ STATICLIBS += $(REVENGLIB)
 LDLIBS += $(REVENGLIBLD)
 PM3INCLUDES += $(REVENGLIBINC)
 
+## OpenJPEG
+# vendored, Qt has no JPEG2000 image handler.
+# Only linked in when the Qt GUI is built, see the "gui" section below
+PM3INCLUDES += $(OPENJPEGLIBINC)
+
 ## Tinycbor
 # not distributed as system library
 STATICLIBS += $(TINYCBORLIB)
@@ -255,6 +275,10 @@ endif
 STATICLIBS += $(MQTTLIB)
 LDLIBS += $(MQTTLIBLD)
 PM3INCLUDES += $(MQTTLIBINC)
+
+## VEC
+# not distributed as system library
+PM3INCLUDES += $(VECLIBINC)
 
 ifdef EMSCRIPTEN
 PM3INCLUDES += -Ideps/lz4/lib
@@ -594,10 +618,16 @@ else
         ifeq ($(QT6_FOUND),1)
             $(info GUI support:       QT6 found, enabled ($(shell QT_SELECT=6 $(QMAKE) -v 2>/dev/null|grep -o 'Qt version.*')))
         else
+            ifeq ($(FORCEQT6),1)
+                $(error FORCEQT6 not satisfied, aborting)
+            endif
             $(info GUI support:       QT5 found, enabled ($(shell QT_SELECT=5 $(QMAKE) -v 2>/dev/null|grep -o 'Qt version.*')))
         endif
     else
         $(info GUI support:       QT not found, disabled)
+        ifeq ($(FORCEQT),1)
+            $(error FORCEQT not satisfied, aborting)
+        endif
     endif
 endif
 
@@ -608,6 +638,9 @@ else
         $(info native BT support: Bluez found, enabled)
     else
         $(info native BT support: Bluez not found, disabled)
+        ifeq ($(FORCEBT),1)
+            $(error FORCEBT not satisfied, aborting)
+        endif
     endif
 endif
 
@@ -617,6 +650,9 @@ else ifeq ($(JANSSON_FOUND),1)
     $(info Jansson library:   system library found)
 else
     $(info Jansson library:   system library not found, using local library)
+    ifeq ($(FORCEJANSSONSYSTEM),1)
+        $(error FORCEJANSSONSYSTEM not satisfied, aborting)
+    endif
 endif
 
 ifeq ($(SKIPLUASYSTEM),1)
@@ -626,6 +662,9 @@ else
         $(info Lua library:       system library found)
     else
         $(info Lua library:       system library not found, using local library)
+        ifeq ($(FORCELUASYSTEM),1)
+            $(error FORCELUASYSTEM not satisfied, aborting)
+        endif
     endif
 endif
 
@@ -636,6 +675,9 @@ else
         $(info Python3 library:   Python3 v$(shell $(PKG_CONFIG_ENV) pkg-config --modversion $(PYTHON3_PKGCONFIG)) found, enabled)
     else
         $(info Python3 library:   Python3 not found, disabled)
+        ifeq ($(FORCEPYTHON),1)
+            $(error FORCEPYTHON not satisfied, aborting)
+        endif
     endif
 endif
 
@@ -646,13 +688,23 @@ else
         $(info GD library:        GD v$(shell $(PKG_CONFIG_ENV) pkg-config --modversion gdlib) found, enabled)
     else
         $(info GD library:        GD not found, disabled)
+        ifeq ($(FORCEGD),1)
+            $(error FORCEGD not satisfied, aborting)
+        endif
     endif
 endif
 
-ifeq ($(ZLIB_FOUND),1)
-    $(info Zlib library:      system library found, enabled)
+ifeq ($(SKIPZLIB),1)
+    $(info Zlib library:      skipped)
 else
-    $(info Zlib library:      not found, disabled)
+    ifeq ($(ZLIB_FOUND),1)
+        $(info Zlib library:      system library found, enabled)
+    else
+        $(info Zlib library:      not found, disabled)
+        ifeq ($(FORCEZLIB),1)
+            $(error FORCEZLIB not satisfied, aborting)
+        endif
+    endif
 endif
 
 ifeq ($(SKIPREADLINE),1)
@@ -662,6 +714,9 @@ else
         $(info Readline library:  enabled)
     else
         $(info Readline library:  Readline not found, disabled)
+        ifeq ($(FORCEREADLINE),1)
+            $(error FORCEREADLINE not satisfied, aborting)
+        endif
     endif
 endif
 
@@ -673,6 +728,9 @@ ifneq ($(READLINE_FOUND),1)
             $(info Linenoise library: enabled)
         else
             $(info Linenoise library: Linenoise not found, disabled)
+            ifeq ($(FORCELINENOISE),1)
+                $(error FORCELINENOISE not satisfied, aborting)
+            endif
         endif
     endif
 endif
@@ -684,6 +742,9 @@ else
         $(info Whereami library:  system library found)
     else
         $(info Whereami library:  system library not found, using local library)
+        ifeq ($(FORCEWHEREAMISYSTEM),1)
+            $(error FORCEWHEREAMISYSTEM not satisfied, aborting)
+        endif
     endif
 endif
 
@@ -725,16 +786,19 @@ SRCS =  mifare/aiddesfire.c \
         cmdhf14b.c \
         cmdhf15.c \
         cmdhfaliro.c \
+        cmdhfcalypso.c \
         cmdhfcryptorf.c \
         cmdhfepa.c \
         cmdhfemrtd.c \
         cmdhffelica.c \
         cmdhffido.c \
+        cmdhffmcos.c \
         cmdhffudan.c \
         cmdhfgallagher.c \
         cmdhfgst.c \
         cmdhfksx6924.c \
         cmdhfcipurse.c \
+        cmdhfsecc.c \
         cmdhficlass.c \
         cmdhfict.c \
         cmdhflegic.c \
@@ -744,8 +808,9 @@ SRCS =  mifare/aiddesfire.c \
         cmdhfmf.c \
         cmdhfmfdes.c \
         cmdhfmfhard.c \
-        cmdhfmfu.c \
         cmdhfmfp.c \
+        cmdhfmfsen.c \
+        cmdhfmfu.c \
         cmdhfntag424.c \
         cmdhfsaflok.c \
         cmdhfseos.c \
@@ -758,6 +823,7 @@ SRCS =  mifare/aiddesfire.c \
         cmdhfvas.c \
         cmdhfxerox.c \
         cmdhw.c \
+        cmdfpga.c \
         cmdlf.c \
         cmdlfawid.c \
         cmdlfcotag.c \
@@ -791,9 +857,11 @@ SRCS =  mifare/aiddesfire.c \
         cmdlfsecurakey.c \
         cmdlft55xx.c \
         cmdlfti.c \
+        cmdlftrovan.c \
         cmdlfviking.c \
         cmdlfvisa2000.c \
         cmdlfzx8211.c \
+        cmdmad.c \
         cmdmain.c \
         cmdmqtt.c \
         cmdnfc.c \
@@ -807,6 +875,7 @@ SRCS =  mifare/aiddesfire.c \
         comms.c \
         crypto/asn1dump.c \
         crypto/asn1utils.c\
+        crypto/duoxcrypto.c\
         crypto/libpcrypto.c\
         crypto/originality.c\
         emv/cmdemv.c \
@@ -834,16 +903,25 @@ SRCS =  mifare/aiddesfire.c \
         cipurse/cipursecore.c \
         cipurse/cipursecrypto.c \
         cipurse/cipursetest.c \
+        emrtd/emrtd_pace.c \
+        emrtd/emrtd_pacetest.c \
         fileutils.c \
         flash.c \
+        frame_progress.c \
         generator.c \
         graph.c \
         hidsio.c \
         jansson_path.c \
+        jsonutils.c \
         iso4217.c \
         iso7816/apduinfo.c \
         iso7816/iso7816core.c \
         loclass/cipher.c \
+        loclass/cipher_bs.c \
+        loclass/cipher_bs_avx2.c \
+        loclass/cipher_bs_avx512.c \
+        loclass/cipher_bs_dispatch.c \
+        loclass/cipher_bs_neon.c \
         loclass/cipherutils.c \
         loclass/elite_crack.c \
         loclass/ikeys.c \
@@ -856,22 +934,32 @@ SRCS =  mifare/aiddesfire.c \
         mifare/gallaghercore.c \
 		mifare/gallaghertest.c \
         mifare/mad.c \
+        mifare/mad_test.c \
         mifare/mfkey.c \
         mifare/mifare4.c \
         mifare/mifaredefault.c \
         mifare/mifarehost.c \
+        mifare/prime.c \
         mifare/gen4.c \
         nfc/ndef.c \
+        parsers/parsehrt.c \
+        parsers/hrtparser/hrtparser.c \
         pm3.c \
         pm3_binlib.c \
         pm3_bitlib.c \
+        pm3_dsp.c \
+        pm3_fit.c \
         preferences.c \
         pm3line.c \
+        pm3line_vocabulary.c \
         proxmark3.c \
         scandir.c \
+        relay/relay_posix.c \
+        relay/relay_win32.c \
         uart/ringbuffer.c \
         uart/uart_common.c \
         uart/uart_posix.c \
+        uart/ble_posix.c \
         uart/uart_win32.c \
         scripting.c \
         ui.c \
@@ -926,6 +1014,12 @@ endif
 # gui
 ifeq ($(QT_FOUND),1)
     CXXSRCS = proxgui.cpp proxguiqt.cpp proxguiqt.moc.cpp
+    # Qt has no JPEG2000 image handler, so we decode EF_DG2 & friends ourselves
+    SRCS += imgjp2.c
+    # openjpeg.a is a static lib, avoid __declspec(dllimport) on its Windows API decls
+    PM3CFLAGS += -DOPJ_STATIC
+    STATICLIBS += $(OPENJPEGLIB)
+    LDLIBS += $(OPENJPEGLIBLD)
 else
     CXXSRCS = guidummy.cpp
 endif
@@ -1015,6 +1109,7 @@ ifeq ($(LINENOISE_LOCAL_FOUND), 1)
 endif
 	$(Q)$(MAKE) --no-print-directory -C $(LUALIBPATH) clean
 	$(Q)$(MAKE) --no-print-directory -C $(REVENGLIBPATH) clean
+	$(Q)$(MAKE) --no-print-directory -C $(OPENJPEGLIBPATH) clean
 	$(Q)$(MAKE) --no-print-directory -C $(TINYCBORLIBPATH) clean
 	$(Q)$(MAKE) --no-print-directory -C $(WHEREAMILIBPATH) clean
 	$(Q)$(MAKE) --no-print-directory -C $(MQTTLIBPATH) clean
@@ -1104,6 +1199,10 @@ $(MBEDTLSLIB): .FORCE
 $(REVENGLIB): .FORCE
 	$(info [*] MAKE $@)
 	$(Q)$(MAKE) --no-print-directory -C $(REVENGLIBPATH) all
+
+$(OPENJPEGLIB): .FORCE
+	$(info [*] MAKE $@)
+	$(Q)$(MAKE) --no-print-directory -C $(OPENJPEGLIBPATH) all
 
 $(TINYCBORLIB): .FORCE
 	$(info [*] MAKE $@)

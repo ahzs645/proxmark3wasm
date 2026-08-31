@@ -19,94 +19,35 @@
 #include "util.h"
 #include "protocols.h"
 #include "crc16.h"
-#include "fpgaloader.h"
+#include "fpga_loader.h"
 #include "string.h"
 #include "commonutil.h"
 #include "dbprint.h"
-#include "ticks.h"
+#include "ticks_apis.h"
+#include "fpga_apis.h"
+#include "rssi_apis.h"
 #include "iso18.h"
 
-// FeliCa timings
-// minimum time between the start bits of consecutive transfers from reader to tag: 6800 carrier (13.56MHz) cycles
-#ifndef FELICA_REQUEST_GUARD_TIME
-//# define FELICA_REQUEST_GUARD_TIME (6800 / 16 + 1) // 426
-# define FELICA_REQUEST_GUARD_TIME ((512 + 0 * 256) * 64 / 16 + 1)
-#endif
-// FRAME DELAY TIME 2672 carrier cycles
-#ifndef FELICA_FRAME_DELAY_TIME
-# define FELICA_FRAME_DELAY_TIME (2672/16 + 1) // 168
-#endif
-#ifndef DELAY_AIR2ARM_AS_READER
-#define DELAY_AIR2ARM_AS_READER (3 + 16 + 8 + 8*16 + 4*16 - 8*16) // 91
-#endif
-#ifndef DELAY_ARM2AIR_AS_READER
-#define DELAY_ARM2AIR_AS_READER (4*16 + 8*16 + 8 + 8 + 1) // 209
-#endif
 #define AddCrc(data, len) compute_crc(CRC_FELICA, (data), (len), (data)+(len)+1, (data)+(len))
-
-static uint32_t felica_timeout;
-static uint32_t felica_nexttransfertime;
-static uint32_t felica_lasttime_prox2air_start;
-static bool felica_field_active;
-
-static void iso18092_setup(uint8_t fpga_minor_mode);
 static uint8_t felica_select_card(felica_card_select_t *card);
-static void TransmitFor18092_AsReader(const uint8_t *frame, uint16_t len, const uint32_t *NYI_timing_NYI, uint8_t power, uint8_t highspeed);
-static bool WaitForFelicaReply(uint16_t maxbytes);
-
-static void iso18092_set_timeout(uint32_t timeout) {
-    felica_timeout = timeout + (DELAY_AIR2ARM_AS_READER + DELAY_ARM2AIR_AS_READER) / (16 * 8) + 2;
-}
-
-static uint32_t iso18092_get_timeout(void) {
-    return felica_timeout - (DELAY_AIR2ARM_AS_READER + DELAY_ARM2AIR_AS_READER) / (16 * 8) - 2;
-}
-
-#ifndef FELICA_MAX_DATA_SIZE
-// FeliCa length byte includes itself, so application level payload max is 254 bytes.
-#define FELICA_MAX_DATA_SIZE 254
-#endif
-
-#ifndef FELICA_MAX_RF_FRAME_SIZE
-// 255 base length (max 254 data + 1 len byte) + 2 sync + 2 crc + 1 extra for safety.
-#define FELICA_MAX_RF_FRAME_SIZE 260
-#endif
-
 
 //structure to hold outgoing NFC frame
 static uint8_t frameSpace[FELICA_MAX_RF_FRAME_SIZE];
 
-//structure to hold incoming NFC frame, used for ISO/IEC 18092-compatible frames
-typedef struct {
-    enum {
-        STATE_UNSYNCD,
-        STATE_TRYING_SYNC,
-        STATE_GET_LENGTH,
-        STATE_GET_DATA,
-        STATE_GET_CRC,
-        STATE_FULL
-    } state;
+#define FELICA_PREAMBLE_BYTES 6U
 
-    uint16_t  shiftReg; //for synchronization and offset calculation
-    uint16_t  shiftRegInv; // sync search helper while polarity is unknown
-    int       posCnt;
-    bool      crc_ok;
-    int       rem_len;
-    uint16_t  len;
-    uint8_t   byte_offset;
-    uint8_t   polarity;
-    uint8_t   *framebytes;
-//should be enough. maxlen is 255, 254 for data, 2 for sync, 2 for crc
-// 0,1 -> SYNC, 2 - len,  3-(len+1)->data, then crc
-} felica_frame_t;
+// how much raw demodulator output to keep for `hw dbg -4` diagnostics
+#define FELICA_RAW_CAPTURE_BYTES 128U
 
-enum {
-    FELICA_POLARITY_UNKNOWN = 0,
-    FELICA_POLARITY_NORMAL = 1,
-    FELICA_POLARITY_INVERTED = 2
-};
-
-static felica_frame_t FelicaFrame;
+// Keep a conservative reader-to-reader guard of one FeliCa polling slot-0 wait
+// (512 bit periods). The spec minimum of 6800 carrier periods is shorter.
+#ifndef FELICA_REQUEST_GUARD_TIME
+# define FELICA_REQUEST_GUARD_TIME ((512 + 0 * 256) + 1)
+#endif
+// FRAME DELAY TIME 2672 carrier cycles
+#ifndef FELICA_FRAME_DELAY_TIME
+# define FELICA_FRAME_DELAY_TIME (FELICA_212K_CARRIER_TO_TIMER_TICKS(2672) + 1)
+#endif
 
 //b2 4d is SYNC, 45645 in 16-bit notation, 10110010 01001101 binary. Frame will not start filling until this is shifted in
 //bit order in byte -reverse, I guess?  [((bt>>0)&1),((bt>>1)&1),((bt>>2)&1),((bt>>3)&1),((bt>>4)&1),((bt>>5)&1),((bt>>6)&1),((bt>>7)&1)] -at least in the mode that I read those in
@@ -114,7 +55,28 @@ static felica_frame_t FelicaFrame;
 # define SYNC_16BIT 0xB24D
 #endif
 
-static void FelicaFrameReset(felica_frame_t *f) {
+static uint32_t felica_timeout;
+uint32_t felica_nexttransfertime;
+static uint32_t felica_lasttime_prox2air_start;
+static bool felica_field_active;
+// when set, the FPGA streams envelope peak-to-peak instead of demodulated bits
+static bool felica_probe_mode = false;
+
+felica_frame_t FelicaFrame;
+
+static void iso18092_set_timeout(uint32_t timeout) {
+    felica_timeout = timeout + (DELAY_AIR2ARM_AS_READER + DELAY_ARM2AIR_AS_READER) / (FELICA_212K_CARRIER_PERIODS_PER_BIT * FELICA_BITS_PER_BYTE) + 2;
+}
+
+static uint32_t iso18092_get_timeout(void) {
+    return felica_timeout - (DELAY_AIR2ARM_AS_READER + DELAY_ARM2AIR_AS_READER) / (FELICA_212K_CARRIER_PERIODS_PER_BIT * FELICA_BITS_PER_BYTE) - 2;
+}
+
+bool felica_field_is_active(void) {
+    return felica_field_active;
+}
+
+void FelicaFrameReset(felica_frame_t *f) {
     f->state = STATE_UNSYNCD;
     f->posCnt = 0;
     f->shiftReg = 0;
@@ -124,18 +86,32 @@ static void FelicaFrameReset(felica_frame_t *f) {
     f->len = 0;
     f->byte_offset = 0;
     f->polarity = FELICA_POLARITY_UNKNOWN;
+    f->startTime = 0;
+    f->endTime = 0;
 }
+
 static void FelicaFrameinit(felica_frame_t *f, uint8_t *data) {
     f->framebytes = data;
     FelicaFrameReset(f);
 }
 
+uint32_t felica_timer_to_carrier_periods(uint32_t timer_ticks, bool highspeed) {
+    return timer_ticks * (highspeed ? FELICA_424K_CARRIER_PERIODS_PER_BIT : FELICA_212K_CARRIER_PERIODS_PER_BIT);
+}
+
+uint32_t felica_get_rx_byte_start_time(void) {
+    return (GetCountSspClk() & 0xfffffff8) - FELICA_BITS_PER_BYTE;
+}
+
 //shift byte into frame, reversing it at the same time
-static void shiftInByte(felica_frame_t *f, uint8_t bt) {
+static void shiftInByte(felica_frame_t *f, uint8_t bt, uint32_t byte_start_time) {
     uint8_t j;
     for (j = 0; j < f->byte_offset; j++) {
         f->framebytes[f->posCnt] = (f->framebytes[f->posCnt] << 1) + (bt & 1);
         bt >>= 1;
+    }
+    if (f->byte_offset > 0) {
+        f->endTime = byte_start_time + f->byte_offset;
     }
     f->posCnt++;
     f->rem_len--;
@@ -143,9 +119,12 @@ static void shiftInByte(felica_frame_t *f, uint8_t bt) {
         f->framebytes[f->posCnt] = (f->framebytes[f->posCnt] << 1) + (bt & 1);
         bt >>= 1;
     }
+    if (f->byte_offset == 0) {
+        f->endTime = byte_start_time + FELICA_BITS_PER_BYTE;
+    }
 }
 
-static void Process18092Byte(felica_frame_t *f, uint8_t bt) {
+void Process18092Byte(felica_frame_t *f, uint8_t bt, uint32_t byte_start_time) {
 
     switch (f->state) {
 
@@ -180,6 +159,8 @@ static void Process18092Byte(felica_frame_t *f, uint8_t bt) {
                     f->framebytes[2] = 0x00;
                     f->byte_offset = i;
                     f->polarity = use_inverted ? FELICA_POLARITY_INVERTED : FELICA_POLARITY_NORMAL;
+                    f->startTime = byte_start_time + i - (2U * FELICA_BITS_PER_BYTE);
+                    f->endTime = f->startTime;
 
                     // shift in remaining byte, slowly...
                     for (uint8_t j = i; j < 8; j++) {
@@ -208,6 +189,8 @@ static void Process18092Byte(felica_frame_t *f, uint8_t bt) {
                 f->byte_offset = 0;
                 f->posCnt = 1;
                 f->polarity = use_inverted ? FELICA_POLARITY_INVERTED : FELICA_POLARITY_NORMAL;
+                f->startTime = byte_start_time + FELICA_BITS_PER_BYTE - (2U * FELICA_BITS_PER_BYTE);
+                f->endTime = f->startTime;
             }
             break;
         }
@@ -215,7 +198,7 @@ static void Process18092Byte(felica_frame_t *f, uint8_t bt) {
             if (f->polarity == FELICA_POLARITY_INVERTED) {
                 bt = (uint8_t)~bt;
             }
-            shiftInByte(f, bt);
+            shiftInByte(f, bt, byte_start_time);
             if (f->framebytes[2] == 0 || (f->framebytes[2] + 4 > FELICA_MAX_RF_FRAME_SIZE)) {
                 // invalid frame length, drop frame and start over.
                 FelicaFrameReset(f);
@@ -230,7 +213,7 @@ static void Process18092Byte(felica_frame_t *f, uint8_t bt) {
             if (f->polarity == FELICA_POLARITY_INVERTED) {
                 bt = (uint8_t)~bt;
             }
-            shiftInByte(f, bt);
+            shiftInByte(f, bt, byte_start_time);
             if (f->rem_len <= 0) {
                 f->state = STATE_GET_CRC;
                 f->rem_len = 2;
@@ -241,7 +224,7 @@ static void Process18092Byte(felica_frame_t *f, uint8_t bt) {
             if (f->polarity == FELICA_POLARITY_INVERTED) {
                 bt = (uint8_t)~bt;
             }
-            shiftInByte(f, bt);
+            shiftInByte(f, bt, byte_start_time);
             if (f->rem_len <= 0) {
                 f->rem_len = 0;
                 // skip sync 2bytes. IF ok, residue should be 0x0000
@@ -276,44 +259,69 @@ static uint8_t felica_select_card(felica_card_select_t *card) {
     // b0    = fc/64 (212kbps)
     // 0x00 = timeslot
     // 0x09 0x21 = crc
-    static uint8_t poll[10] = {0xb2, 0x4d, 0x06, FELICA_POLL_REQ, 0xFF, 0xFF, 0x00, 0x00, 0x09, 0x21};
+    uint8_t poll[10] = {0xb2, 0x4d, 0x06, FELICA_POLLING_REQ, 0xFF, 0xFF, 0x00, 0x00, 0x09, 0x21};
 
+    // Number of time slots offered to the card(s), the FeliCa polling TSN field.
+    // Slot 0 only is what a single card wants, but when several cards share the
+    // field they all answer in slot 0 and keep colliding. Widen the window on
+    // some attempts so a colliding card gets a slot of its own.
+    static const uint8_t timeslots[] = {0x00, 0x00, 0x00, 0x01, 0x03, 0x07};
 
-    // We try 10 times, or if answer was received.
-    int len = 25;
+    bool got_reply = false;
+
+    // We try 24 times, or stop early once an answer was received.
+    int len = 24;
     do {
+        poll[7] = timeslots[(unsigned int)len % ARRAYLEN(timeslots)];
+        AddCrc(poll + 2, 6);
+
         // end-of-reception response packet data, wait approx. 501µs
         // end-of-transmission command packet data, wait approx. 197µs
         // polling card
         TransmitFor18092_AsReader(poll, sizeof(poll), NULL, 1, 0);
 
         // polling card, break if success
-        if (WaitForFelicaReply(1024) && FelicaFrame.framebytes[3] == FELICA_POLL_ACK) {
-            break;
+        if (WaitForFelicaReply(1024)) {
+            if (FelicaFrame.framebytes[3] == FELICA_POLLING_RES) {
+                got_reply = true;
+                break;
+            }
         }
 
         WDT_HIT();
 
     } while (--len);
 
-    // 1. timed-out
-    if (len == 0) {
+    // 1. timed-out.  Never inspect FelicaFrame past this point without a reply,
+    //    it still holds whatever a previous exchange left in it.
+    if (got_reply == false) {
         return 1;
     }
 
     // 2. wrong answer
-    if (FelicaFrame.framebytes[3] != FELICA_POLL_ACK) {
+    if (FelicaFrame.framebytes[3] != FELICA_POLLING_RES) {
         return 2;
     }
 
     // 3. wrong crc.  residue is 0, hence if crc is a value it failed.
-    if (check_crc(CRC_FELICA, FelicaFrame.framebytes + 2, FelicaFrame.len - 2) == false) {
+    //    len covers sync(2) + payload + crc(2); anything shorter would underflow
+    //    the size_t length handed to check_crc().
+    if (FelicaFrame.len < 5 ||
+            check_crc(CRC_FELICA, FelicaFrame.framebytes + 2, FelicaFrame.len - 2) == false) {
 
         if (g_dbglevel >= DBG_DEBUG) {
             Dbprintf("Error: CRC check failed!");
             Dbhexdump(FelicaFrame.len - 2, FelicaFrame.framebytes + 2, 0);
         }
         return 3;
+    }
+
+    // 4. frame too short to contain IDm + PMm (need 4 header + 8 + 8 = 20 bytes)
+    if (FelicaFrame.len < 20) {
+        if (g_dbglevel >= DBG_DEBUG) {
+            Dbprintf("Error: Frame length smaller than 20, got %u", FelicaFrame.len);
+        }
+        return 4;
     }
 
     // copy UID
@@ -343,14 +351,17 @@ static uint8_t felica_select_card(felica_card_select_t *card) {
 // page-req: 0x06, IDm(8), ServiceNum(1),Slist(2*num) BLocknum (1) BLockids(2-3*num)
 // page-resp: 0xb2,0x4d,0x1d,0x07,  0xXX,0xXX,0xXX,0xXX,0xXX,0xXX,0xXX,0xXX,  0x00,  0x00,  0x01,  0x10,0x04,0x01,0x00,0x0d,0x00,0x00,0x00,0x00,0x00,0x01,0x00,0x00,0x00,0x00,0x23,   0xcb,0x6e,
 
-// builds a readblock frame for felica lite(s).  Using SERVICE:  SERVICE_FELICA_LITE_READONLY
+// builds a readblock frame for felica lite(s).  Using SERVICE:  FELICA_SERVICE_LITE_READONLY
 // Felica standard has a different file system, AFAIK,
 // 8-byte IDm, number of blocks, blocks numbers
 // number of blocks limited to 4 for FelicaLite(S)
 static void BuildFliteRdblk(const uint8_t *idm, uint8_t blocknum, const uint16_t *blocks) {
 
     if (blocknum > 4 || blocknum == 0) {
-        Dbprintf("Invalid number of blocks, %d != 4", blocknum);
+        Dbprintf("Invalid number of blocks, %d, expected 1..4", blocknum);
+        // make sure a caller that ignores this cannot transmit a stale frame
+        frameSpace[2] = 0;
+        return;
     }
 
     uint8_t c = 0, i = 0;
@@ -361,7 +372,7 @@ static void BuildFliteRdblk(const uint8_t *idm, uint8_t blocknum, const uint16_t
 
     c++; // set length later
 
-    frameSpace[c++] = FELICA_RDBLK_REQ; // command number
+    frameSpace[c++] = FELICA_READ_WITHOUT_ENCRYPTION_REQ; // command number
 
     // card IDm, from poll
     frameSpace[c++] = idm[0];
@@ -377,8 +388,8 @@ static void BuildFliteRdblk(const uint8_t *idm, uint8_t blocknum, const uint16_t
     frameSpace[c++] = 0x01;
 
     // service code
-    frameSpace[c++] = (SERVICE_FELICA_LITE_READONLY >> 8);
-    frameSpace[c++] = SERVICE_FELICA_LITE_READONLY & 0xFF;
+    frameSpace[c++] = (FELICA_SERVICE_LITE_READONLY >> 8);
+    frameSpace[c++] = FELICA_SERVICE_LITE_READONLY & 0xFF;
 
     // number of blocks
     frameSpace[c++] = blocknum;
@@ -402,7 +413,7 @@ static void BuildFliteRdblk(const uint8_t *idm, uint8_t blocknum, const uint16_t
     AddCrc(frameSpace + 2, c - 2);
 }
 
-static void TransmitFor18092_AsReader(const uint8_t *frame, uint16_t len, const uint32_t *NYI_timing_NYI, uint8_t power, uint8_t highspeed) {
+void TransmitFor18092_AsReaderEx(const uint8_t *frame, uint16_t len, const uint32_t *NYI_timing_NYI, uint8_t power, uint8_t highspeed, bool reader2tag) {
 
     if (NYI_timing_NYI != NULL) {
         DbpString("Error: TransmitFor18092_AsReader does not check or set parameter NYI_timing_NYI");
@@ -432,8 +443,8 @@ static void TransmitFor18092_AsReader(const uint8_t *frame, uint16_t len, const 
     uint16_t c = 0;
     while (c < 6) {
         // keep tx buffer in a defined state anyway.
-        if (AT91C_BASE_SSC->SSC_SR & (AT91C_SSC_TXRDY)) {
-            AT91C_BASE_SSC->SSC_THR = 0x00;
+        if (FPGA_SSC_TX_Ready()) {
+            FPGA_SSC_TX_Value(0x00);
             c++;
         }
     }
@@ -442,30 +453,37 @@ static void TransmitFor18092_AsReader(const uint8_t *frame, uint16_t len, const 
 
     while (c < len) {
         // Put byte into tx holding register as soon as it is ready
-        if (AT91C_BASE_SSC->SSC_SR & (AT91C_SSC_TXRDY)) {
-            AT91C_BASE_SSC->SSC_THR = frame[c++];
+        if (FPGA_SSC_TX_Ready()) {
+            FPGA_SSC_TX_Value(frame[c++]);
         }
     }
 
     /**/
-    while (!(AT91C_BASE_SSC->SSC_SR & (AT91C_SSC_TXRDY))) {};
-    AT91C_BASE_SSC->SSC_THR = 0x00; //minimum delay
+    while (!FPGA_SSC_TX_Ready()) {};
+    FPGA_SSC_TX_Value(0x00); //minimum delay
 
-    while (!(AT91C_BASE_SSC->SSC_SR & (AT91C_SSC_TXRDY))) {};
-    AT91C_BASE_SSC->SSC_THR = 0x00; //spin
+    while (!FPGA_SSC_TX_Ready()) {};
+    FPGA_SSC_TX_Value(0x00); //spin
     /**/
+
+    const uint32_t frame_start = felica_lasttime_prox2air_start + (FELICA_PREAMBLE_BYTES * FELICA_BITS_PER_BYTE);
+    const uint32_t frame_end = frame_start + (len * FELICA_BITS_PER_BYTE);
 
     // log
     LogTrace(
         frame,
         len,
-        (felica_lasttime_prox2air_start << 4) + DELAY_ARM2AIR_AS_READER,
-        ((felica_lasttime_prox2air_start + felica_lasttime_prox2air_start) << 4) + DELAY_ARM2AIR_AS_READER,
+        felica_timer_to_carrier_periods(frame_start, highspeed) + DELAY_ARM2AIR_AS_READER,
+        felica_timer_to_carrier_periods(frame_end, highspeed) + DELAY_ARM2AIR_AS_READER,
         NULL,
-        true
+        reader2tag
     );
 
     felica_nexttransfertime = MAX(felica_nexttransfertime, felica_lasttime_prox2air_start + FELICA_REQUEST_GUARD_TIME);
+}
+
+void TransmitFor18092_AsReader(const uint8_t *frame, uint16_t len, const uint32_t *NYI_timing_NYI, uint8_t power, uint8_t highspeed) {
+    TransmitFor18092_AsReaderEx(frame, len, NYI_timing_NYI, power, highspeed, true);
 }
 
 // Wait for tag reply
@@ -476,15 +494,21 @@ bool WaitForFelicaReply(uint16_t maxbytes) {
 //    if (g_dbglevel >= DBG_DEBUG) { Dbprintf("WaitForFelicaReply Start"); }
 
     uint32_t c = 0;
+    uint32_t rx_bytes = 0;
     uint16_t crc_fail_normal = 0;
     uint16_t crc_fail_inverted = 0;
 
+    // raw demodulator output, only kept when the user asks for extended debug.
+    uint8_t rawcap[FELICA_RAW_CAPTURE_BYTES];
+    uint16_t rawcnt = 0;
+
     // power, no modulation
-    FpgaWriteConfWord(FPGA_MAJOR_MODE_HF_ISO18092 | FPGA_HF_ISO18092_FLAG_READER | FPGA_HF_ISO18092_FLAG_NOMOD);
+    FpgaWriteConfWord(FPGA_MAJOR_MODE_HF_ISO18092 | FPGA_HF_ISO18092_FLAG_READER | FPGA_HF_ISO18092_FLAG_NOMOD
+                      | (felica_probe_mode ? FPGA_HF_ISO18092_FLAG_PROBE : 0));
     FelicaFrameReset(&FelicaFrame);
 
     // clear RXRDY:
-    uint8_t b = (uint8_t)AT91C_BASE_SSC->SSC_RHR;
+    uint8_t b = (uint8_t)FPGA_SSC_RX_Value();
     (void)b;
 
     uint32_t timeout = iso18092_get_timeout();
@@ -493,11 +517,16 @@ bool WaitForFelicaReply(uint16_t maxbytes) {
 
         WDT_HIT();
 
-        if (AT91C_BASE_SSC->SSC_SR & AT91C_SSC_RXRDY) {
+        if (FPGA_SSC_RX_Ready()) {
 
-            b = (uint8_t)(AT91C_BASE_SSC->SSC_RHR);
+            b = (uint8_t)(FPGA_SSC_RX_Value());
+            rx_bytes++;
 
-            Process18092Byte(&FelicaFrame, b);
+            if (g_dbglevel >= DBG_EXTENDED && rawcnt < sizeof(rawcap)) {
+                rawcap[rawcnt++] = b;
+            }
+
+            Process18092Byte(&FelicaFrame, b, felica_get_rx_byte_start_time());
             felica_frame_t *received = NULL;
 
             if (FelicaFrame.state == STATE_FULL) {
@@ -528,26 +557,38 @@ bool WaitForFelicaReply(uint16_t maxbytes) {
 
                 felica_nexttransfertime = MAX(
                                               felica_nexttransfertime,
-                                              (GetCountSspClk() & 0xfffffff8) - (DELAY_AIR2ARM_AS_READER + DELAY_ARM2AIR_AS_READER) / 16 + FELICA_FRAME_DELAY_TIME);
+                                              received->endTime - FELICA_212K_CARRIER_TO_TIMER_TICKS(DELAY_AIR2ARM_AS_READER + DELAY_ARM2AIR_AS_READER) + FELICA_FRAME_DELAY_TIME);
 
                 LogTrace(
                     received->framebytes,
                     received->len,
-                    ((GetCountSspClk() & 0xfffffff8) << 4) - DELAY_AIR2ARM_AS_READER - timeout,
-                    ((GetCountSspClk() & 0xfffffff8) << 4) - DELAY_AIR2ARM_AS_READER,
+                    felica_timer_to_carrier_periods(received->startTime, false) - DELAY_AIR2ARM_AS_READER,
+                    felica_timer_to_carrier_periods(received->endTime, false) - DELAY_AIR2ARM_AS_READER,
                     NULL,
                     false
                 );
                 return true;
 
             } else if (
-                c++ > timeout
-                && (FelicaFrame.state == STATE_UNSYNCD || FelicaFrame.state == STATE_TRYING_SYNC)
+                (c++ > timeout
+                 && (FelicaFrame.state == STATE_UNSYNCD || FelicaFrame.state == STATE_TRYING_SYNC))
+                // A frame that never completes (bogus length byte, demodulator stuck
+                // mid-frame) leaves the states above, so it would never hit the check
+                // above. Bound the total wait as well.
+                || (rx_bytes > timeout + FELICA_MAX_RF_FRAME_SIZE)
             ) {
 
 //                if (g_dbglevel >= DBG_DEBUG) Dbprintf("Error: Timeout! STATE_UNSYNCD");
                 if (g_dbglevel >= DBG_DEBUG && (crc_fail_normal || crc_fail_inverted)) {
                     Dbprintf("FeliCa RX timeout, CRC fails normal=%u inverted=%u", crc_fail_normal, crc_fail_inverted);
+                }
+
+                if (g_dbglevel >= DBG_EXTENDED) {
+                    Dbprintf("FeliCa RX timeout, state %u, %u bytes from the front end. Below is %s:",
+                             FelicaFrame.state, rx_bytes,
+                             felica_probe_mode ? "envelope peak-to-peak per 8 bit periods"
+                             : "raw demodulator output");
+                    Dbhexdump(rawcnt, rawcap, 0);
                 }
 
                 return false;
@@ -558,32 +599,40 @@ bool WaitForFelicaReply(uint16_t maxbytes) {
 
 // Set up FeliCa communication (similar to iso14443a_setup)
 // field is setup for "Sending as Reader"
-static void iso18092_setup(uint8_t fpga_minor_mode) {
+bool iso18092_setup_ex(uint8_t fpga_minor_mode, uint32_t preserve_low_bytes) {
 
     LEDsoff();
-#if defined XC3
+#if defined XC3 || defined PM5
     FpgaDownloadAndGo(FPGA_BITSTREAM_HF);
 #else
     FpgaDownloadAndGo(FPGA_BITSTREAM_HF_FELICA);
 #endif
     // allocate command receive buffer
     BigBuf_free();
-    FelicaFrameinit(&FelicaFrame, BigBuf_calloc(FELICA_MAX_RF_FRAME_SIZE));
+    if (preserve_low_bytes) {
+        set_tracelen(preserve_low_bytes);
+    }
 
-    felica_nexttransfertime = 2 * DELAY_ARM2AIR_AS_READER;  // 418
+    uint8_t *rx = BigBuf_calloc(FELICA_MAX_RF_FRAME_SIZE);
+    if (rx == NULL) {
+        return false;
+    }
+    FelicaFrameinit(&FelicaFrame, rx);
+
+    felica_nexttransfertime = 2 * FELICA_212K_CARRIER_TO_TIMER_TICKS(DELAY_ARM2AIR_AS_READER);
     // iso18092_set_timeout(2120); // 106 * 20ms  maximum start-up time of card
     iso18092_set_timeout(1060); // 106 * 10ms  maximum start-up time of card
 
     init_table(CRC_FELICA);
 
     // connect Demodulated Signal to ADC:
-    SetAdcMuxFor(GPIO_MUXSEL_HIPKD);
+    SetAdcMuxFor(ADC_MUXSEL_HIPKD);
 
     // Set up the synchronous serial port
     FpgaSetupSsc(FPGA_MAJOR_MODE_HF_ISO18092);
 
-    // LSB transfer.  Remember to set it back to MSB with
-    AT91C_BASE_SSC->SSC_RFMR = SSC_FRAME_MODE_BITS_IN_WORD(8) | SSC_FRAME_MODE_WORDS_PER_TRANSFER(0);
+    // RX LSB transfer. TX MSB transfer, Remember to set it(RX) back to MSB with
+    FpgaUpdateFrameMode(8, false, true);
 
     // Signal field is on with the appropriate LED
     FpgaWriteConfWord(FPGA_MAJOR_MODE_HF_ISO18092 | fpga_minor_mode);
@@ -591,20 +640,28 @@ static void iso18092_setup(uint8_t fpga_minor_mode) {
     //20.4 ms generate field,  start sending polling command afterwars.
     SpinDelay(100);
 
+    if (g_dbglevel >= DBG_EXTENDED) {
+        Dbprintf("FeliCa field: HF antenna %u mV", AdcRssiAvgToMilliVolt(ADC_RSSI_CH_HF));
+    }
+
     // Start the timer
     StartCountSspClk();
 
     LED_D_ON();
     felica_field_active = true;
+    return true;
 }
 
-static void felica_reset_frame_mode(void) {
+void iso18092_setup(uint8_t fpga_minor_mode) {
+    (void)iso18092_setup_ex(fpga_minor_mode, 0);
+}
+
+void felica_reset_frame_mode(void) {
     switch_off();
     felica_field_active = false;
-    //Resetting Frame mode (First set in fpgaloader.c)
-    AT91C_BASE_SSC->SSC_RFMR = SSC_FRAME_MODE_BITS_IN_WORD(8) | AT91C_SSC_MSBF | SSC_FRAME_MODE_WORDS_PER_TRANSFER(0);
+    // Resetting Frame mode (First set in FpgaSetupSsc() function)
+    FpgaUpdateFrameMode(8, true, true);
 }
-
 
 //-----------------------------------------------------------------------------
 // RAW FeliCa commands. Send out commands and store answers.
@@ -635,8 +692,15 @@ void felica_sendraw(const PacketCommandNG *c) {
 
     bool do_connect = ((param & FELICA_CONNECT) == FELICA_CONNECT);
     bool no_disconnect = ((param & FELICA_NO_DISCONNECT) == FELICA_NO_DISCONNECT);
+    bool replied = false;
 
-    if (do_connect) {
+    // Signal probe. The FPGA hands us envelope peak-to-peak per 8 bit periods
+    // instead of demodulated bits, so nothing will decode while this is on.
+    // It is how you tell "tag out of range" apart from "demodulator not
+    // locking", which are otherwise identical from up here.
+    felica_probe_mode = ((param & FELICA_PROBE) == FELICA_PROBE);
+
+    if ((param & FELICA_CLEARTRACE) == FELICA_CLEARTRACE) {
         clear_trace();
     }
 
@@ -644,7 +708,7 @@ void felica_sendraw(const PacketCommandNG *c) {
 
     // Preserve compatibility with existing commands that do not send CONNECT:
     // set up reader path when starting from field-off state.
-    if (do_connect || !felica_field_active) {
+    if (do_connect || felica_field_is_active() == false) {
         iso18092_setup(FPGA_HF_ISO18092_FLAG_READER | FPGA_HF_ISO18092_FLAG_NOMOD);
     }
 
@@ -657,6 +721,8 @@ void felica_sendraw(const PacketCommandNG *c) {
 
         int select_status = PM3_SUCCESS;
         switch (select_result) {
+            case 0:
+                break;
             case 1:
                 select_status = PM3_ETIMEOUT;
                 break;
@@ -666,11 +732,17 @@ void felica_sendraw(const PacketCommandNG *c) {
             case 3:
                 select_status = PM3_ECRC;
                 break;
+            case 4:
+                // polling response too short to hold IDm + PMm, card is all zeroes
+                select_status = PM3_ELENGTH;
+                break;
             default:
+                select_status = PM3_ESOFT;
                 break;
         }
 
         reply_ng(CMD_HF_FELICA_COMMAND, select_status, (uint8_t *)&card, sizeof(felica_card_select_t));
+        replied = true;
         if (select_status != PM3_SUCCESS) {
             felica_reset_frame_mode();
             return;
@@ -681,6 +753,7 @@ void felica_sendraw(const PacketCommandNG *c) {
         if (len > FELICA_MAX_DATA_SIZE) {
             Dbprintf("FeliCa raw payload too long: %u (max %u)", len, FELICA_MAX_DATA_SIZE);
             reply_ng(CMD_HF_FELICA_COMMAND, PM3_ELENGTH, NULL, 0);
+            replied = true;
             if (!no_disconnect) {
                 felica_reset_frame_mode();
             }
@@ -727,6 +800,13 @@ void felica_sendraw(const PacketCommandNG *c) {
         int status = got_frame ? PM3_SUCCESS : PM3_ERFTRANS;
         uint16_t frame_len = got_frame ? FelicaFrame.len : 0;
         reply_ng(CMD_HF_FELICA_COMMAND, status, got_frame ? FelicaFrame.framebytes : NULL, frame_len);
+        replied = true;
+    }
+
+    if (replied == false) {
+        // Nothing above answered the client. Say so instead of letting it block
+        // until its own timeout expires.
+        reply_ng(CMD_HF_FELICA_COMMAND, PM3_EINVARG, NULL, 0);
     }
 
     if (no_disconnect) {
@@ -734,6 +814,7 @@ void felica_sendraw(const PacketCommandNG *c) {
     }
 
     felica_reset_frame_mode();
+    felica_probe_mode = false;
     return;
 }
 
@@ -746,9 +827,9 @@ void felica_sniff(uint32_t samplesToSkip, uint32_t triggersToSkip) {
     LED_D_ON();
 
     int retval = PM3_SUCCESS;
-    int remFrames = (samplesToSkip) ? samplesToSkip : 0;
+    // 0 == no limit, keep sniffing until the user aborts
+    int remFrames = (samplesToSkip) ? (int)samplesToSkip : -1;
     int trigger_cnt = 0;
-    uint32_t timeout = iso18092_get_timeout();
     bool isReaderFrame;
 
     uint8_t flip = 0;
@@ -778,41 +859,49 @@ void felica_sniff(uint32_t samplesToSkip, uint32_t triggersToSkip) {
         }
         ++checker;
 
-        if (AT91C_BASE_SSC->SSC_SR & AT91C_SSC_RXRDY) {
+        if (FPGA_SSC_RX_Ready()) {
 
-            uint8_t dist = (uint8_t)(AT91C_BASE_SSC->SSC_RHR);
-            Process18092Byte(&FelicaFrame, dist);
+            uint8_t dist = (uint8_t)FPGA_SSC_RX_Value();
+            Process18092Byte(&FelicaFrame, dist, felica_get_rx_byte_start_time());
 
             if ((dist >= 178) && (++trigger_cnt > triggersToSkip)) {
                 Dbprintf("triggers To skip kicked %d", dist);
                 break;
             }
             if (FelicaFrame.state == STATE_FULL) {
+
+                // A frame that failed CRC is demodulator noise, not traffic.
+                // Logging it only pollutes the trace and eats the frame budget.
+                if (FelicaFrame.crc_ok == false) {
+                    FelicaFrameReset(&FelicaFrame);
+                    continue;
+                }
+
                 if ((FelicaFrame.framebytes[3] % 2) == 0) {
                     isReaderFrame = true; // All Reader Frames are even and all Tag frames are odd
                 } else {
                     isReaderFrame = false;
                 }
-                remFrames--;
-                if (remFrames <= 0) {
-                    Dbprintf("Stop Sniffing - samples To skip reached!");
-                    break;
-                }
+
+                // log first, then decide whether we are done. The old order threw
+                // away the very frame that reached the limit.
                 LogTrace(FelicaFrame.framebytes,
                          FelicaFrame.len,
-                         ((GetCountSspClk() & 0xfffffff8) << 4) - DELAY_AIR2ARM_AS_READER - timeout,
-                         ((GetCountSspClk() & 0xfffffff8) << 4) - DELAY_AIR2ARM_AS_READER,
+                         felica_timer_to_carrier_periods(FelicaFrame.startTime, false) - DELAY_AIR2ARM_AS_READER,
+                         felica_timer_to_carrier_periods(FelicaFrame.endTime, false) - DELAY_AIR2ARM_AS_READER,
                          NULL,
                          isReaderFrame
                         );
                 FelicaFrameReset(&FelicaFrame);
+
+                if (remFrames > 0 && --remFrames == 0) {
+                    Dbprintf("Stop Sniffing - samples To skip reached!");
+                    break;
+                }
             }
         }
     }
-    switch_off();
-    felica_field_active = false;
-    //reset framing
-    AT91C_BASE_SSC->SSC_RFMR = SSC_FRAME_MODE_BITS_IN_WORD(8) | AT91C_SSC_MSBF | SSC_FRAME_MODE_WORDS_PER_TRANSFER(0);
+    felica_reset_frame_mode();
 
     Dbprintf("Felica sniffing done, tracelen: %i", BigBuf_get_traceLen());
     reply_ng(CMD_HF_FELICA_SNIFF, retval, NULL, 0);
@@ -827,9 +916,9 @@ void felica_sniff(uint32_t samplesToSkip, uint32_t triggersToSkip) {
 void felica_sim_lite(const uint8_t *uid) {
 
     // prepare our 3 responses...
-    uint8_t resp_poll0[R_POLL0_LEN] = { 0xb2, 0x4d, 0x12, FELICA_POLL_ACK, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xf1, 0x00, 0x00, 0x00, 0x01, 0x43, 0x00, 0xb3, 0x7f};
-    uint8_t resp_poll1[R_POLL1_LEN] = { 0xb2, 0x4d, 0x14, FELICA_POLL_ACK, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xf1, 0x00, 0x00, 0x00, 0x01, 0x43, 0x00, 0x88, 0xb4, 0xb3, 0x7f};
-    uint8_t resp_readblk[R_READBLK_LEN] = { 0xb2, 0x4d, 0x1d, FELICA_RDBLK_ACK, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x10, 0x04, 0x01, 0x00, 0x0d, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x23, 0xcb, 0x6e};
+    uint8_t resp_poll0[R_POLL0_LEN] = { 0xb2, 0x4d, 0x12, FELICA_POLLING_RES, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xf1, 0x00, 0x00, 0x00, 0x01, 0x43, 0x00, 0xb3, 0x7f};
+    uint8_t resp_poll1[R_POLL1_LEN] = { 0xb2, 0x4d, 0x14, FELICA_POLLING_RES, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xf1, 0x00, 0x00, 0x00, 0x01, 0x43, 0x00, 0x88, 0xb4, 0xb3, 0x7f};
+    uint8_t resp_readblk[R_READBLK_LEN] = { 0xb2, 0x4d, 0x1d, FELICA_READ_WITHOUT_ENCRYPTION_RES, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x10, 0x04, 0x01, 0x00, 0x0d, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x23, 0xcb, 0x6e};
 
     // NFC tag 3/ ISo technically. Many overlapping standards
     DbpString("Felica Lite-S simulation start");
@@ -889,11 +978,11 @@ void felica_sim_lite(const uint8_t *uid) {
 
         if (listenmode) {
             // waiting for request...
-            if (AT91C_BASE_SSC->SSC_SR & AT91C_SSC_RXRDY) {
+            if (FPGA_SSC_RX_Ready()) {
 
-                uint8_t dist = (uint8_t)(AT91C_BASE_SSC->SSC_RHR);
+                uint8_t dist = (uint8_t)(FPGA_SSC_RX_Value());
                 // frtm = GetCountSspClk();
-                Process18092Byte(&FelicaFrame, dist);
+                Process18092Byte(&FelicaFrame, dist, felica_get_rx_byte_start_time());
 
                 if (FelicaFrame.state == STATE_FULL) {
 
@@ -918,7 +1007,7 @@ void felica_sim_lite(const uint8_t *uid) {
                                 timeslot = 0;
                             }
                             // first time slot (#0) starts after 512 * 64 / fc, slot length equals 256 * 64 / fc
-                            felica_nexttransfertime = GetCountSspClk() - (DELAY_AIR2ARM_AS_READER + DELAY_ARM2AIR_AS_READER) / 16 + (512 + timeslot * 256) * 64 / 16 + 1;
+                            felica_nexttransfertime = GetCountSspClk() - FELICA_212K_CARRIER_TO_TIMER_TICKS(DELAY_AIR2ARM_AS_READER + DELAY_ARM2AIR_AS_READER) + (512 + timeslot * 256) + 1;
                             timeslot++; // we should use a random time slot, but responding in incremental slots should do just fine for now
                         }
 
@@ -956,11 +1045,7 @@ void felica_sim_lite(const uint8_t *uid) {
         }
     }
 
-    switch_off();
-    felica_field_active = false;
-
-    // reset framing
-    AT91C_BASE_SSC->SSC_RFMR = SSC_FRAME_MODE_BITS_IN_WORD(8) | AT91C_SSC_MSBF | SSC_FRAME_MODE_WORDS_PER_TRANSFER(0);
+    felica_reset_frame_mode();
 
     Dbprintf("FeliCa Lite-S emulator stopped. Trace length: %d ", BigBuf_get_traceLen());
     reply_ng(CMD_HF_FELICALITE_SIMULATE, retval, NULL, 0);
@@ -970,7 +1055,7 @@ void felica_sim_lite(const uint8_t *uid) {
 
 void felica_dump_lite_s(void) {
     uint8_t ndef[8];
-    uint8_t poll[10] = { 0xb2, 0x4d, 0x06, FELICA_POLL_REQ, 0xff, 0xff, 0x00, 0x00, 0x09, 0x21};
+    uint8_t poll[10] = { 0xb2, 0x4d, 0x06, FELICA_POLLING_REQ, 0xff, 0xff, 0x00, 0x00, 0x09, 0x21};
     uint16_t liteblks[28] = {0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x80, 0x81, 0x82, 0x83, 0x84, 0x85, 0x86, 0x87, 0x88, 0x90, 0x91, 0x92, 0xa0};
 
     // setup device.
@@ -988,7 +1073,7 @@ void felica_dump_lite_s(void) {
         //TransmitFor18092_AsReader(poll, 10, GetCountSspClk()+512, 1, 0);
         TransmitFor18092_AsReader(poll, 10, NULL, 1, 0);
 
-        if (WaitForFelicaReply(512) && FelicaFrame.framebytes[3] == FELICA_POLL_ACK) {
+        if (WaitForFelicaReply(512) && FelicaFrame.framebytes[3] == FELICA_POLLING_RES) {
             // copy 8bytes to ndef.
             memcpy(ndef, FelicaFrame.framebytes + 4, 8);
             // for (c=0; c < 8; c++)
@@ -1002,7 +1087,7 @@ void felica_dump_lite_s(void) {
 
                 TransmitFor18092_AsReader(frameSpace, frameSpace[2] + 4, NULL, 1, 0);
                 // read block
-                if (WaitForFelicaReply(1024) && FelicaFrame.framebytes[3] == FELICA_RDBLK_ACK) {
+                if (WaitForFelicaReply(1024) && FelicaFrame.framebytes[3] == FELICA_READ_WITHOUT_ENCRYPTION_RES) {
 
                     dest[cnt++] = liteblks[blknum];
 
@@ -1035,11 +1120,7 @@ void felica_dump_lite_s(void) {
             break;
         }
     }
-    switch_off();
-    felica_field_active = false;
-
-    // Resetting Frame mode (First set in fpgaloader.c)
-    AT91C_BASE_SSC->SSC_RFMR = SSC_FRAME_MODE_BITS_IN_WORD(8) | AT91C_SSC_MSBF | SSC_FRAME_MODE_WORDS_PER_TRANSFER(0);
+    felica_reset_frame_mode();
 
     // setting tracelen - important!  it was set by buffer overflow before
     // iceman:  is this still needed?!?

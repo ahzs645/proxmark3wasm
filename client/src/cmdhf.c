@@ -21,17 +21,21 @@
 #include "cmdparser.h"      // command_t
 #include "cliparser.h"      // parse
 #include "comms.h"          // clearCommandBuffer
+#include "util.h"           // set_rgb
 #include "lfdemod.h"        // computeSignalProperties
 #include "cmdhf14a.h"       // ISO14443-A
 #include "cmdhf14b.h"       // ISO14443-B
 #include "cmdhf15.h"        // ISO15693
 #include "cmdhfaliro.h"     // ALIRO digital keys
+#include "cmdhfcalypso.h"   // Calypso transport cards
 #include "cmdhfcipurse.h"   // CIPURSE transport cards
 #include "cmdhfcryptorf.h"  // CryptoRF
 #include "cmdhfepa.h"       // German Identification Card
 #include "cmdhfemrtd.h"     // eMRTD
 #include "cmdhffelica.h"    // ISO18092 / FeliCa
 #include "cmdhffido.h"      // FIDO authenticators
+#include "cmdhffmcos.h"     // FMCOS CPU cards
+#include "cmdhfsecc.h"      // iClass SE Config Card
 #include "cmdhffudan.h"     // Fudan cards
 #include "cmdhfgallagher.h" // Gallagher DESFire cards
 #include "cmdhfgst.h"       // Google Smart Tap
@@ -42,8 +46,8 @@
 #include "cmdhflegic.h"     // LEGIC
 #include "cmdhflto.h"       // LTO-CM
 #include "cmdhfmf.h"        // CLASSIC
-#include "cmdhfmfu.h"       // ULTRALIGHT/NTAG etc
 #include "cmdhfmfp.h"       // Mifare Plus
+#include "cmdhfmfu.h"       // ULTRALIGHT/NTAG etc
 #include "cmdhfmfdes.h"     // DESFIRE
 #include "cmdhfntag424.h"   // NTAG 424 DNA
 #include "cmdhfsaflok.h"    // Saflok
@@ -219,6 +223,10 @@ int CmdHFSearch(const char *Cmd) {
             PrintAndLogEx(SUCCESS, "\nValid " _GREEN_("ISO 18092 / FeliCa tag") " found\n");
             success[FELICA] = true;
             res = PM3_SUCCESS;
+        } else if (info_felica_seac() == PM3_SUCCESS) {
+            PrintAndLogEx(SUCCESS, "Valid " _GREEN_("FeliCa SEAC tag") " found\n");
+            success[FELICA] = true;
+            res = PM3_SUCCESS;
         }
     }
 
@@ -291,6 +299,22 @@ int CmdHFSearch(const char *Cmd) {
     return res;
 }
 
+// Mirror an antenna tuning level on the PM5 antenna RGB LED. `volt` is scaled
+// relative to the running peak (`v_max`), so the colour tracks the on-screen bar:
+// blue = low, green = mid, red = high.
+static void tune_rgb_update(uint32_t volt, uint32_t v_max) {
+    uint32_t t = (v_max > 0) ? (volt * 510 / v_max) : 0;
+    if (t > 510) {
+        t = 510;
+    }
+    if (t < 255) {          // blue -> green
+        set_rgb(0, (uint8_t)t, (uint8_t)(255 - t));
+    } else {                // green -> red
+        t -= 255;
+        set_rgb((uint8_t)t, (uint8_t)(255 - t), 0);
+    }
+}
+
 int CmdHFTune(const char *Cmd) {
 
     CLIParserContext *ctx;
@@ -308,6 +332,7 @@ int CmdHFTune(const char *Cmd) {
         arg_lit0(NULL, "mix", "mixed style"),
         arg_lit0(NULL, "value", "values style"),
         arg_lit0("v", "verbose", "verbose output"),
+        arg_lit0(NULL, "rgb", "(PM5) mirror the tuning level on the antenna RGB LED"),
         arg_param_end
     };
     CLIExecWithReturn(ctx, Cmd, argtable, true);
@@ -316,7 +341,13 @@ int CmdHFTune(const char *Cmd) {
     bool is_mix = arg_get_lit(ctx, 3);
     bool is_value = arg_get_lit(ctx, 4);
     bool verbose = arg_get_lit(ctx, 5);
+    bool use_rgb = arg_get_lit(ctx, 6);
     CLIParserFree(ctx);
+
+    if (use_rgb && (IfPm5() == false)) {
+        PrintAndLogEx(WARNING, "`--rgb` is only supported on Proxmark5; ignoring");
+        use_rgb = false;
+    }
 
     if ((is_bar + is_mix + is_value) > 1) {
         PrintAndLogEx(ERR, "Select only one output style");
@@ -366,12 +397,18 @@ int CmdHFTune(const char *Cmd) {
             break;
         }
 
-        if ((resp.status == PM3_EOPABORTED) || (resp.length != sizeof(uint16_t))) {
+        if ((resp.status == PM3_EOPABORTED) || (resp.length != sizeof(uint16_t) && resp.length != sizeof(uint32_t))) {
             PrintAndLogEx(NORMAL, "");
             break;
         }
 
-        uint16_t volt = resp.data.asDwords[0] & 0xFFFF;
+        uint32_t volt;
+        if (resp.length == sizeof(uint16_t)) {
+            volt = resp.data.asDwords[0] & 0xFFFF;
+        } else {
+            volt = resp.data.asDwords[0]; // U32. It can exceed 65.535V.
+        }
+
         if (first) {
             v_max = volt;
             v_min = volt;
@@ -384,6 +421,12 @@ int CmdHFTune(const char *Cmd) {
             v_count++;
         }
         print_progress(volt, v_max, style);
+        if (use_rgb) {
+            tune_rgb_update(volt, v_max);
+        }
+    }
+    if (use_rgb) {
+        set_rgb(0, 0, 0); // turn the LED off on exit
     }
     mode[0] = 3;
 
@@ -392,7 +435,7 @@ int CmdHFTune(const char *Cmd) {
         PrintAndLogEx(WARNING, "timeout while waiting for Proxmark HF shutdown, aborting");
         return PM3_ETIMEOUT;
     }
-    PrintAndLogEx(NORMAL, "\x1b%c[2K\r", 30);
+    PrintAndLogEx(NORMAL, _CLR_LINE_ "\r");
 
     if (verbose) {
         PrintAndLogEx(INFO, "Min....... %u mV", v_min);
@@ -579,15 +622,18 @@ static command_t CommandTable[] = {
     {"14b",         CmdHF14B,         AlwaysAvailable, "{ ISO14443B RFIDs...                  }"},
     {"15",          CmdHF15,          AlwaysAvailable, "{ ISO15693 RFIDs...                   }"},
     {"aliro",       CmdHFAliro,       AlwaysAvailable, "{ ALIRO digital access credentials... }"},
+    {"calypso",     CmdHFCalypso,     AlwaysAvailable, "{ Calypso transport cards...          }"},
 //    {"cryptorf",    CmdHFCryptoRF,    AlwaysAvailable, "{ CryptoRF RFIDs...                   }"},
     {"cipurse",     CmdHFCipurse,     AlwaysAvailable, "{ Cipurse transport Cards...          }"},
     {"epa",         CmdHFEPA,         AlwaysAvailable, "{ German Identification Card...       }"},
     {"emrtd",       CmdHFeMRTD,       AlwaysAvailable, "{ Machine Readable Travel Document... }"},
     {"felica",      CmdHFFelica,      AlwaysAvailable, "{ ISO18092 / FeliCa RFIDs...          }"},
     {"fido",        CmdHFFido,        AlwaysAvailable, "{ FIDO and FIDO2 authenticators...    }"},
+    {"fmcos",       CmdHFFmcos,       AlwaysAvailable, "{ FMCOS CPU cards...                  }"},
     {"fudan",       CmdHFFudan,       AlwaysAvailable, "{ Fudan RFIDs...                      }"},
     {"gallagher",   CmdHFGallagher,   AlwaysAvailable, "{ Gallagher DESFire RFIDs...          }"},
     {"gst",         CmdHFGST,         AlwaysAvailable, "{ Google Smart Tap passes...          }"},
+    {"secc",        CmdHFHIDConfig,   AlwaysAvailable, "{ iClass SE Config Card Emulator...   }"},
     {"iclass",      CmdHFiClass,      AlwaysAvailable, "{ ICLASS RFIDs...                     }"},
     {"ict",         CmdHFICT,         AlwaysAvailable, "{ ICT MFC/DESfire RFIDs...            }"},
     {"jooki",       CmdHF_Jooki,      AlwaysAvailable, "{ Jooki RFIDs...                      }"},

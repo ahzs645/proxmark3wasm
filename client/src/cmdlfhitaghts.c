@@ -199,7 +199,6 @@ static int process_hitags_common_args(CLIParserContext *ctx, lf_hitag_data_t *co
 
     int res = CLIParamHexToBuf(arg_get_str(ctx, 2), nrar, HITAG_NRAR_SIZE, &nrar_len);
     if (res != 0) {
-        CLIParserFree(ctx);
         return PM3_EINVARG;
     }
 
@@ -212,7 +211,6 @@ static int process_hitags_common_args(CLIParserContext *ctx, lf_hitag_data_t *co
 
     res = CLIParamHexToBuf(arg_get_str(ctx, 4), key, HITAG_CRYPTOKEY_SIZE, &key_len);
     if (res != 0) {
-        CLIParserFree(ctx);
         return PM3_EINVARG;
     }
 
@@ -235,13 +233,15 @@ static int process_hitags_common_args(CLIParserContext *ctx, lf_hitag_data_t *co
 
     // complete options
     switch (key_len) {
-        case HITAG_PASSWORD_SIZE:
+        case HITAG_PASSWORD_SIZE: {
             use_82xx = true;
             break;
-        case HITAG_CRYPTOKEY_SIZE:
+        }
+        case HITAG_CRYPTOKEY_SIZE: {
             use_crypto = true;
             break;
-        default:    // key_len == 0
+        }
+        default: {    // key_len == 0
             if (use_82xx) {
                 memcpy(key, "\xBB\xDD\x33\x99", 4);
                 key_len = 4;
@@ -249,6 +249,8 @@ static int process_hitags_common_args(CLIParserContext *ctx, lf_hitag_data_t *co
                 memcpy(key, "ONMIKR", 6);
                 key_len = 6;
             }
+            break;
+        }
     }
 
     // check coherence
@@ -400,7 +402,10 @@ static int CmdLFHitagSRead(const char *Cmd) {
 
     lf_hitag_data_t packet;
 
-    if (process_hitags_common_args(ctx, &packet) < 0) return PM3_EINVARG;
+    if (process_hitags_common_args(ctx, &packet) != PM3_SUCCESS) {
+        CLIParserFree(ctx);
+        return PM3_EINVARG;
+    }
 
     uint32_t page = arg_get_int_def(ctx, 6, 0);
 
@@ -592,7 +597,7 @@ static int CmdLFHitagSDump(const char *Cmd) {
     lf_hitag_data_t packet;
     memset(&packet, 0, sizeof(packet));
 
-    if (process_hitags_common_args(ctx, &packet) < 0) {
+    if (process_hitags_common_args(ctx, &packet) != PM3_SUCCESS) {
         CLIParserFree(ctx);
         return PM3_EINVARG;
     }
@@ -645,7 +650,7 @@ static int CmdLFHitagSDump(const char *Cmd) {
         FillFileNameByUID(fptr, card->pages[HITAGS_UID_PADR], "-dump", HITAGS_PAGE_SIZE);
     }
 
-    pm3_save_dump(filename, (uint8_t *)card->pages, mem_size, jsfHitag);
+    pm3_save_dump(filename, (uint8_t *)card->pages, mem_size, jsfHitagS);
 
     return PM3_SUCCESS;
 }
@@ -683,7 +688,7 @@ static int CmdLFHitagSRestore(const char *Cmd) {
     lf_hitag_data_t packet;
     memset(&packet, 0, sizeof(packet));
 
-    if (process_hitags_common_args(ctx, &packet) < 0) {
+    if (process_hitags_common_args(ctx, &packet) != PM3_SUCCESS) {
         CLIParserFree(ctx);
         return PM3_EINVARG;
     }
@@ -700,7 +705,7 @@ static int CmdLFHitagSRestore(const char *Cmd) {
     // read dump file
     uint32_t *dump = NULL;
     size_t bytes_read = 0;
-    if (pm3_load_dump(filename, (void **)&dump, &bytes_read, jsfHitag) != PM3_SUCCESS) {
+    if (pm3_load_dump(filename, (void **)&dump, &bytes_read, 64 * HITAGS_PAGE_SIZE) != PM3_SUCCESS) {
         return PM3_EFILE;
     }
 
@@ -901,7 +906,11 @@ static int CmdLFHitagSWrite(const char *Cmd) {
 
     lf_hitag_data_t packet;
 
-    if (process_hitags_common_args(ctx, &packet) < 0) return PM3_EINVARG;
+    if (process_hitags_common_args(ctx, &packet) != PM3_SUCCESS) {
+        CLIParserFree(ctx);
+        return PM3_EINVARG;
+    }
+
 
     int page = arg_get_int_def(ctx, 6, 0);
 
@@ -996,7 +1005,11 @@ static int CmdLFHitagSSim(const char *Cmd) {
     CLIParserFree(ctx);
 
     clearCommandBuffer();
-    SendCommandMIX(CMD_LF_HITAGS_SIMULATE, false, threshold, 0, NULL, 0);
+    hitag_sim_t payload = {
+        .tag_mem_supplied = false,
+        .threshold = threshold,
+    };
+    SendCommandNG(CMD_LF_HITAGS_SIMULATE, (uint8_t *)&payload, sizeof(payload));
     return PM3_SUCCESS;
 }
 

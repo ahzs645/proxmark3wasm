@@ -29,15 +29,17 @@
 
 #include "appmain.h"
 #include "BigBuf.h"
-#include "fpgaloader.h"
+#include "fpga_loader.h"
+#include "fpga_apis.h"
 #include "string.h"
 #include "util.h"
 #include "dbprint.h"
 #include "protocols.h"
-#include "ticks.h"
+#include "ticks_apis.h"
 #include "iso15693.h"
 #include "iclass_cmd.h"              // iclass_card_select_t struct
 #include "i2c.h"                     // i2c defines (SIM module access)
+#include "sam_common.h"
 #include "printf.h"
 
 uint8_t get_pagemap(const picopass_hdr_t *hdr) {
@@ -136,11 +138,18 @@ static void CodeIClassTagSOF(void) {
  * @param datain
  */
 // turn off afterwards
-void SimulateIClass(uint32_t arg0, uint32_t arg1, uint32_t arg2, uint8_t *datain) {
-    iclass_simulate(arg0, arg1, arg2, datain, NULL, NULL);
+
+static void reply_iclass_sim(uint16_t num_mac, const uint8_t *macs, uint16_t maclen) {
+    uint8_t respbuf[sizeof(iclass_sim_resp_t) + PM3_CMD_DATA_SIZE] = {0};
+    iclass_sim_resp_t *response = (iclass_sim_resp_t *)respbuf;
+    response->num_mac = num_mac;
+    if (maclen && macs) {
+        memcpy(response->mac, macs, maclen);
+    }
+    reply_ng(CMD_HF_ICLASS_SIMULATE, PM3_SUCCESS, respbuf, sizeof(iclass_sim_resp_t) + maclen);
 }
 
-void iclass_simulate(uint8_t sim_type, uint8_t num_csns, bool send_reply, uint8_t *datain, uint8_t *dataout, uint16_t *dataoutlen) {
+void iclass_simulate(uint8_t sim_type, uint8_t num_csns, bool send_reply, bool trace, uint8_t *datain, uint8_t *dataout, uint16_t *dataoutlen) {
 
     LEDsoff();
 
@@ -148,8 +157,7 @@ void iclass_simulate(uint8_t sim_type, uint8_t num_csns, bool send_reply, uint8_
 
     clear_trace();
 
-    // only logg if we are called from the client.
-    set_tracing(send_reply);
+    set_tracing(trace);
 
     //Use the emulator memory for SIM
     uint8_t *emulator = BigBuf_get_EM_addr();
@@ -186,7 +194,7 @@ void iclass_simulate(uint8_t sim_type, uint8_t num_csns, bool send_reply, uint8_
 
                 // Button pressed
                 if (send_reply)
-                    reply_old(CMD_ACK, CMD_HF_ICLASS_SIMULATE, i, 0, mac_responses, i * EPURSE_MAC_SIZE);
+                    reply_iclass_sim(i, mac_responses, i * EPURSE_MAC_SIZE);
                 goto out;
             }
         }
@@ -194,9 +202,9 @@ void iclass_simulate(uint8_t sim_type, uint8_t num_csns, bool send_reply, uint8_
             *dataoutlen = i * EPURSE_MAC_SIZE;
 
         if (send_reply)
-            reply_old(CMD_ACK, CMD_HF_ICLASS_SIMULATE, i, 0, mac_responses, i * EPURSE_MAC_SIZE);
+            reply_iclass_sim(i, mac_responses, i * EPURSE_MAC_SIZE);
 
-    } else if (sim_type == ICLASS_SIM_MODE_FULL || sim_type == ICLASS_SIM_MODE_FULL_GLITCH || sim_type == ICLASS_SIM_MODE_FULL_GLITCH_KEY) {
+    } else if (sim_type == ICLASS_SIM_MODE_FULL || sim_type == ICLASS_SIM_MODE_FULL_GLITCH || sim_type == ICLASS_SIM_MODE_FULL_GLITCH_KEY || sim_type == ICLASS_SIM_MODE_FULL_LIVE) {
 
         //This is 'full sim' mode, where we use the emulator storage for data.
         //ie:  BigBuf_get_EM_addr should be previously filled with data from the "eload" command
@@ -209,7 +217,7 @@ void iclass_simulate(uint8_t sim_type, uint8_t num_csns, bool send_reply, uint8_
         }
 
         if (send_reply) {
-            reply_mix(CMD_ACK, CMD_HF_ICLASS_SIMULATE, 0, 0, NULL, 0);
+            reply_iclass_sim(0, NULL, 0);
         }
 
     } else if (sim_type == ICLASS_SIM_MODE_READER_ATTACK_KEYROLL) {
@@ -238,7 +246,7 @@ void iclass_simulate(uint8_t sim_type, uint8_t num_csns, bool send_reply, uint8_
                     *dataoutlen = i * EPURSE_MAC_SIZE * 2;
 
                 if (send_reply)
-                    reply_old(CMD_ACK, CMD_HF_ICLASS_SIMULATE, i * 2, 0, mac_responses, i * EPURSE_MAC_SIZE * 2);
+                    reply_iclass_sim(i * 2, mac_responses, i * EPURSE_MAC_SIZE * 2);
 
                 // Button pressed
                 goto out;
@@ -251,7 +259,7 @@ void iclass_simulate(uint8_t sim_type, uint8_t num_csns, bool send_reply, uint8_
                     *dataoutlen = i * EPURSE_MAC_SIZE * 2;
 
                 if (send_reply)
-                    reply_old(CMD_ACK, CMD_HF_ICLASS_SIMULATE, i * 2, 0, mac_responses, i * EPURSE_MAC_SIZE * 2);
+                    reply_iclass_sim(i * 2, mac_responses, i * EPURSE_MAC_SIZE * 2);
 
                 // Button pressed
                 goto out;
@@ -263,7 +271,7 @@ void iclass_simulate(uint8_t sim_type, uint8_t num_csns, bool send_reply, uint8_
 
         // double the amount of collected data.
         if (send_reply)
-            reply_old(CMD_ACK, CMD_HF_ICLASS_SIMULATE, i * 2, 0, mac_responses, i * EPURSE_MAC_SIZE * 2);
+            reply_iclass_sim(i * 2, mac_responses, i * EPURSE_MAC_SIZE * 2);
 
     } else {
         // We may want a mode here where we hardcode the csns to use (from proxclone).
@@ -291,6 +299,19 @@ out:
  * @param breakAfterMacReceived if true, returns after reader MAC has been received.
  */
 int do_iclass_simulation(int simulationMode, uint8_t *reader_mac_buf) {
+
+    // FULL_LIVE = FULL + inline EML_MEMSET handling so the client can push live
+    // emul updates (see hf iclass tagsim). All full sim modes still need USB
+    // polling so commands like hw break or eview can stop the ARM-side loop.
+    const bool handle_live_updates = (simulationMode == ICLASS_SIM_MODE_FULL_LIVE);
+    const bool allow_usb_interrupt =
+        simulationMode == ICLASS_SIM_MODE_FULL ||
+        simulationMode == ICLASS_SIM_MODE_FULL_GLITCH ||
+        simulationMode == ICLASS_SIM_MODE_FULL_GLITCH_KEY ||
+        handle_live_updates;
+    if (simulationMode == ICLASS_SIM_MODE_FULL_LIVE) {
+        simulationMode = ICLASS_SIM_MODE_FULL;
+    }
 
     // free eventually allocated BigBuf memory
     BigBuf_free_keep_EM();
@@ -499,7 +520,35 @@ int do_iclass_simulation(int simulationMode, uint8_t *reader_mac_buf) {
         trace_data_size = 0;
 
         uint32_t reader_eof_time = 0;
-        len = GetIso15693CommandFromReader(receivedCmd, MAX_FRAME_SIZE, &reader_eof_time);
+        len = GetIso15693CommandFromReader(receivedCmd, MAX_FRAME_SIZE, &reader_eof_time, allow_usb_interrupt);
+        if (len == -2) {
+            if (handle_live_updates == false) {
+                exit_loop = true;
+                continue;
+            }
+
+            // USB data arrived while waiting for RF — drain all pending EML_MEMSET
+            // commands inline (without FpgaDownloadAndGo) so live tag updates work.
+            PacketCommandNG rx;
+            while (data_available()) {
+                if (receive_ng(&rx) != PM3_SUCCESS) break;
+                if (rx.cmd == CMD_HF_ICLASS_EML_MEMSET) {
+                    struct p {
+                        uint16_t offset;
+                        uint16_t plen;
+                        uint8_t  data[];
+                    } PACKED;
+                    struct p *payload = (struct p *) rx.data.asBytes;
+                    emlSet(payload->data, payload->offset, payload->plen);
+                } else {
+                    // LIVE mode owns this packet; non-EML traffic (break or stray
+                    // commands) is treated as an abort and is not redispatched.
+                    exit_loop = true;
+                    break;
+                }
+            }
+            continue;
+        }
         if (len < 0) {
             button_pressed = true;
             exit_loop = true;
@@ -512,6 +561,45 @@ int do_iclass_simulation(int simulationMode, uint8_t *reader_mac_buf) {
         block = receivedCmd[1];
 
         if (cmd == ICLASS_CMD_ACTALL && len == 1) {   // 0x0A
+
+            // Check for a live tag-identity reload requested by the client.
+            // The client writes a non-zero byte to emulator offset 32*8 = 256
+            // (one byte past the 32-block tag data) then updates blocks 0, 3, 4, 6-9
+            // in emulator memory.  We pick it up at the start of each anti-collision
+            // cycle so the reader sees the new identity from the very first SELECT.
+            if ((simulationMode == ICLASS_SIM_MODE_FULL ||
+                    simulationMode == ICLASS_SIM_MODE_FULL_GLITCH ||
+                    simulationMode == ICLASS_SIM_MODE_FULL_GLITCH_KEY) &&
+                    emulator[32 * 8] != 0) {
+
+                emulator[32 * 8] = 0;  // consume the flag
+
+                // Reload CSN (block 0) and rebuild anticollision/CSN responses
+                memcpy(csn_data, emulator, 8);
+                rotateCSN(csn_data, anticoll_data);
+                AddCrc(anticoll_data, 8);
+                AddCrc(csn_data, 8);
+
+                CodeIso15693AsTag(anticoll_data, sizeof(anticoll_data));
+                memcpy(resp_anticoll, ts->buf, ts->max);
+                resp_anticoll_len = ts->max;
+
+                CodeIso15693AsTag(csn_data, sizeof(csn_data));
+                memcpy(resp_csn, ts->buf, ts->max);
+                resp_csn_len = ts->max;
+
+                // Reload KD/KC (blocks 3 & 4) and recompute cipher states
+                memcpy(diversified_kd, emulator + (8 * 3), 8);
+                memcpy(diversified_kc, emulator + (8 * 4), 8);
+                cipher_state_KD[0] = opt_doTagMAC_1(card_challenge_data, diversified_kd);
+                cipher_state_KC[0] = opt_doTagMAC_1(card_challenge_data, diversified_kc);
+
+                // Reset per-transaction auth state
+                kc_attempt = 0;
+                using_kc = false;
+                cipher_state = &cipher_state_KD[0];
+            }
+
             // Reader in anti collision phase
             modulated_response = resp_sof;
             modulated_response_size = resp_sof_len;
@@ -884,6 +972,9 @@ int do_iclass_simulation(int simulationMode, uint8_t *reader_mac_buf) {
             goto send;
 
         } else if (cmd == ICLASS_CMD_DETECT) { // 0x0F
+            // if EAS byte in config block,   (normally 0xFF,  but 0x7F)
+            //    MSB = 1  ,  don't answe with CSN
+            //    MSB = 0  == enabled ,  answer with CSN
             // not supported yet, ignore
 //        } else if (cmd == 0x26 && len == 5) {
             // standard ISO15693 INVENTORY command. Ignore.
@@ -1055,7 +1146,13 @@ int do_iclass_simulation_nonsec(void) {
         WDT_HIT();
 
         uint32_t reader_eof_time = 0;
-        len = GetIso15693CommandFromReader(receivedCmd, MAX_FRAME_SIZE, &reader_eof_time);
+        len = GetIso15693CommandFromReader(receivedCmd, MAX_FRAME_SIZE, &reader_eof_time, true);
+        if (len == -2) {
+            // Non-secure simulation has no live reload/update path; any USB
+            // command interrupts the sim and is handled by the main dispatcher.
+            exit_loop = true;
+            continue;
+        }
         if (len < 0) {
             button_pressed = true;
             exit_loop = true;
@@ -1310,7 +1407,7 @@ static bool iclass_send_cmd_with_retries(uint8_t *cmd, size_t cmdsize, uint8_t *
  * @return false = fail
  *         true = Got all.
  */
-static bool select_iclass_tag_ex(picopass_hdr_t *hdr, bool use_credit_key, uint32_t *eof_time, uint8_t *status, bool shallow_mod) {
+static bool select_iclass_tag_ex(picopass_hdr_t *hdr, bool use_credit_key, uint32_t *eof_time, uint8_t *status, bool shallow_mod, uint8_t page) {
 
     static uint8_t act_all[] = { ICLASS_CMD_ACTALL };
     static uint8_t identify[] = { ICLASS_CMD_READ_OR_IDENTIFY, 0x00, 0x73, 0x33 };
@@ -1357,6 +1454,21 @@ static bool select_iclass_tag_ex(picopass_hdr_t *hdr, bool use_credit_key, uint3
 
     // save CSN
     memcpy(hdr->csn, resp, sizeof(hdr->csn));
+
+    // card selected, select page if not page 0
+    if (page != 0) {
+        uint8_t pagesel_resp[10];
+        start_time = *eof_time + DELAY_ICLASS_VICC_TO_VCD_READER;
+        uint8_t pagesel[] = {0x80 | ICLASS_CMD_PAGESEL, page, 0x00, 0x00};
+        AddCrc(pagesel + 1, 1);
+
+        bool pagesel_res = iclass_send_cmd_with_retries(pagesel, sizeof(pagesel), pagesel_resp, sizeof(resp),
+                                                        10, 2, &start_time, ICLASS_READER_TIMEOUT_OTHERS, eof_time, shallow_mod);
+
+        if (pagesel_res == false) {
+            return false;
+        }
+    }
 
     // card selected, now read config (block1) (only 8 bytes no CRC)
     start_time = *eof_time + DELAY_ICLASS_VICC_TO_VCD_READER;
@@ -1432,12 +1544,21 @@ static bool select_iclass_tag_ex(picopass_hdr_t *hdr, bool use_credit_key, uint3
 
 bool select_iclass_tag(picopass_hdr_t *hdr, bool use_credit_key, uint32_t *eof_time, bool shallow_mod) {
     uint8_t result = 0;
-    return select_iclass_tag_ex(hdr, use_credit_key, eof_time, &result, shallow_mod);
+    return select_iclass_tag_ex(hdr, use_credit_key, eof_time, &result, shallow_mod, 0); // page 0 unless specified
+}
+
+
+bool select_iclass_tag_and_page(picopass_hdr_t *hdr, bool use_credit_key, uint32_t *eof_time, bool shallow_mod, uint8_t page) {
+    uint8_t result = 0;
+    return select_iclass_tag_ex(hdr, use_credit_key, eof_time, &result, shallow_mod, page);
 }
 
 // Reader iClass Anticollission
 // turn off afterwards
-void ReaderIClass(uint8_t flags) {
+void ReaderIClass(uint8_t *msg) {
+    iclass_card_select_t *cmd = (iclass_card_select_t *)msg;
+    uint8_t flags = cmd->flags;
+    uint8_t page = cmd->page;
 
     // flag to use credit key
     bool use_credit_key = ((flags & FLAG_ICLASS_READER_CREDITKEY) == FLAG_ICLASS_READER_CREDITKEY);
@@ -1456,7 +1577,7 @@ void ReaderIClass(uint8_t flags) {
     uint32_t eof_time = 0;
     picopass_hdr_t hdr = {0};
 
-    if (select_iclass_tag_ex(&hdr, use_credit_key, &eof_time, &res, shallow_mod) == false) {
+    if (select_iclass_tag_ex(&hdr, use_credit_key, &eof_time, &res, shallow_mod, page) == false) {
         reply_ng(CMD_HF_ICLASS_READER, PM3_ERFTRANS, NULL, 0);
         goto out;
     }
@@ -1486,6 +1607,62 @@ void ReaderIClass(uint8_t flags) {
 
 out:
     switch_off();
+}
+
+// Raw iCLASS reader exchange that leaves the field ON
+// The field is only dropped by CMD_HF_DROPFIELD (or a failed select).
+void iClass_Raw(uint8_t *msg) {
+    uint8_t flags = msg[0];
+    uint16_t rawlen = (uint16_t)msg[1] | ((uint16_t)msg[2] << 8);
+    uint8_t *raw = msg + 3;
+
+    uint32_t start_time = 0, eof_time = 0;
+
+    if (flags & 0x01) {                         // INIT: energize + select
+        Iso15693InitReader();
+        picopass_hdr_t hdr = {0};
+        if (select_iclass_tag(&hdr, false, &eof_time, false) == false) {
+            switch_off();
+            reply_ng(CMD_HF_ICLASS_RAW, PM3_ERFTRANS, NULL, 0);
+            return;
+        }
+        if (rawlen == 0) {                      // scan: return the header, keep field ON
+            switch_clock_to_ticks();
+            reply_ng(CMD_HF_ICLASS_RAW, PM3_SUCCESS, (uint8_t *)&hdr, sizeof(picopass_hdr_t));
+            return;
+        }
+        start_time = eof_time + DELAY_ICLASS_VICC_TO_VCD_READER;
+    } else {
+        switch_clock_to_countsspclk();
+    }
+
+    uint8_t resp[ICLASS_BUFFER_SIZE] = {0};
+    uint16_t resp_len = 0;
+
+    start_time = GetCountSspClk();
+    bool is_update = rawlen > 0 && ((raw[0] & 0x0F) == ICLASS_CMD_UPDATE);
+    uint8_t tries = is_update ? 1 : 3;
+    uint16_t timeout = is_update ? ICLASS_READER_TIMEOUT_UPDATE : ICLASS_READER_TIMEOUT_ACTALL;
+    int res = PM3_ECARDEXCHANGE;
+    while (tries-- > 0) {
+        iclass_send_as_reader(raw, rawlen, &start_time, &eof_time, false);
+        resp_len = 0;
+        res = GetIso15693AnswerFromTag(resp, sizeof(resp), timeout, &eof_time,
+                                       false, true, &resp_len);
+        if (res == PM3_SUCCESS && resp_len > 0) {
+            break;
+        }
+        start_time = eof_time + ((DELAY_ICLASS_VICC_TO_VCD_READER +
+                                  DELAY_ISO15693_VCD_TO_VICC_READER +
+                                  (8 * 8 * 8 * 16)) * 2);
+    }
+    switch_clock_to_ticks();
+    if (res == PM3_SUCCESS && resp_len > 0) {
+        reply_ng(CMD_HF_ICLASS_RAW, PM3_SUCCESS, resp, resp_len);
+    } else {
+        reply_ng(CMD_HF_ICLASS_RAW, PM3_ECARDEXCHANGE, NULL, 0);
+    }
+    // field left ON; the host drops it via CMD_HF_DROPFIELD
 }
 
 bool authenticate_iclass_tag(iclass_auth_req_t *payload, picopass_hdr_t *hdr, uint32_t *start_time, uint32_t *eof_time, uint8_t *mac_out) {
@@ -1551,8 +1728,9 @@ void iClass_Authentication_fast(iclass_chk_t *p) {
     uint8_t resp[ICLASS_BUFFER_SIZE] = {0};
     uint8_t readcheck_cc[] = { 0x80 | ICLASS_CMD_READCHECK, 0x02 };
 
-    if (p->use_credit_key)
+    if (p->use_credit_key) {
         readcheck_cc[0] = 0x10 | ICLASS_CMD_READCHECK;
+    }
 
     // select card / e-purse
     picopass_hdr_t hdr = {0};
@@ -1566,10 +1744,13 @@ void iClass_Authentication_fast(iclass_chk_t *p) {
     Iso15693InitReader();
 
     bool isOK = false;
+    uint8_t i = 0;
+    uint32_t start_time = 0;
+    uint32_t eof_time = 0;
 
-    uint32_t start_time = 0, eof_time = 0;
-    if (select_iclass_tag(&hdr, p->use_credit_key, &eof_time, shallow_mod) == false)
+    if (select_iclass_tag(&hdr, p->use_credit_key, &eof_time, shallow_mod) == false) {
         goto out;
+    }
 
     start_time = eof_time + DELAY_ICLASS_VICC_TO_VCD_READER;
 
@@ -1577,12 +1758,13 @@ void iClass_Authentication_fast(iclass_chk_t *p) {
     uint16_t checked = 0;
 
     // Keychunk loop
-    uint8_t i = 0;
     for (i = 0; i < p->count; i++) {
 
         // Allow button press / usb cmd to interrupt device
         if (checked == 1000) {
-            if (BUTTON_PRESS() || data_available()) goto out;
+            if (BUTTON_PRESS() || data_available()) {
+                goto out;
+            }
             checked = 0;
         }
         ++checked;
@@ -1598,8 +1780,9 @@ void iClass_Authentication_fast(iclass_chk_t *p) {
 
         // expect 4bytes, 3 retries times..
         isOK = iclass_send_cmd_with_retries(check, sizeof(check), resp, sizeof(resp), 4, 2, &start_time, ICLASS_READER_TIMEOUT_OTHERS, &eof_time, shallow_mod);
-        if (isOK)
+        if (isOK) {
             goto out;
+        }
 
         start_time = eof_time + DELAY_ICLASS_VICC_TO_VCD_READER;
         // Auth Sequence MUST begin with reading e-purse. (block2)
@@ -1704,6 +1887,7 @@ void iClass_Dump(uint8_t *msg) {
     iclass_dump_req_t *cmd = (iclass_dump_req_t *)msg;
     iclass_auth_req_t *req = &cmd->req;
     bool shallow_mod = req->shallow_mod;
+    uint8_t page = cmd->page;
 
     uint8_t *dataout = BigBuf_calloc(ICLASS_16KS_SIZE);
     if (dataout == NULL) {
@@ -1718,12 +1902,12 @@ void iClass_Dump(uint8_t *msg) {
 
     Iso15693InitReader();
 
-    // select tag.
+    // select tag and page
     uint32_t eof_time = 0;
     picopass_hdr_t hdr = {0};
     memset(&hdr, 0xff, sizeof(picopass_hdr_t));
 
-    bool res = select_iclass_tag(&hdr, req->use_credit_key, &eof_time, shallow_mod);
+    bool res = select_iclass_tag_and_page(&hdr, req->use_credit_key, &eof_time, shallow_mod, page);
     if (res == false) {
         if (req->send_reply) {
             reply_ng(CMD_HF_ICLASS_DUMP, PM3_ETIMEOUT, NULL, 0);
@@ -2750,9 +2934,6 @@ void iClass_Recover(iclass_recover_req_t *msg) {
     uint32_t start_time = 0;
     uint8_t read_check_cc[] = { 0x10 | ICLASS_CMD_READCHECK, 0x18 }; //block 24 with credit key
     uint8_t read_check_cc2[] = { 0x80 | ICLASS_CMD_READCHECK, 0x02 }; //block 2 -> to check Kd macs
-    if (msg->credit_recovery == true) {
-        read_check_cc[0] = 0x80 | ICLASS_CMD_READCHECK; //still block 24 but with debit key
-    }
 
     /*  iclass_mac_table is a series of weak macs, those weak macs correspond to the different combinations of the last 3 bits of each key byte. */
 
@@ -2795,7 +2976,7 @@ void iClass_Recover(iclass_recover_req_t *msg) {
         }
         //Step0 Card Select Routine
         eof_time = 0; //reset eof time
-        res = select_iclass_tag(&hdr, msg->credit_recovery, &eof_time, shallow_mod);
+        res = select_iclass_tag(&hdr, false, &eof_time, shallow_mod);
         if (res) {
             status_message = 1; //card select successful
             card_select = true;
@@ -2803,16 +2984,13 @@ void iClass_Recover(iclass_recover_req_t *msg) {
 
         //Step 0A - The read_check_cc block has to be in AA2, set it by checking the card configuration
         read_check_cc[1] = hdr.conf.app_limit + 1; //first block of AA2
-        if (msg->credit_recovery == true) {
-            read_check_cc[1] = hdr.conf.app_limit - 1; //last block of AA1
-        }
         //Step1 Authenticate with AA1 using trace
         if (card_select) {
             memcpy(original_mac, msg->req.key, 8);
             start_time = eof_time + DELAY_ICLASS_VICC_TO_VCD_READER;
             res = authenticate_iclass_tag(&msg->req, &hdr, &start_time, &eof_time, mac1);
             if (res) {
-                status_message = 2; //authentication with AA1(AA2 if credit recovery) macs successful
+                status_message = 2; //authentication with AA1 macs successful
                 card_auth = true;
             }
         }
@@ -2861,7 +3039,7 @@ void iClass_Recover(iclass_recover_req_t *msg) {
             set_tracing(false);   // disable tracing to prevent crashes - set to true for debugging
             // Step0 Card Select Routine
             eof_time = 0; // reset eof time
-            res = select_iclass_tag(&hdr, msg->credit_recovery, &eof_time, shallow_mod);
+            res = select_iclass_tag(&hdr, false, &eof_time, shallow_mod);
             if (res) {
                 status_message = 1; // card select successful
                 card_select = true;
@@ -2932,9 +3110,6 @@ void iClass_Recover(iclass_recover_req_t *msg) {
 
         uint8_t wb[9] = {0};
         uint8_t blockno = 3;
-        if (msg->credit_recovery == true) {
-            blockno = 4;
-        }
         wb[0] = blockno;
         memcpy(wb + 1, genkeyblock, 8);
         doMAC_N(wb, sizeof(wb), div_key2, mac2);
@@ -3084,9 +3259,6 @@ fast_restore:
     uint8_t mac2[4] = {0};
     uint8_t wb[9] = {0};
     uint8_t blockno = 3;
-    if (msg->credit_recovery == true) {
-        blockno = 4;
-    }
     wb[0] = blockno;
     bool reverted = false;
     uint8_t revert_retries = 0;
@@ -3124,12 +3296,13 @@ fast_restore:
             Dbhexdump(8, fast_restore_key, false);
             Dbprintf(_RED_("Attempted to restore original key for %3d times and failed. Stopping. Card is likely unusable."), revert_retries);
         }
-        if (recovered) {
+        if (recovered && reverted) {
             goto restore;
-        } else {
+        } else if (revert_retries >= 7) {
             goto out;
         }
     }
+    goto out;
 
 restore:
     ;// empty statement for compilation

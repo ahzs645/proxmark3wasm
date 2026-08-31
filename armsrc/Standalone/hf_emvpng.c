@@ -31,10 +31,11 @@
 #include "standalone.h"
 #include "proxmark3_arm.h"
 #include "appmain.h"
-#include "fpgaloader.h"
+#include "fpga_apis.h"
+#include "fpga_loader.h"
 #include "util.h"
 #include "dbprint.h"
-#include "ticks.h"
+#include "ticks_apis.h"
 #include "string.h"
 #include "BigBuf.h"
 #include "iso14443a.h"
@@ -302,8 +303,13 @@ void RunMod(void) {
 
                 DbpString(_YELLOW_("+") "Found ISO 14443 Type A!");
 
+                chktoken = false;
                 for (uint8_t i = 0; i < 4; i++) {
-                    chktoken = false;
+
+                    if (i == 3 && chktoken) {
+                        break; // Tag 57 was already found in GPO, no need to issue READ RECORD
+                    }
+
                     LED_C_OFF();
                     LED_B_ON();
                     uint8_t apdulen = iso14_apdu(apdus[i], (uint16_t) apduslen[i], false, apdubuffer, sizeof(apdubuffer), NULL);
@@ -331,13 +337,13 @@ void RunMod(void) {
                                 }
 
 
-                            } else if (i == 3) {
+                            } else if (i == 2 || i == 3) {
 
 
-                                // find track 2
-                                if (apdubuffer[u] == 0x57 && apdubuffer[u + 1] == 0x13 && !chktoken) {
+                                // find track 2 in GPO or READ RECORD
+                                if (u + 20 < apdulen && apdubuffer[u] == 0x57 && apdubuffer[u + 1] == 0x13 && !chktoken) {
                                     chktoken = true;
-                                    memcpy(&token, &apdubuffer[u + 2], 19);
+                                    memcpy(token, &apdubuffer[u + 2], 19);
                                     break;
                                 }
                             }

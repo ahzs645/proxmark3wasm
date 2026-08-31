@@ -20,7 +20,8 @@
 #include "iso14443a.h"
 #include "BigBuf.h"
 
-#include "fpgaloader.h"
+#include "fpga_loader.h"
+#include "fpga_apis.h"
 #include "string.h"
 #include "dbprint.h"
 #include "protocols.h"
@@ -64,8 +65,9 @@ static uint8_t round_to_next(uint8_t value, uint8_t step) {
 }
 
 static uint8_t cryptogram_iv[16] = {0x00};
+
 static bool generate_cryptogram(const uint8_t *key, bool use_iv, const uint8_t *input, size_t length, uint8_t *output, uint8_t algorithm) {
-    if (!use_iv) {
+    if (use_iv == false) {
         memset(cryptogram_iv, 0x00, 16);
     }
 
@@ -85,6 +87,7 @@ static bool generate_cryptogram(const uint8_t *key, bool use_iv, const uint8_t *
 }
 
 static bool decrypt_cryptogram(const uint8_t *key, const uint8_t *input, size_t length, uint8_t *output, uint8_t algorithm) {
+
     memset(cryptogram_iv, 0x00, 16);
 
     if (algorithm == SEOS_ENCRYPTION_AES) {
@@ -99,7 +102,7 @@ static bool decrypt_cryptogram(const uint8_t *key, const uint8_t *input, size_t 
         mbedtls_des3_crypt_cbc(&ctx, MBEDTLS_DES_DECRYPT, length, cryptogram_iv, input, output);
         mbedtls_des3_free(&ctx);
     } else {
-        Dbprintf(_RED_("Unknown Encryption Algorithm"));
+        Dbprintf(_RED_("Unknown encryption algorithm"));
         return false;
     }
 
@@ -108,6 +111,7 @@ static bool decrypt_cryptogram(const uint8_t *key, const uint8_t *input, size_t 
 
 // Returns length of generated CMAC
 static bool generate_cmac(const uint8_t *key, const uint8_t *input, size_t length, uint8_t *output, uint8_t encryption_algorithm) {
+
     if (encryption_algorithm == SEOS_ENCRYPTION_AES) {
         ulaes_cmac(key, 16, input, length, output);
     } else if (encryption_algorithm == SEOS_ENCRYPTION_2K3DES || encryption_algorithm == SEOS_ENCRYPTION_3K3DES) {
@@ -115,7 +119,7 @@ static bool generate_cmac(const uint8_t *key, const uint8_t *input, size_t lengt
         if (encryption_algorithm == SEOS_ENCRYPTION_3K3DES) keylen = 24;
         des3_cmac(key, keylen, input, length, output);
     } else {
-        Dbprintf(_RED_("Unknown Encryption Algorithm"));
+        Dbprintf(_RED_("Unknown encryption algorithm"));
         return false;
     }
 
@@ -146,7 +150,8 @@ static void seos_kdf(bool forEncryption, uint8_t *masterKey, uint8_t keyslot, ui
     memcpy(work_buffer + 19 + adfoid_len, diversifier, diversifier_len);
 
     // This CMAC always uses AES, regardless of the main encryption algorithm in use.
-    generate_cmac(masterKey, work_buffer, 19 + adfoid_len + diversifier_len, out, SEOS_ENCRYPTION_AES);
+    bool res = generate_cmac(masterKey, work_buffer, 19 + adfoid_len + diversifier_len, out, SEOS_ENCRYPTION_AES);
+    (void)res;
 }
 
 // turn off afterwards
@@ -160,15 +165,15 @@ void SimulateSeos(seos_emulate_req_t *msg) {
 
     // These values are determined at runtime
     uint8_t RND_ICC[8] = { 0x00 };
-    uint8_t RND_IFD[8];
+    uint8_t RND_IFD[8] = { 0x00 };
     uint8_t KEY_ICC[16] = { 0x00 };
-    uint8_t KEY_IFD[16];
-    uint8_t diver_encr_key[16];
-    uint8_t diver_cmac_key[16];
+    uint8_t KEY_IFD[16] = { 0x00 };
+    uint8_t diver_encr_key[16] = { 0x00 };
+    uint8_t diver_cmac_key[16] = { 0x00 };
 
     // Calculated block size
     const uint8_t bs = block_size(msg->encr_alg);
-    const uint8_t half_bs = bs >> 1;
+    const uint8_t half_bs = (bs >> 1);
     if (bs == 0) {
         // Can't continue, invalid encryption algorithm
         reply_ng(CMD_HF_SEOS_SIMULATE, PM3_EINVARG, NULL, 0);
@@ -189,12 +194,14 @@ void SimulateSeos(seos_emulate_req_t *msg) {
         reply_ng(CMD_HF_MIFARE_SIMULATE, PM3_EMALLOC, NULL, 0);
         return;
     }
+
     uint8_t *dynamic_modulation_buffer = BigBuf_calloc(DYNAMIC_MODULATION_BUFFER_SIZE);
     if (dynamic_modulation_buffer == NULL) {
         BigBuf_free_keep_EM();
         reply_ng(CMD_HF_MIFARE_SIMULATE, PM3_EMALLOC, NULL, 0);
         return;
     }
+
     tag_response_info_t dynamic_response_info = {
         .response = dynamic_response_buffer,
         .response_n = 0,
@@ -210,6 +217,7 @@ void SimulateSeos(seos_emulate_req_t *msg) {
         reply_ng(CMD_HF_MIFARE_SIMULATE, PM3_EMALLOC, NULL, 0);
         return;
     }
+
     uint8_t *work_buffer_b = BigBuf_calloc(WORK_BUFFER_SIZE);
     if (work_buffer_b == NULL) {
         BigBuf_free_keep_EM();
@@ -276,6 +284,7 @@ void SimulateSeos(seos_emulate_req_t *msg) {
             if (odd_reply) {
                 p_response = &responses[RESP_INDEX_ATQA];
             }
+
         } else if (receivedCmd[0] == ISO14443A_CMD_WUPA && len == 1) { // Received a WAKEUP
             p_response = &responses[RESP_INDEX_ATQA];
         } else if (receivedCmd[1] == 0x20 && receivedCmd[0] == ISO14443A_CMD_ANTICOLL_OR_SELECT && len == 2) {    // Received request for UID (cascade 1)
@@ -301,6 +310,7 @@ void SimulateSeos(seos_emulate_req_t *msg) {
             p_response = &responses[RESP_INDEX_ATS];
             got_rats = true;
         } else {
+
             // clear old dynamic responses
             dynamic_response_info.response_n = 0;
             dynamic_response_info.modulation_n = 0;
@@ -311,6 +321,7 @@ void SimulateSeos(seos_emulate_req_t *msg) {
                 case 0x0B: // IBlock with CID
                 case 0x0A: {
                     offset = 1;
+                    break;
                 }
                 case 0x02: // IBlock without CID
                 case 0x03: {
@@ -367,9 +378,16 @@ void SimulateSeos(seos_emulate_req_t *msg) {
 
                             // Check all requested OIDs and see if we support any
                             uint8_t tlv_offset = 0;
-                            while (tlv_offset < received_tlv_len) {
+                            while (tlv_offset + 2 <= received_tlv_len) {
+
                                 uint8_t tag = received_tlv[tlv_offset++];
+
                                 uint8_t length = received_tlv[tlv_offset++];
+
+                                if (length > received_tlv_len - tlv_offset) {
+                                    break;
+                                }
+
                                 uint8_t *value = &received_tlv[tlv_offset];
                                 if (tag == 0x06) {
                                     if (length == msg->oid_len && memcmp(value, msg->oid, length) == 0) {
@@ -404,8 +422,14 @@ void SimulateSeos(seos_emulate_req_t *msg) {
                                 memcpy(reply + reply_idx, msg->diversifier, msg->diversifier_len);
                                 reply_idx += msg->diversifier_len;
 
-                                uint8_t tlv_base = 1 + offset;
-                                uint8_t tlv_idx = tlv_base;
+                                uint16_t tlv_base = 1 + offset;
+                                uint16_t tlv_idx = tlv_base;
+
+                                // Pre-flight: 6 fixed bytes + bs (IV) + reply_len (cryptogram) + 10 (CMAC tag+len+data)
+                                if (tlv_base + 6 + bs + reply_len + 10 > DYNAMIC_RESPONSE_BUFFER_SIZE) {
+                                    Dbprintf(_RED_("Select ADF failed") ": Response too large for buffer.");
+                                    break;
+                                }
 
                                 dynamic_response_info.response[tlv_idx++] = 0xCD; // Tag: cryptography type
                                 dynamic_response_info.response[tlv_idx++] = 0x02; // Length
@@ -463,7 +487,7 @@ void SimulateSeos(seos_emulate_req_t *msg) {
                                 uint8_t tlv_idx = 1 + offset;
 
                                 dynamic_response_info.response[tlv_idx++] = 0x7C; // Tag: mutual auth
-                                dynamic_response_info.response[tlv_idx++] = sizeof(RND_ICC) +2; // Length
+                                dynamic_response_info.response[tlv_idx++] = sizeof(RND_ICC) + 2; // Length
                                 dynamic_response_info.response[tlv_idx++] = 0x81; // Tag: request for RND.ICC
                                 dynamic_response_info.response[tlv_idx++] = sizeof(RND_ICC); // Length
                                 memcpy(dynamic_response_info.response + tlv_idx, RND_ICC, sizeof(RND_ICC));
@@ -615,9 +639,15 @@ void SimulateSeos(seos_emulate_req_t *msg) {
 
                             // Check all requested OIDs and see if we support any
                             uint8_t tlv_offset = 0;
-                            while (tlv_offset < received_tlv_len) {
+                            while (tlv_offset + 2 <= received_tlv_len) {
+
                                 uint8_t tag = received_tlv[tlv_offset];
+
                                 uint8_t length = received_tlv[tlv_offset + 1];
+                                if (length > received_tlv_len - tlv_offset - 2) {
+                                    break;
+                                }
+
                                 uint8_t *value = &received_tlv[tlv_offset + 2];
 
                                 if (tag == 0x85) {
@@ -628,6 +658,7 @@ void SimulateSeos(seos_emulate_req_t *msg) {
                                     recvd_cmac_length = length;
                                     recvd_cmac_offset = tlv_offset;
                                 }
+
                                 tlv_offset += 2 + length;
                             }
 
@@ -642,13 +673,17 @@ void SimulateSeos(seos_emulate_req_t *msg) {
                                 memcpy(rndCounter, RND_ICC, half_bs);
                                 memcpy(rndCounter + half_bs, RND_IFD, half_bs);
 
+                                // skip zero bytes
                                 for (int8_t i = bs - 1; i >= 0; i--) {
                                     rndCounter[i]++;
-                                    if (rndCounter[i] != 0x00) break;
+
+                                    if (rndCounter[i]) {
+                                        break;
+                                    }
                                 }
 
                                 uint8_t *mac_input = work_buffer_a;
-                                uint8_t mac_input_idx = 0;
+                                uint16_t mac_input_idx = 0;
 
                                 // Add RND_* counter to mac_input
                                 memcpy(mac_input + mac_input_idx, rndCounter, bs);
@@ -662,6 +697,10 @@ void SimulateSeos(seos_emulate_req_t *msg) {
                                 mac_input_idx += bs;
 
                                 // Add received TLV data to mac_input
+                                if (mac_input_idx + recvd_cmac_offset + bs > WORK_BUFFER_SIZE) {
+                                    Dbprintf(_RED_("Get Data failed") ": CMAC input too large.");
+                                    break;
+                                }
                                 memcpy(mac_input + mac_input_idx, received_tlv, recvd_cmac_offset);
                                 mac_input_idx += recvd_cmac_offset;
 
@@ -685,8 +724,8 @@ void SimulateSeos(seos_emulate_req_t *msg) {
                                 uint8_t *request = work_buffer_a;
                                 decrypt_cryptogram(diver_encr_key, cryptogram, cryptogram_length, request, msg->encr_alg);
 
-                                uint8_t tlv_base = 1 + offset;
-                                uint8_t tlv_idx = tlv_base;
+                                uint16_t tlv_base = 1 + offset;
+                                uint16_t tlv_idx = tlv_base;
 
                                 if (is_put) {
                                     // TODO: Add write support
@@ -732,6 +771,12 @@ void SimulateSeos(seos_emulate_req_t *msg) {
                                         break;
                                     }
 
+                                    // Pre-flight: 2 (cryptogram tag+len) + reply_len + 4 (status) + 2 (CMAC tag+len) + recvd_cmac_length
+                                    if (tlv_base + 2 + reply_len + 4 + 2 + recvd_cmac_length > DYNAMIC_RESPONSE_BUFFER_SIZE) {
+                                        Dbprintf(_RED_("Get Data failed") ": Response too large for buffer.");
+                                        break;
+                                    }
+
                                     // Only include a cryptogram for GET DATA
                                     dynamic_response_info.response[tlv_idx++] = 0x85; // Tag: cryptogram
                                     dynamic_response_info.response[tlv_idx++] = reply_len; // Length
@@ -756,6 +801,10 @@ void SimulateSeos(seos_emulate_req_t *msg) {
 
                                 memcpy(mac_input + mac_input_idx, rndCounter, bs);
                                 mac_input_idx += bs;
+                                if (mac_input_idx + (tlv_idx - tlv_base) + bs > WORK_BUFFER_SIZE) {
+                                    Dbprintf(_RED_("Get Data failed") ": Reply CMAC input too large.");
+                                    break;
+                                }
                                 memcpy(mac_input + mac_input_idx, dynamic_response_info.response + tlv_base, tlv_idx - tlv_base);
                                 mac_input_idx += tlv_idx - tlv_base;
 
@@ -767,6 +816,11 @@ void SimulateSeos(seos_emulate_req_t *msg) {
                                 }
 
                                 uint8_t cmac_size = recvd_cmac_length;
+                                if (cmac_size > 16) {
+                                    Dbprintf(_RED_("Get Data failed") ": CMAC size invalid.");
+                                    break;
+                                }
+
                                 if (!generate_cmac(diver_cmac_key, mac_input, mac_input_idx, cmac, msg->encr_alg)) {
                                     Dbprintf(_RED_("Get Data failed") ": Failed to create reply CMAC.");
                                     break;

@@ -84,6 +84,7 @@ void hex_to_buffer(uint8_t *buf, const uint8_t *hex_data, const size_t hex_len,
 void print_hex(const uint8_t *data, const size_t len);
 void print_hex_break(const uint8_t *data, const size_t len, const uint8_t breaks);
 void print_hex_noascii_break(const uint8_t *data, const size_t len, uint8_t breaks);
+void print_hex_noascii_break_ex(const uint8_t *data, const size_t len, uint8_t breaks, const char *prefix, char separator, const char *suffix);
 
 char *sprint_hex(const uint8_t *data, const size_t len);
 char *sprint_hex_inrow(const uint8_t *data, const size_t len);
@@ -166,6 +167,9 @@ void str_lower(char *s); // converts string to lower case
 void str_upper(char *s); // converts string to UPPER case
 void strn_upper(char *s, size_t n);
 
+bool str_equal_case_insensitive(const char *a, const char *b);
+bool str_startswith_case_insensitive(const char *s, const char *pre);
+bool str_contains_case_insensitive(const char *s, const char *needle);
 bool str_startswith(const char *s,  const char *pre);  // check for prefix in string
 bool str_endswith(const char *s,  const char *suffix);    // check for suffix in string
 void clean_ascii(unsigned char *buf, size_t len);
@@ -181,6 +185,13 @@ void str_trim(char *s);
 char *str_dup(const char *src);
 char *str_ndup(const char *src, size_t len);
 size_t str_nlen(const char *src, size_t maxlen);
+size_t str_copy(char *dst, size_t dst_size, const char *src);
+// Lightweight regex subset:
+//  - supported metacharacters: '^' (start), '$' (end), '.' (any char), '*' (zero or more)
+//  - escaping: '\\' to match the following char literally
+//  - all other regex constructs are currently treated as literal characters
+bool str_regex_match(const char *regexp, const char *text);
+bool str_regex_match_case_insensitive(const char *regexp, const char *text);
 
 int hexstring_to_u96(uint32_t *hi2, uint32_t *hi, uint32_t *lo, const char *str);
 int binstring_to_u96(uint32_t *hi2, uint32_t *hi, uint32_t *lo, const char *str);
@@ -204,5 +215,26 @@ void sb_append_char(smartbuf *sb, unsigned char c);
 uint8_t get_highest_frequency(const uint8_t *d, uint8_t n);
 
 size_t unduplicate(uint8_t *d, size_t n, const uint8_t item_n);
+
+/**
+ * @brief Trim leading and trailing ASCII whitespace from a mutable string.
+ */
+void str_trim_ascii_inplace(char *s);
+
+/**
+ * @brief Replace escaped \n, \r, and \t sequences with their control characters in-place.
+ */
+void str_unescape_newlines_inplace(char *s);
+
+/**
+ * @brief Copy a string while dropping all ASCII whitespace characters.
+ */
+int str_copy_without_whitespace(const char *src, char *dst, size_t dst_size, size_t *dst_len);
+
+/**
+ * @brief Set the antenna RGB LED colour (Proxmark5). No-op reply on devices
+ * without an RGB LED. Sends CMD_PM5_RGB_SET and waits briefly for the ack.
+ */
+void set_rgb(uint8_t r, uint8_t g, uint8_t b);
 
 #endif

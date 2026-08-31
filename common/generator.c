@@ -44,6 +44,8 @@
 # define prnt Dbprintf
 #endif
 
+#define MIFARE_KEY_SIZE         6
+
 // Implementation tips:
 // For each implementation of the algos, I recommend adding a self test for easy "simple unit" tests when Travis CI / Appveyor runs.
 // See special note for MFC based algos.
@@ -185,6 +187,7 @@ uint32_t ul_ev1_pwdgenE(const uint8_t *uid) {
     return pwd;
 }
 
+#ifndef ON_DEVICE
 // NDEF tools format password generator
 uint32_t ul_ev1_pwdgenF(const uint8_t *uid) {
     uint8_t hash[16] = {0};;
@@ -196,6 +199,7 @@ uint32_t ul_ev1_pwdgenF(const uint8_t *uid) {
     pwd |= hash[3];
     return pwd;
 }
+#endif // ON_DEVICE
 
 // Solution from @atc1441
 // https://gist.github.com/atc1441/41af75048e4c22af1f5f0d4c1d94bb56
@@ -386,15 +390,16 @@ int mfc_algo_mizip_one(const uint8_t *uid, uint8_t sector, uint8_t keytype, uint
     if (keytype > 2) return PM3_EINVARG;
 
     if (sector == 0) {
-        // A
-        if (keytype == 0)
-            *key = 0xA0A1A2A3A4A5U;
-        else    // B
-            *key = 0xB4C132439eef;
+
+        if (keytype == 0) {
+            *key = 0xA0A1A2A3A4A5U; // A
+        } else {
+            *key = 0xB4C132439eefU; // B
+        }
 
     } else {
 
-        uint8_t txor[6];
+        uint8_t txor[MIFARE_KEY_SIZE];
 
         if (keytype == 0) {
 
@@ -405,7 +410,7 @@ int mfc_algo_mizip_one(const uint8_t *uid, uint8_t sector, uint8_t keytype, uint
                 0x317AB72F4490,
             };
 
-            num_to_bytes(xor_tbl_a[sector - 1], 6, txor);
+            num_to_bytes(xor_tbl_a[sector - 1], MIFARE_KEY_SIZE, txor);
 
             *key =
                 (uint64_t)(uid[0] ^ txor[0]) << 40 |
@@ -425,7 +430,7 @@ int mfc_algo_mizip_one(const uint8_t *uid, uint8_t sector, uint8_t keytype, uint
             };
 
             // B
-            num_to_bytes(xor_tbl_b[sector - 1], 6, txor);
+            num_to_bytes(xor_tbl_b[sector - 1], MIFARE_KEY_SIZE, txor);
 
             *key =
                 (uint64_t)(uid[2] ^ txor[0]) << 40 |
@@ -449,7 +454,7 @@ int mfc_algo_mizip_all(uint8_t *uid, uint8_t *keys) {
         for (int sector = 0; sector < 5; sector++) {
             uint64_t key = 0;
             mfc_algo_mizip_one(uid, sector, keytype, &key);
-            num_to_bytes(key, 6, keys + (keytype * 5 * 6) + (sector * 6));
+            num_to_bytes(key, MIFARE_KEY_SIZE, keys + (keytype * 5 * MIFARE_KEY_SIZE) + (sector * MIFARE_KEY_SIZE));
         }
     }
     return PM3_SUCCESS;
@@ -543,6 +548,7 @@ int mfc_algo_sky_all(uint8_t *uid, uint8_t *keys) {
 }
 
 
+#ifndef ON_DEVICE
 static const uint8_t bambu_salt[] = { 0x9a, 0x75, 0x9c, 0xf2, 0xc4, 0xf7, 0xca, 0xff, 0x22, 0x2c, 0xb9, 0x76, 0x9b, 0x41, 0xbc, 0x96 };
 static const uint8_t bambu_context_a[] = "RFID-A";
 static const uint8_t bambu_context_b[] = "RFID-B";
@@ -619,6 +625,7 @@ int mfc_algo_snapmaker_all(uint8_t *uid, uint8_t *keys) {
 
     return PM3_SUCCESS;
 }
+#endif // ON_DEVICE
 
 // Vanderbilt ACT pattern-based key generation
 // Generates keys by appending block ID to "Acces" (0x4163636573)
@@ -626,24 +633,24 @@ int mfc_algo_snapmaker_all(uint8_t *uid, uint8_t *keys) {
 int mfc_algo_vanderbilt_one(uint8_t *uid, uint8_t sector, uint8_t keytype, uint64_t *key) {
     if (key == NULL) return PM3_EINVARG;
     if (sector > 39) return PM3_EINVARG;
-    
+
     // Base pattern: "Acces" in ASCII = 0x4163636573
     // For each sector, we generate keys for all 4 blocks (or 16 for sector 32+)
     // Key format: 41 63 63 65 73 XX where XX is the block number
-    
+
     uint8_t first_block = (sector < 32) ? (sector * 4) : (128 + (sector - 32) * 16);
     uint8_t block_id = first_block + 3; // Use sector trailer block ID
-    
+
     // Both key A and B use the same pattern with block ID
     uint8_t key_bytes[6] = {0x41, 0x63, 0x63, 0x65, 0x73, block_id};
     *key = bytes_to_num(key_bytes, 6);
-    
+
     return PM3_SUCCESS;
 }
 
 int mfc_algo_vanderbilt_all(uint8_t *uid, uint8_t *keys) {
     if (keys == NULL) return PM3_EINVARG;
-    
+
     // Generate keys for all sectors (40 sectors for 4K card)
     for (int keytype = 0; keytype < 2; keytype++) {
         for (int sector = 0; sector < 40; sector++) {
@@ -652,17 +659,21 @@ int mfc_algo_vanderbilt_all(uint8_t *uid, uint8_t *keys) {
             num_to_bytes(key, 6, keys + (keytype * 40 * 6) + (sector * 6));
         }
     }
-    
+
     return PM3_SUCCESS;
 }
+
 
 static kdf_t KDFTable[] = {
     {"Saflok / Maid", 16, mfc_algo_saflok_all, 4},
     {"MIZIP", 5, mfc_algo_mizip_all, 4},
     {"Disney Infinity", 5, mfc_algo_di_all, 7},
     {"Skylanders", 16, mfc_algo_sky_all, 4},
+#ifndef ON_DEVICE
     {"Bambu Lab Filament Spool", 16, mfc_algo_bambu_all, 4},
     {"Snapmaker Filament Spool", 16, mfc_algo_snapmaker_all, 4},
+#endif // ON_DEVICE
+
     {"Vanderbilt ACT", 40, mfc_algo_vanderbilt_all, 0},
     // {"Vinglock", 16, mfc_algo_ving_all, 4}, // not implemented
     // {"Yale Doorman", 16, mfc_algo_yale_all, 4}, // not implemented

@@ -21,7 +21,11 @@ Standalone modes run directly on the Proxmark3 device without a connected host c
 See [Developing Standalone Modes](#developing-standalone-modes) for how to build your own.
 > Only one (1) mode can be compiled into the firmware at a time (except via [DANKARMULTI](../../doc/standalone/dankarmulti.md)).
 
-## Individual Mode Documentation
+
+## Individual Mode Documentation 
+>>> NOTE <<<  This documentation below for the individual standalone mode is AI-generated
+As such the information inside may be false or hallucinated.
+
 
 ### LF (Low Frequency — 125 kHz) Standalone Modes
 
@@ -56,7 +60,8 @@ See [Developing Standalone Modes](#developing-standalone-modes) for how to build
 | HF_CARDHOPPER | [CardHopper Relay](../../doc/standalone/hf_cardhopper.md) | Long-range 14A relay over serial/IP | RDV4 (BT) |
 | HF_COLIN | [VIGIKPWN](../../doc/standalone/hf_colin.md) | MIFARE Classic ultra-fast sniff/sim/clone | RDV4 (flash) |
 | HF_CRAFTBYTE | [CraftByte UID Stealer](../../doc/standalone/hf_craftbyte.md) | Scan and emulate ISO14443A UIDs | Generic |
-| HF_DOEGOX_AUTH0 | [UL-C/UL-AES Unlocker](../../doc/standalone/hf_doegox_auth0.md) | Unlock password-protected Ultralight tags | Generic |
+| HF_DOEGOX_AUTH0 | [UL-C/UL-AES Unlocker](../../doc/standalone/hf_doegox_auth0.md) | Unlock password-protected Ultralight tags | RDV4 (antenna) |
+| HF_DOEGOX_COMMIT | [DESFire suspended commit](../../doc/standalone/hf_doegox_commit.md) | DESFire Suspend commit without relay | RDV4 (antenna) |
 | HF_EMVPNG | [EMV Visa Reader/Emulator](../../doc/standalone/hf_emvpng.md) | Read Visa EMV cards and emulate transactions | RDV4 (flash) |
 | HF_ICECLASS | [IceClass iCLASS](../../doc/standalone/hf_iceclass.md) | iCLASS multi-mode: sim/dump/attack/config | RDV4 (flash) |
 | HF_LEGIC | [Legic Prime Reader](../../doc/standalone/hf_legic.md) | Read and simulate Legic Prime tags | Generic |

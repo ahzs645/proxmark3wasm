@@ -20,16 +20,21 @@
 #include "cmdhfmfdes.h"
 #include <ctype.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include "jansson.h"
 #include "commonutil.h"             // ARRAYLEN
 #include "cmdparser.h"              // command_t
 #include "comms.h"
+#include "mifare/desfirecrypto.h"
+#include "pm3_cmd.h"
 #include "ui.h"
 #include "cmdhf14a.h"
 #include "aes.h"
 #include "crypto/libpcrypto.h"
+#include "crypto/duoxcrypto.h"
 #include "protocols.h"
+#include "parsers/parsehrt.h"
 #include "cmdtrace.h"
 #include "cliparser.h"
 #include "iso7816/apduinfo.h"       // APDU manipulation / errorcodes
@@ -46,6 +51,7 @@
 #include "mifare/mifaredefault.h"
 #include "generator.h"
 #include "mifare/aiddesfire.h"
+#include "mifare/prime.h"
 #include "util.h"
 #include "crypto/originality.h"
 
@@ -57,6 +63,114 @@
 #define MFDES_BRUTEAID_MAD_STEP          0x10U
 #define MFDES_BRUTEFID_RESELECT_ATTEMPTS 3
 #define MFDES_BRUTEFID_RESELECT_WAIT_MS 500
+#define MFDES_BRUTEDAMSLOT_RESELECT_ATTEMPTS 3
+#define MFDES_BRUTEDAMSLOT_RESELECT_WAIT_MS 500
+#define MFDES_PC_KEY_LEN                16U
+#define MFDES_PC_CHALLENGE_LEN          8U
+#define MFDES_PC_MAX_ROUNDS             8U
+#define MFDES_PC_MAC_LEN                8U
+
+#define MFDES_EV3C_MFC_KILL_KEY                0x31U
+#define MFDES_EV3C_ALLOWED_DATA_PERMISSIONS    0x11U
+#define MFDES_EV3C_ALLOWED_TRAILER_PERMISSIONS 0x1FU
+
+// DUOX ISO Internal Authenticate
+#define DUOX_INTAUTH_CHALLENGE_LEN      16
+#define DUOX_INTAUTH_SIG_LEN            64
+#define DUOX_MAX_KEY_INPUT              8192
+// TLV tags for ISO Internal Authenticate
+#define DUOX_TAG_OPTSA                  0x80
+#define DUOX_TAG_DYNAMIC_AUTH_DATA      0x7C
+#define DUOX_TAG_CHALLENGE              0x81
+#define DUOX_TAG_SIGNATURE              0x82
+#define DUOX_INTAUTH_MSG_PREFIX         0xF0
+
+// LEAF Verified Open Application
+#define LEAF_VERIFIED_DEFAULT_AID       0xF51CD6U
+#define LEAF_VERIFIED_CERT_FILE         0x02
+#define DUOX_VDE_DEFAULT_AID            0x1010F6U
+#define DUOX_VDE_CERT_FILE              0x00
+
+static const uint8_t kDuoxVDEDefaultDFName[] = {
+    0xA0, 0x00, 0x00, 0x08, 0x45, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01
+};
+#define MFDES_VERIFYCERT_MAX_CAS        DUOX_MAX_CERTIFICATE_ANCHORS
+
+static uint8_t saved_mfclicense[192];
+static size_t saved_mfclicense_len = 0;
+static bool saved_mfclicense_set = false;
+static uint8_t saved_mfclicense_mac[8];
+static bool saved_mfclicense_mac_set = false;
+
+typedef struct mfd_app_select {
+    bool dfname_present;
+    uint8_t dfname[16];
+    uint8_t dfname_len;
+    bool isoid_present;
+    uint16_t isoid;
+    bool aid_present;
+    uint32_t aid;
+} mfd_app_select;
+
+typedef enum {
+    MFDES_VALIDATE_METHOD_AUTO = 0,
+    MFDES_VALIDATE_METHOD_INTAUTH,
+    MFDES_VALIDATE_METHOD_VDE,
+    MFDES_VALIDATE_METHOD_SKIP,
+} mfdes_validate_method_t;
+
+typedef enum {
+    MFDES_READ_METHOD_AUTO = 0,
+    MFDES_READ_METHOD_DESFIRE,
+} mfdes_read_method_t;
+
+#define MFDES_VERIFYCERT_CERTIFICATE_PROFILE_MAX_DATA 4
+#define MFDES_VERIFYCERT_PROFILE_MAX_NAMES     4
+#define MFDES_VERIFYCERT_PROFILE_MAX_METHODS   3
+#define MFDES_VERIFYCERT_NO_FID                0xFF
+
+typedef struct {
+    char label[32];
+    char value[DUOX_CERT_TEXT_LEN];
+} mfdes_certificate_profile_value_t;
+
+typedef struct {
+    duox_certificate_format_t format;
+    mbedtls_ecp_group_id curveid;
+    uint8_t pubkey[DUOX_EC_PUBKEY_MAX_LEN];
+    size_t pubkey_len;
+    char issuer[DUOX_CERT_TEXT_LEN];
+    char subject[DUOX_CERT_TEXT_LEN];
+    char serial[DUOX_CERT_TEXT_LEN];
+    char valid_from[DUOX_CERT_TEXT_LEN];
+    char valid_to[DUOX_CERT_TEXT_LEN];
+    char certificate_profile_note[DUOX_CERT_TEXT_LEN];
+    mfdes_certificate_profile_value_t certificate_profile_data[MFDES_VERIFYCERT_CERTIFICATE_PROFILE_MAX_DATA];
+    size_t certificate_profile_data_count;
+} mfdes_verified_cert_t;
+
+typedef enum {
+    MFDES_VERIFYCERT_CERTIFICATE_PROFILE_DATA_SUBJECT_DN = 0,
+    MFDES_VERIFYCERT_CERTIFICATE_PROFILE_DATA_ISSUER_DN,
+} mfdes_certificate_profile_data_source_t;
+
+typedef struct {
+    const char *label;
+    mfdes_certificate_profile_data_source_t source;
+    const char *dn_component;
+} mfdes_certificate_profile_data_t;
+
+typedef struct {
+    const char *names[MFDES_VERIFYCERT_PROFILE_MAX_NAMES];
+    mfd_app_select cert_select;
+    bool key_select_present;
+    mfd_app_select key_select;
+    uint8_t fid;
+    uint8_t keyidx;
+    mfdes_validate_method_t validate_methods[MFDES_VERIFYCERT_PROFILE_MAX_METHODS];
+    const mfdes_certificate_profile_data_t *certificate_profile_data;
+} mfdes_verifycert_profile_t;
 
 #define status(x) ( ((uint16_t)(0x91 << 8)) + (uint16_t)x )
 /*
@@ -158,29 +272,6 @@ typedef struct aidhdr {
     uint8_t name[16];
 } PACKED aidhdr_t;
 
-typedef struct {
-    const uint32_t aidnum;
-    const char *aid;
-    const char *comment;
-} mfdesCommonAID_t;
-
-/*
-PACS application id(s) - HID Factory, CP1000 Standard, Mobile, Custom and Elite
-We have HID Factory,  Field Encoder == CP1000 (?)
-No mobile, Custom or Elite
-*/
-
-static const mfdesCommonAID_t commonAids[] = {
-    { 0x53494F, "\x53\x49\x4F", "SIO DESFire EV1 - HID Factory" },
-    { 0xD3494F, "\xD3\x49\x4F", "SIO DESFire EV1 - Field Encoder" },
-    { 0xD9494F, "\xD9\x49\x4F", "SIO DESFire EV1 - Field Encoder" },
-    { 0xF484E3, "\xF4\x84\xE3", "SE Enhanced" },
-    { 0xF484E4, "\xF4\x84\xE4", "SE Enhanced" },
-    { 0xF4812F, "\xf4\x81\x2f", "Gallagher card data application" },
-    { 0xF48120, "\xf4\x81\x20", "Gallagher card application directory" }, // Can be 0xF48120 - 0xF4812B, but I've only ever seen 0xF48120
-    { 0xF47300, "\xf4\x73\x00", "Inner Range card application" },
-};
-
 typedef enum {
     MFDES_BRUTEAID_PRESET_FULL = 0,
     MFDES_BRUTEAID_PRESET_ASCII = 1,
@@ -221,124 +312,6 @@ static int CLIGetUint32Hex(CLIParserContext *ctx, uint8_t paramnum, uint32_t def
     }
 
     return PM3_SUCCESS;
-}
-
-/*
-  The 7 MSBits (= n) code the storage size itself based on 2^n,
-  the LSBit is set to '0' if the size is exactly 2^n
-    and set to '1' if the storage size is between 2^n and 2^(n+1).
-    For this version of DESFire the 7 MSBits are set to 0x0C (2^12 = 4096) and the LSBit is '0'.
-*/
-static char *getCardSizeStr(uint8_t fsize) {
-
-    static char buf[40] = {0x00};
-    char *retStr = buf;
-
-    uint16_t usize = 1 << (((uint16_t)fsize >> 1) + 1);
-    uint16_t lsize = 1 << ((uint16_t)fsize >> 1);
-
-    // is  LSB set?
-    if (fsize & 1)
-        snprintf(retStr, sizeof(buf), "0x%02X ( " _GREEN_("%d - %d bytes") " )", fsize, usize, lsize);
-    else
-        snprintf(retStr, sizeof(buf), "0x%02X ( " _GREEN_("%d bytes") " )", fsize, lsize);
-    return buf;
-}
-
-static char *getProtocolStr(uint8_t id, bool hw) {
-
-    static char buf[50] = {0x00};
-    char *retStr = buf;
-
-    if (id == 0x04) {
-        snprintf(retStr, sizeof(buf), "0x%02X ( " _YELLOW_("ISO 14443-3 MIFARE, 14443-4") " )", id);
-    } else if (id == 0x05) {
-        if (hw)
-            snprintf(retStr, sizeof(buf), "0x%02X ( " _YELLOW_("ISO 14443-2, 14443-3") " )", id);
-        else
-            snprintf(retStr, sizeof(buf), "0x%02X ( " _YELLOW_("ISO 14443-3, 14443-4") " )", id);
-    } else {
-        snprintf(retStr, sizeof(buf), "0x%02X ( " _YELLOW_("Unknown") " )", id);
-    }
-    return buf;
-}
-
-static char *getVersionStr(uint8_t type, uint8_t major, uint8_t minor) {
-
-    static char buf[60] = {0x00};
-    char *retStr = buf;
-
-    if (type == 0x01 && major == 0x00)
-        snprintf(retStr, sizeof(buf), "%x.%x ( " _GREEN_("DESFire MF3ICD40") " )", major, minor);
-    else if (major == 0x10 && minor == 0x00)
-        snprintf(retStr, sizeof(buf), "%x.%x ( " _GREEN_("NTAG413DNA") " )", major, minor);
-    else if (type == 0x01 && major == 0x01 && minor == 0x00)
-        snprintf(retStr, sizeof(buf), "%x.%x ( " _GREEN_("DESFire EV1") " )", major, minor);
-    else if (type == 0x01 && major == 0x12 && minor == 0x00)
-        snprintf(retStr, sizeof(buf), "%x.%x ( " _GREEN_("DESFire EV2") " )", major, minor);
-    else if (type == 0x01 && major == 0x22 && minor == 0x00)
-        snprintf(retStr, sizeof(buf), "%x.%x ( " _GREEN_("DESFire EV2 XL") " )", major, minor);
-    else if (type == 0x01 && major == 0x42 && minor == 0x00)
-        snprintf(retStr, sizeof(buf), "%x.%x ( " _GREEN_("DESFire EV2") " )", major, minor);
-    else if (type == 0x01 && major == 0x33 && minor == 0x00)
-        snprintf(retStr, sizeof(buf), "%x.%x ( " _GREEN_("DESFire EV3") " )", major, minor);
-    else if (type == 0x81 && major == 0x43 && minor == 0x01)
-        snprintf(retStr, sizeof(buf), "%x.%x ( " _GREEN_("DESFire EV3C implementation on P71D600") " )", major, minor); // Swisskey iShield Key
-    else if (type == 0x01 && major == 0x30 && minor == 0x00)
-        snprintf(retStr, sizeof(buf), "%x.%x ( " _GREEN_("DESFire Light") " )", major, minor);
-    else if (type == 0x02 && major == 0x11 && minor == 0x00)
-        snprintf(retStr, sizeof(buf), "%x.%x ( " _GREEN_("Plus EV1") " )", major, minor);
-    else if (type == 0x02 && major == 0x22 && minor == 0x00)
-        snprintf(retStr, sizeof(buf), "%x.%x ( " _GREEN_("Plus EV2") " )", major, minor);
-    else if (type == 0x01 && major == 0xA0 && minor == 0x00)
-        snprintf(retStr, sizeof(buf), "%x.%x ( " _GREEN_("DUOX") " )", major, minor);
-    else if ((type & 0x08) == 0x08)
-        snprintf(retStr, sizeof(buf), "%x.%x ( " _GREEN_("DESFire Light") " )", major, minor);
-    else
-        snprintf(retStr, sizeof(buf), "%x.%x ( " _YELLOW_("Unknown") " )", major, minor);
-    return buf;
-
-//04 01 01 01 00 1A 05
-}
-
-static char *getTypeStr(uint8_t type) {
-
-    static char buf[40] = {0x00};
-    char *retStr = buf;
-
-    switch (type) {
-        case 0x01:
-            snprintf(retStr, sizeof(buf), "0x%02X ( " _YELLOW_("DESFire") " )", type);
-            break;
-        case 0x02:
-            snprintf(retStr, sizeof(buf), "0x%02X ( " _YELLOW_("Plus") " )", type);
-            break;
-        case 0x03:
-            snprintf(retStr, sizeof(buf), "0x%02X ( " _YELLOW_("Ultralight") " )", type);
-            break;
-        case 0x04:
-            snprintf(retStr, sizeof(buf), "0x%02X ( " _YELLOW_("NTAG") " )", type);
-            break;
-        case 0x81:
-            snprintf(retStr, sizeof(buf), "0x%02X ( " _YELLOW_("Smartcard") " )", type);
-            break;
-        case 0x91:
-            snprintf(retStr, sizeof(buf), "0x%02X ( " _YELLOW_("Applet") " )", type);
-            break;
-        default:
-            snprintf(retStr, sizeof(buf), "0x%02X", type);
-            break;
-    }
-    return buf;
-}
-
-static const char *getAidCommentStr(uint32_t aid) {
-    for (int i = 0; i < ARRAYLEN(commonAids); i++) {
-        if (aid == commonAids[i].aidnum) {
-            return commonAids[i].comment;
-        }
-    }
-    return "";
 }
 
 nxp_cardtype_t getCardType(uint8_t type, uint8_t major, uint8_t minor) {
@@ -424,16 +397,26 @@ static const char *getProductTypeStr(const uint8_t *versionhw) {
 
     uint8_t product = versionhw[1];
 
-    if (product == 0x01)
+    if (product == 0x01) {
         return "MIFARE DESFire native IC (physical card)";
-    if (product == 0x08)
+    }
+
+    if (product == 0x08) {
         return "MIFARE DESFire Light native IC (physical card)";
-    if (product == 0x81 || product == 0x83)
+    }
+
+    if (product == 0x81 || product == 0x83) {
         return "MIFARE DESFire implementation on microcontroller (physical card)";
-    if (product == 0x91)
+    }
+
+    if (product == 0x91) {
         return "MIFARE DESFire applet on Java card / secure element";
-    if (product == 0xA1)
+    }
+
+    if (product == 0xA1) {
         return "MIFARE DESFire HCE (MIFARE 2GO)";
+    }
+
     return "UNKNOWN PROD";
 }
 
@@ -656,6 +639,177 @@ static int CmdDesGetSessionParameters(CLIParserContext *ctx, DesfireContext_t *d
     return PM3_SUCCESS;
 }
 
+static int DesfirePCRun(DesfireContext_t *dctx, const uint8_t proximity_key[MFDES_PC_KEY_LEN], uint8_t rounds, bool activate_field, bool verbose) {
+    if (dctx == NULL || proximity_key == NULL || rounds < 1 || rounds > MFDES_PC_MAX_ROUNDS) {
+        return PM3_EINVARG;
+    }
+
+    int res = PM3_SUCCESS;
+    uint8_t random_challenge[MFDES_PC_CHALLENGE_LEN] = {0};
+    res = pcrypto_rng_fill_oneshot(random_challenge, sizeof(random_challenge), "hf_mfdes_pc");
+    if (res != PM3_SUCCESS) {
+        PrintAndLogEx(ERR, "Failed to generate random challenge");
+        return res;
+    }
+
+    uint8_t prepare_resp[APDU_RES_LEN] = {0};
+    size_t prepare_resp_len = 0;
+    uint8_t respcode = 0xFF;
+    res = DesfireExchangeEx(activate_field, dctx, MFDES_PREPARE_PC, NULL, 0, &respcode, prepare_resp, &prepare_resp_len, true, 0);
+    if (res != PM3_SUCCESS) {
+        uint16_t sw = status(respcode);
+        PrintAndLogEx(ERR, "Prepare proximity check command failed. Result: %d %s", res, DesfireGetErrorString(res, &sw));
+        goto out;
+    }
+
+    uint8_t options[3] = {0};
+    size_t options_len = MIN((size_t)3, prepare_resp_len);
+    if (options_len > 0) {
+        memcpy(options, prepare_resp, options_len);
+    }
+
+    bool prepare_extension_present = (prepare_resp_len > 3);
+    uint8_t prepare_extension = prepare_extension_present ? prepare_resp[3] : 0x00;
+
+    if (verbose) {
+        PrintAndLogEx(INFO, "Prepare response [%zu] : %s", prepare_resp_len, sprint_hex(prepare_resp, prepare_resp_len));
+        PrintAndLogEx(INFO, "Prepare options[%zu]   : %s", options_len, sprint_hex(options, options_len));
+        if (prepare_extension_present) {
+            PrintAndLogEx(INFO, "Prepare extension      : %02X", prepare_extension);
+        }
+    }
+
+    if (verbose) {
+        PrintAndLogEx(INFO, "Random challenge       : %s", sprint_hex(random_challenge, sizeof(random_challenge)));
+    }
+
+    size_t split_size = MFDES_PC_CHALLENGE_LEN / rounds;
+    if (split_size == 0) {
+        split_size = 1;
+    }
+
+    uint8_t challenge_response[MFDES_PC_CHALLENGE_LEN * 2] = {0};
+    size_t challenge_response_len = 0;
+    size_t challenge_offset = 0;
+
+    for (uint8_t round = 0; round < rounds; round++) {
+        size_t remaining = MFDES_PC_CHALLENGE_LEN - challenge_offset;
+        size_t challenge_part_len = ((round + 1) == rounds) ? remaining : MIN(split_size, remaining);
+        if (challenge_part_len == 0) {
+            PrintAndLogEx(ERR, "Invalid challenge split state at round %u", (unsigned int)round + 1);
+            res = PM3_ESOFT;
+            goto out;
+        }
+
+        uint8_t round_payload[1 + MFDES_PC_CHALLENGE_LEN] = {0};
+        round_payload[0] = (uint8_t)challenge_part_len;
+        memcpy(&round_payload[1], &random_challenge[challenge_offset], challenge_part_len);
+
+        uint8_t round_resp[APDU_RES_LEN] = {0};
+        size_t round_resp_len = 0;
+        respcode = 0xFF;
+
+        res = DesfireExchange(dctx, MFDES_PROXIMITY_CHECK, round_payload, challenge_part_len + 1, &respcode, round_resp, &round_resp_len);
+        if (res != PM3_SUCCESS) {
+            uint16_t sw = status(respcode);
+            PrintAndLogEx(ERR, "Proximity check round %u command failed. Result: %d %s", (unsigned int)round + 1, res, DesfireGetErrorString(res, &sw));
+            goto out;
+        }
+
+        size_t response_slice_len = MIN(round_resp_len, challenge_part_len);
+        memcpy(&challenge_response[challenge_response_len], round_resp, response_slice_len);
+        challenge_response_len += response_slice_len;
+        memcpy(&challenge_response[challenge_response_len], &random_challenge[challenge_offset], challenge_part_len);
+        challenge_response_len += challenge_part_len;
+
+        if (verbose) {
+            PrintAndLogEx(INFO, "Round %u challenge[%zu]: %s", (unsigned int)round + 1, challenge_part_len, sprint_hex(&random_challenge[challenge_offset], challenge_part_len));
+            PrintAndLogEx(INFO, "Round %u response [%zu]: %s", (unsigned int)round + 1, round_resp_len, sprint_hex(round_resp, round_resp_len));
+        }
+
+        challenge_offset += challenge_part_len;
+    }
+
+    bool include_prepare_extension = prepare_extension_present;
+
+    uint8_t verify_cmd_input[1 + 3 + 1 + (MFDES_PC_CHALLENGE_LEN * 2)] = {0};
+    size_t verify_cmd_input_len = 0;
+    verify_cmd_input[verify_cmd_input_len++] = MFDES_VERIFY_PC;
+    if (options_len > 0) {
+        memcpy(&verify_cmd_input[verify_cmd_input_len], options, options_len);
+        verify_cmd_input_len += options_len;
+    }
+    if (include_prepare_extension) {
+        verify_cmd_input[verify_cmd_input_len++] = prepare_extension;
+    }
+    memcpy(&verify_cmd_input[verify_cmd_input_len], challenge_response, challenge_response_len);
+    verify_cmd_input_len += challenge_response_len;
+
+    uint8_t verify_cmd_mac[MFDES_PC_MAC_LEN] = {0};
+    res = aes_cmac8(NULL, (uint8_t *)proximity_key, verify_cmd_input, verify_cmd_mac, (int)verify_cmd_input_len);
+    if (res != PM3_SUCCESS) {
+        PrintAndLogEx(ERR, "Failed to calculate Verify_PC command MAC");
+        res = PM3_ESOFT;
+        goto out;
+    }
+
+    if (verbose) {
+        PrintAndLogEx(INFO, "Verify command input[%zu]: %s", verify_cmd_input_len, sprint_hex(verify_cmd_input, verify_cmd_input_len));
+        PrintAndLogEx(INFO, "Verify command MAC       : %s", sprint_hex(verify_cmd_mac, sizeof(verify_cmd_mac)));
+    }
+
+    uint8_t verify_resp[APDU_RES_LEN] = {0};
+    size_t verify_resp_len = 0;
+    respcode = 0xFF;
+    res = DesfireExchange(dctx, MFDES_VERIFY_PC, verify_cmd_mac, sizeof(verify_cmd_mac), &respcode, verify_resp, &verify_resp_len);
+    if (res != PM3_SUCCESS) {
+        uint16_t sw = status(respcode);
+        PrintAndLogEx(ERR, "Verify proximity check command failed. Result: %d %s", res, DesfireGetErrorString(res, &sw));
+        goto out;
+    }
+
+    if (verify_resp_len < MFDES_PC_MAC_LEN) {
+        PrintAndLogEx(WARNING, "Verify response MAC is not present");
+    } else {
+        uint8_t verify_resp_input[1 + 3 + 1 + (MFDES_PC_CHALLENGE_LEN * 2)] = {0};
+        size_t verify_resp_input_len = 0;
+        verify_resp_input[verify_resp_input_len++] = MFDES_S_SIGNATURE;
+        if (options_len > 0) {
+            memcpy(&verify_resp_input[verify_resp_input_len], options, options_len);
+            verify_resp_input_len += options_len;
+        }
+        if (prepare_extension_present) {
+            verify_resp_input[verify_resp_input_len++] = prepare_extension;
+        }
+        memcpy(&verify_resp_input[verify_resp_input_len], challenge_response, challenge_response_len);
+        verify_resp_input_len += challenge_response_len;
+
+        uint8_t expected_resp_mac[MFDES_PC_MAC_LEN] = {0};
+        res = aes_cmac8(NULL, (uint8_t *)proximity_key, verify_resp_input, expected_resp_mac, (int)verify_resp_input_len);
+        if (res != PM3_SUCCESS) {
+            PrintAndLogEx(ERR, "Failed to calculate expected verify response MAC");
+            res = PM3_ESOFT;
+            goto out;
+        }
+
+        if (memcmp(verify_resp, expected_resp_mac, MFDES_PC_MAC_LEN) != 0) {
+            PrintAndLogEx(WARNING, "Verify response MAC mismatch");
+            if (verbose) {
+                PrintAndLogEx(INFO, "Expected: %s", sprint_hex(expected_resp_mac, MFDES_PC_MAC_LEN));
+                PrintAndLogEx(INFO, "Received: %s", sprint_hex(verify_resp, MFDES_PC_MAC_LEN));
+            }
+        } else if (verbose) {
+            PrintAndLogEx(INFO, "Verify response MAC      : %s", sprint_hex(verify_resp, MFDES_PC_MAC_LEN));
+        }
+    }
+
+    PrintAndLogEx(SUCCESS, "DESFire proximity check " _GREEN_("passed") ", rounds: %u", rounds);
+    res = PM3_SUCCESS;
+
+out:
+    return res;
+}
+
 static int CmdHF14ADesDefault(const char *Cmd) {
     CLIParserContext *ctx;
     CLIParserInit(&ctx, "hf mfdes default",
@@ -714,90 +868,75 @@ static int CmdHF14ADesDefault(const char *Cmd) {
     return PM3_SUCCESS;
 }
 
-static int CmdHF14ADesInfo(const char *Cmd) {
-    CLIParserContext *ctx;
-    CLIParserInit(&ctx, "hf mfdes info",
-                  "Get info from MIFARE DESfire tags",
-                  "hf mfdes info");
-
-    void *argtable[] = {
-        arg_param_begin,
-        arg_param_end
-    };
-    CLIExecWithReturn(ctx, Cmd, argtable, true);
-    CLIParserFree(ctx);
-
-    SetAPDULogging(false);
-    DropField();
-
-    mfdes_info_res_t info;
-    int res = mfdes_get_info(&info);
-    if (res != PM3_SUCCESS) {
-        DropField();
-        return res;
+static bool DesfirePrintVersionInfo(const mfdes_info_res_t *info, nxp_cardtype_t *cardtype) {
+    if (info == NULL) {
+        return false;
     }
 
-    nxp_cardtype_t cardtype = getCardType(info.versionHW[1], info.versionHW[3], info.versionHW[4]);
-    if (cardtype == PLUS_EV1) {
+    nxp_cardtype_t local_cardtype = getCardType(info->versionHW[1], info->versionHW[3], info->versionHW[4]);
+    if (cardtype != NULL) {
+        *cardtype = local_cardtype;
+    }
+
+    if (local_cardtype == PLUS_EV1) {
         PrintAndLogEx(INFO, "Card seems to be MIFARE Plus EV1.  Try " _YELLOW_("`hf mfp info`"));
-        DropField();
-        return PM3_SUCCESS;
+        return false;
     }
 
-    if (cardtype == PLUS_EV2) {
+    if (local_cardtype == PLUS_EV2) {
         PrintAndLogEx(INFO, "Card seems to be MIFARE Plus EV2.  Try " _YELLOW_("`hf mfp info`"));
-        DropField();
-        return PM3_SUCCESS;
+        return false;
     }
 
-    if (cardtype == NTAG424) {
+    if (local_cardtype == NTAG424) {
         PrintAndLogEx(INFO, "Card seems to be NTAG 424.  Try " _YELLOW_("`hf ntag424 info`"));
-        DropField();
-        return PM3_SUCCESS;
+        return false;
     }
 
-    if (cardtype == NXP_UNKNOWN) {
-        PrintAndLogEx(INFO, "HW Version.. %s", sprint_hex_inrow(info.versionHW, sizeof(info.versionHW)));
-        PrintAndLogEx(INFO, "SW Version.. %s", sprint_hex_inrow(info.versionSW, sizeof(info.versionSW)));
+    nxp_producttype_t prodtype = getProductType(info->versionHW);
+    if (local_cardtype == NXP_UNKNOWN && prodtype == DESFIRE_UNKNOWN_PROD) {
+        PrintAndLogEx(INFO, "HW Version.. %s", sprint_hex_inrow(info->versionHW, sizeof(info->versionHW)));
+        PrintAndLogEx(INFO, "SW Version.. %s", sprint_hex_inrow(info->versionSW, sizeof(info->versionSW)));
         PrintAndLogEx(INFO, "Version data identification failed. Report to Iceman!");
-        DropField();
-        return PM3_SUCCESS;
+        return false;
     }
 
     PrintAndLogEx(NORMAL, "");
     PrintAndLogEx(INFO, "---------------------------------- " _CYAN_("Tag Information") " ----------------------------------");
-    PrintAndLogEx(SUCCESS, "              UID: " _GREEN_("%s"), sprint_hex(info.uid, info.uidlen));
-    PrintAndLogEx(SUCCESS, "     Batch number: " _GREEN_("%s"), sprint_hex(info.details + 7, 5));
-    PrintAndLogEx(SUCCESS, "  Production date: week " _GREEN_("%02x") " / " _GREEN_("20%02x"), info.details[12], info.details[13]);
+    PrintAndLogEx(SUCCESS, "              UID: " _GREEN_("%s"), sprint_hex(info->uid, info->uidlen));
+    PrintAndLogEx(SUCCESS, "     Batch number: " _GREEN_("%s"), sprint_hex(info->details + 7, 5));
+    PrintAndLogEx(SUCCESS, "  Production date: week " _GREEN_("%02x") " / " _GREEN_("20%02x"), info->details[12], info->details[13]);
 
-    nxp_producttype_t prodtype = getProductType(info.versionHW);
     if (prodtype != DESFIRE_UNKNOWN_PROD) {
-        PrintAndLogEx(SUCCESS, "     Product type: %s", getProductTypeStr(info.versionHW));
+        PrintAndLogEx(SUCCESS, "     Product type: %s", getProductTypeStr(info->versionHW));
+    }
+    if (local_cardtype == NXP_UNKNOWN) {
+        PrintAndLogEx(WARNING, "Version tuple not fully identified. Report to Iceman!");
     }
 
     PrintAndLogEx(NORMAL, "");
     PrintAndLogEx(INFO, "--- " _CYAN_("Hardware Information"));
-    PrintAndLogEx(INFO, "   raw: %s", sprint_hex_inrow(info.versionHW, sizeof(info.versionHW)));
+    PrintAndLogEx(INFO, "   raw: %s", sprint_hex_inrow(info->versionHW, sizeof(info->versionHW)));
 
-    PrintAndLogEx(INFO, "     Vendor Id: " _YELLOW_("%s"), getTagInfo(info.versionHW[0]));
-    PrintAndLogEx(INFO, "          Type: " _YELLOW_("%s"), getTypeStr(info.versionHW[1]));
-    PrintAndLogEx(INFO, "       Subtype: " _YELLOW_("0x%02X"), info.versionHW[2]);
-    PrintAndLogEx(INFO, "       Version: %s", getVersionStr(info.versionHW[1], info.versionHW[3], info.versionHW[4]));
-    PrintAndLogEx(INFO, "  Storage size: %s", getCardSizeStr(info.versionHW[5]));
-    PrintAndLogEx(INFO, "      Protocol: %s", getProtocolStr(info.versionHW[6], true));
+    PrintAndLogEx(INFO, "     Vendor Id: " _YELLOW_("%s"), getTagInfo(info->versionHW[0]));
+    PrintAndLogEx(INFO, "          Type: " _YELLOW_("%s"), mifare_prime_get_type_str(info->versionHW[1]));
+    PrintAndLogEx(INFO, "       Subtype: " _YELLOW_("0x%02X"), info->versionHW[2]);
+    PrintAndLogEx(INFO, "       Version: %s", mifare_prime_get_version_str(info->versionHW[1], info->versionHW[3], info->versionHW[4]));
+    PrintAndLogEx(INFO, "  Storage size: %s", mifare_prime_get_card_size_str(info->versionHW[5]));
+    PrintAndLogEx(INFO, "      Protocol: %s", mifare_prime_get_protocol_str(info->versionHW[6], true));
     PrintAndLogEx(NORMAL, "");
     PrintAndLogEx(INFO, "--- " _CYAN_("Software Information"));
-    PrintAndLogEx(INFO, "   raw: %s", sprint_hex_inrow(info.versionSW, sizeof(info.versionSW)));
-    PrintAndLogEx(INFO, "     Vendor Id: " _YELLOW_("%s"), getTagInfo(info.versionSW[0]));
-    PrintAndLogEx(INFO, "          Type: " _YELLOW_("%s"), getTypeStr(info.versionSW[1]));
-    PrintAndLogEx(INFO, "       Subtype: " _YELLOW_("0x%02X"), info.versionSW[2]);
-    PrintAndLogEx(INFO, "       Version: " _YELLOW_("%d.%d"),  info.versionSW[3], info.versionSW[4]);
-    PrintAndLogEx(INFO, "  Storage size: %s", getCardSizeStr(info.versionSW[5]));
-    PrintAndLogEx(INFO, "      Protocol: %s", getProtocolStr(info.versionSW[6], false));
+    PrintAndLogEx(INFO, "   raw: %s", sprint_hex_inrow(info->versionSW, sizeof(info->versionSW)));
+    PrintAndLogEx(INFO, "     Vendor Id: " _YELLOW_("%s"), getTagInfo(info->versionSW[0]));
+    PrintAndLogEx(INFO, "          Type: " _YELLOW_("%s"), mifare_prime_get_type_str(info->versionSW[1]));
+    PrintAndLogEx(INFO, "       Subtype: " _YELLOW_("0x%02X"), info->versionSW[2]);
+    PrintAndLogEx(INFO, "       Version: " _YELLOW_("%d.%d"),  info->versionSW[3], info->versionSW[4]);
+    PrintAndLogEx(INFO, "  Storage size: %s", mifare_prime_get_card_size_str(info->versionSW[5]));
+    PrintAndLogEx(INFO, "      Protocol: %s", mifare_prime_get_protocol_str(info->versionSW[6], false));
     PrintAndLogEx(NORMAL, "");
     PrintAndLogEx(INFO, "--------------------------------- " _CYAN_("Card capabilities") " ---------------------------------");
-    uint8_t major = info.versionSW[3];
-    uint8_t minor = info.versionSW[4];
+    uint8_t major = info->versionSW[3];
+    uint8_t minor = info->versionSW[4];
 
     if (major == 0 && minor == 2)
         PrintAndLogEx(INFO, "\t0.2 - DESFire Light, Originality check, ");
@@ -826,6 +965,38 @@ static int CmdHF14ADesInfo(const char *Cmd) {
 
     if (major == 0xA0 && minor == 0)
         PrintAndLogEx(INFO, "\tx.x - DUOX, Originality check, proximity check, EAL6++");
+
+    return true;
+}
+
+static int CmdHF14ADesInfo(const char *Cmd) {
+    CLIParserContext *ctx;
+    CLIParserInit(&ctx, "hf mfdes info",
+                  "Get info from MIFARE DESfire tags",
+                  "hf mfdes info");
+
+    void *argtable[] = {
+        arg_param_begin,
+        arg_param_end
+    };
+    CLIExecWithReturn(ctx, Cmd, argtable, true);
+    CLIParserFree(ctx);
+
+    SetAPDULogging(false);
+    DropField();
+
+    mfdes_info_res_t info;
+    int res = mfdes_get_info(&info);
+    if (res != PM3_SUCCESS) {
+        DropField();
+        return res;
+    }
+
+    nxp_cardtype_t cardtype = NXP_UNKNOWN;
+    if (DesfirePrintVersionInfo(&info, &cardtype) == false) {
+        DropField();
+        return PM3_SUCCESS;
+    }
 
 
     DesfireContext_t dctx = {0};
@@ -878,7 +1049,7 @@ static int CmdHF14ADesInfo(const char *Cmd) {
         j = 0;
         for (int i = 0; i < aidbuflen; i += 3, j++) {
             uint32_t aid = DesfireAIDByteToUint(&aidbuf[i]);
-            PrintAndLogEx(SUCCESS, _YELLOW_("%06X") ", %s", aid, getAidCommentStr(aid));
+            PrintAndLogEx(SUCCESS, _YELLOW_("%06X") ", %s", aid, AIDDFGetCommentStr(aid));
         }
         PrintAndLogEx(NORMAL, "");
     }
@@ -961,6 +1132,101 @@ static int CmdHF14ADesInfo(const char *Cmd) {
 
     */
 
+    if (is_valid_hrt_card(&dctx, aidbuf, aidbuflen)) {
+        (void)hrt_parser_parse(&dctx);
+    }
+
+    DropField();
+    return PM3_SUCCESS;
+}
+
+static int CmdHF14ADesGetVersion(const char *Cmd) {
+    CLIParserContext *ctx;
+    CLIParserInit(&ctx, "hf mfdes getversion",
+                  "Request and print DESFire GetVersion data. Optionally select an ISO DF name first.",
+                  "hf mfdes getversion -> request and print card version/type information\n"
+                  "hf mfdes getversion --dfname D2760000850100 -> select DF by name, then request and print version/type information");
+
+    void *argtable[] = {
+        arg_param_begin,
+        arg_lit0("a",  "apdu",    "Show APDU requests and responses"),
+        arg_lit0("v",  "verbose", "Verbose output"),
+        arg_str0(NULL, "dfname",  "<hex>", "Application ISO DF Name (1-16 hex bytes, big endian)"),
+        arg_param_end
+    };
+    CLIExecWithReturn(ctx, Cmd, argtable, true);
+
+    bool APDULogging = arg_get_lit(ctx, 1);
+    bool verbose = arg_get_lit(ctx, 2);
+
+    uint8_t dfname[64] = {0};
+    int dfnamelen = 0;
+    if (CLIParamHexToBuf(arg_get_str(ctx, 3), dfname, sizeof(dfname), &dfnamelen)) {
+        CLIParserFree(ctx);
+        return PM3_EINVARG;
+    }
+    if (dfnamelen > 16) {
+        PrintAndLogEx(ERR, "DF name must be 1-16 bytes, got %d", dfnamelen);
+        CLIParserFree(ctx);
+        return PM3_EINVARG;
+    }
+
+    SetAPDULogging(APDULogging);
+    CLIParserFree(ctx);
+
+    DesfireContext_t dctx = {0};
+    dctx.commMode = DCMPlain;
+    dctx.cmdSet = DCCNativeISO;
+
+    DropField();
+
+    int res = PM3_SUCCESS;
+    if (dfnamelen > 0) {
+        uint8_t select_resp[250] = {0};
+        size_t select_resplen = 0;
+        res = DesfireISOSelect(&dctx, ISSDFName, dfname, (uint8_t)dfnamelen, select_resp, &select_resplen);
+        if (res != PM3_SUCCESS) {
+            DropField();
+            PrintAndLogEx(ERR, "Select DF name %s " _RED_("failed") ". Result: %d", sprint_hex_inrow(dfname, dfnamelen), res);
+            return res;
+        }
+
+        if (verbose) {
+            PrintAndLogEx(SUCCESS, "DF name %s selected " _GREEN_("ok"), sprint_hex_inrow(dfname, dfnamelen));
+        }
+    } else {
+        res = DesfireAnticollision(verbose);
+        if (res != PM3_SUCCESS) {
+            DropField();
+            return res;
+        }
+    }
+
+    mfdes_info_res_t info = {0};
+    uint8_t version[sizeof(info.versionHW) + sizeof(info.versionSW) + sizeof(info.details)] = {0};
+    size_t version_len = 0;
+    res = DesfireGetVersion(&dctx, version, &version_len);
+    if (res != PM3_SUCCESS) {
+        DropField();
+        PrintAndLogEx(ERR, "Desfire GetVersion command " _RED_("error") ". Result: %d", res);
+        return res;
+    }
+
+    if (version_len != sizeof(version)) {
+        DropField();
+        PrintAndLogEx(ERR, "Desfire GetVersion returned wrong length: %zu bytes, expected %zu", version_len, sizeof(version));
+        return PM3_ESOFT;
+    }
+
+    info.isOK = 1;
+    memcpy(info.versionHW, version, sizeof(info.versionHW));
+    memcpy(info.versionSW, version + sizeof(info.versionHW), sizeof(info.versionSW));
+    memcpy(info.details, version + sizeof(info.versionHW) + sizeof(info.versionSW), sizeof(info.details));
+    memcpy(info.uid, info.details, sizeof(info.uid));
+    info.uidlen = sizeof(info.uid);
+
+    DesfirePrintVersionInfo(&info, NULL);
+
     DropField();
     return PM3_SUCCESS;
 }
@@ -992,7 +1258,7 @@ static void DesFill2bPattern(
             memcpy(&k3kkeyList[*k3kkeyListLen][2], &k3kkeyList[*k3kkeyListLen][0], 2);
             memcpy(&k3kkeyList[*k3kkeyListLen][4], &k3kkeyList[*k3kkeyListLen][0], 4);
             memcpy(&k3kkeyList[*k3kkeyListLen][8], &k3kkeyList[*k3kkeyListLen][0], 8);
-            memcpy(&k3kkeyList[*k3kkeyListLen][16], &k3kkeyList[*k3kkeyListLen][0], 4);
+            memcpy(&k3kkeyList[*k3kkeyListLen][16], &k3kkeyList[*k3kkeyListLen][0], 8);
             (*k3kkeyListLen)++;
         }
 
@@ -1373,56 +1639,6 @@ static int CmdHF14aDesChk(const char *Cmd) {
         k3kkeyListLen = 0x100;
     }
 
-    // 2-byte pattern search mode
-    if (pattern2b) {
-        DesFill2bPattern(deskeyList, &deskeyListLen, aeskeyList, &aeskeyListLen, k3kkeyList, &k3kkeyListLen, &startPattern);
-    }
-
-    // dictionary mode
-    size_t endFilePosition = 0;
-    if (dict_filenamelen) {
-
-        res = loadFileDICTIONARYEx((char *)dict_filename, deskeyList, sizeof(deskeyList), NULL, 8, &deskeyListLen, 0, &endFilePosition, true);
-        if (res == PM3_SUCCESS && endFilePosition) {
-            PrintAndLogEx(SUCCESS, "First part of des dictionary successfully loaded.");
-        }
-
-        endFilePosition = 0;
-        res = loadFileDICTIONARYEx((char *)dict_filename, aeskeyList, sizeof(aeskeyList), NULL, 16, &aeskeyListLen, 0, &endFilePosition, true);
-        if (res == PM3_SUCCESS && endFilePosition) {
-            PrintAndLogEx(SUCCESS, "First part of aes dictionary successfully loaded.");
-        }
-
-        endFilePosition = 0;
-        res = loadFileDICTIONARYEx((char *)dict_filename, k3kkeyList, sizeof(k3kkeyList), NULL, 24, &k3kkeyListLen, 0, &endFilePosition, true);
-        if (res == PM3_SUCCESS && endFilePosition) {
-            PrintAndLogEx(SUCCESS, "First part of k3kdes dictionary successfully loaded.");
-        }
-
-        endFilePosition = 0;
-    }
-
-    if (aeskeyListLen == 0 && deskeyListLen == 0 && k3kkeyListLen == 0) {
-        PrintAndLogEx(ERR, "No keys provided. Nothing to check.");
-        return PM3_EINVARG;
-    }
-
-    if (aeskeyListLen != 0) {
-        PrintAndLogEx(INFO, "Loaded " _YELLOW_("%"PRIu32) " aes keys", aeskeyListLen);
-    }
-
-    if (deskeyListLen != 0) {
-        PrintAndLogEx(INFO, "Loaded "  _YELLOW_("%"PRIu32) " des keys", deskeyListLen);
-    }
-
-    if (k3kkeyListLen != 0) {
-        PrintAndLogEx(INFO, "Loaded " _YELLOW_("%"PRIu32) " k3kdes keys", k3kkeyListLen);
-    }
-
-    if (verbose == false) {
-        PrintAndLogEx(INFO, "Search keys:");
-    }
-
     bool result = false;
     uint8_t app_ids[78] = {0};
     size_t app_ids_len = 0;
@@ -1458,53 +1674,131 @@ static int CmdHF14aDesChk(const char *Cmd) {
         app_ids_len = 3;
     }
 
+    {
+        uint32_t deskeyCountTotal = 0;
+        uint32_t aeskeyCountTotal = 0;
+        uint32_t k3kkeyCountTotal = 0;
+
+        if (pattern1b) {
+            deskeyCountTotal = deskeyListLen;
+            aeskeyCountTotal = aeskeyListLen;
+            k3kkeyCountTotal = k3kkeyListLen;
+        } else if (pattern2b) {
+            deskeyCountTotal = 0x10000 - startPattern;
+            aeskeyCountTotal = 0x10000 - startPattern;
+            k3kkeyCountTotal = 0x10000 - startPattern;
+        } else if (dict_filenamelen) {
+            size_t readStart = 0;
+            size_t readEnd = 1;
+            uint32_t n = 0;
+
+            while (readEnd != 0) {
+                loadFileDICTIONARYEx((char *)dict_filename, deskeyList, sizeof(deskeyList), NULL, 8, &n, readStart, &readEnd, false);
+                readStart = readEnd;
+                deskeyCountTotal += n;
+            }
+
+            readStart = 0;
+            readEnd = 1;
+            while (readEnd != 0) {
+                loadFileDICTIONARYEx((char *)dict_filename, aeskeyList, sizeof(aeskeyList), NULL, 16, &n, readStart, &readEnd, false);
+                readStart = readEnd;
+                aeskeyCountTotal += n;
+            }
+
+            readStart = 0;
+            readEnd = 1;
+            while (readEnd != 0) {
+                loadFileDICTIONARYEx((char *)dict_filename, k3kkeyList, sizeof(k3kkeyList), NULL, 24, &n, readStart, &readEnd, false);
+                readStart = readEnd;
+                k3kkeyCountTotal += n;
+            }
+        }
+
+        if (deskeyCountTotal > 0)
+            PrintAndLogEx(INFO, "Loaded "  _YELLOW_("%"PRIu32) " des keys", deskeyCountTotal);
+        if (aeskeyCountTotal > 0)
+            PrintAndLogEx(INFO, "Loaded " _YELLOW_("%"PRIu32) " aes keys", aeskeyCountTotal);
+        if (k3kkeyCountTotal > 0)
+            PrintAndLogEx(INFO, "Loaded " _YELLOW_("%"PRIu32) " k3kdes keys", k3kkeyCountTotal);
+
+        if (deskeyCountTotal + aeskeyCountTotal + k3kkeyCountTotal == 0) {
+            PrintAndLogEx(ERR, "No keys provided. Nothing to check.");
+            return PM3_EINVARG;
+        }
+    }
+
     for (uint32_t x = 0; x < app_ids_len / 3; x++) {
 
         uint32_t curaid = (app_ids[x * 3] & 0xFF) + ((app_ids[(x * 3) + 1] & 0xFF) << 8) + ((app_ids[(x * 3) + 2] & 0xFF) << 16);
         PrintAndLogEx(ERR, "Checking aid 0x%06X...", curaid);
 
-        res = AuthCheckDesfire(&dctx, secureChannel, &app_ids[x * 3], deskeyList, deskeyListLen, aeskeyList, aeskeyListLen, k3kkeyList, k3kkeyListLen, cmdKDFAlgo, kdfInputLen, kdfInput, foundKeys, &result, (verbose == false));
-        if (res == PM3_EOPABORTED) {
+        bool loadedAllKeys = false;
+        size_t desReadStart = 0;
+        size_t desReadEnd = 1;
+        size_t aesReadStart = 0;
+        size_t aesReadEnd = 1;
+        size_t k3kReadStart = 0;
+        size_t k3kReadEnd = 1;
+        uint32_t pattern2bOffset = startPattern;
+
+        while (!loadedAllKeys) {
+            bool foundKeyThisRound = false;
+
+            if (pattern1b) {
+                loadedAllKeys = true;
+            } else if (pattern2b) {
+                if (pattern2bOffset < 0x10000) {
+                    aeskeyListLen = 0;
+                    deskeyListLen = 0;
+                    k3kkeyListLen = 0;
+                    DesFill2bPattern(deskeyList, &deskeyListLen, aeskeyList, &aeskeyListLen, k3kkeyList, &k3kkeyListLen, &pattern2bOffset);
+                } else {
+                    loadedAllKeys = true;
+                }
+            } else if (dict_filenamelen) {
+                deskeyListLen = 0;
+                if (desReadEnd != 0) {
+                    res = loadFileDICTIONARYEx((char *)dict_filename, deskeyList, sizeof(deskeyList), NULL, 8, &deskeyListLen, desReadStart, &desReadEnd, false);
+                    if (res != PM3_SUCCESS)
+                        desReadStart = desReadEnd;
+                } else {
+                    // Every 16 byte or 24 byte key also gets read as a valid des key, so when desReadEnd == 0 there are absolutely no more keys of any kind left in the dictionary
+                    loadedAllKeys = true;
+                }
+
+                aeskeyListLen = 0;
+                if (aesReadEnd != 0) {
+                    res = loadFileDICTIONARYEx((char *)dict_filename, aeskeyList, sizeof(aeskeyList), NULL, 16, &aeskeyListLen, aesReadStart, &aesReadEnd, false);
+                    if (res != PM3_SUCCESS)
+                        aesReadStart = aesReadEnd;
+                }
+
+                k3kkeyListLen = 0;
+                if (k3kReadEnd != 0) {
+                    res = loadFileDICTIONARYEx((char *)dict_filename, k3kkeyList, sizeof(k3kkeyList), NULL, 24, &k3kkeyListLen, k3kReadStart, &k3kReadEnd, false);
+                    if (res != PM3_SUCCESS)
+                        k3kReadStart = k3kReadEnd;
+                }
+            }
+
+            res = AuthCheckDesfire(&dctx, secureChannel, &app_ids[x * 3], deskeyList, deskeyListLen, aeskeyList, aeskeyListLen, k3kkeyList, k3kkeyListLen, cmdKDFAlgo, kdfInputLen, kdfInput, foundKeys, &foundKeyThisRound, verbose);
+            if (res == PM3_EOPABORTED) {
+                break;
+            }
+
+            result = result || foundKeyThisRound;
+
+            if (foundKeyThisRound == true && verbose == false) {
+                if (pattern1b || pattern2b)
+                    PrintAndLogEx(NORMAL, "p" NOLF);
+                else if (dict_filenamelen)
+                    PrintAndLogEx(NORMAL, "d" NOLF);
+            }
+        }
+
+        if (!loadedAllKeys)
             break;
-        }
-
-        if (pattern2b && startPattern < 0x10000) {
-            if (verbose == false) {
-                PrintAndLogEx(NORMAL, "p" NOLF);
-            }
-
-            aeskeyListLen = 0;
-            deskeyListLen = 0;
-            k3kkeyListLen = 0;
-            DesFill2bPattern(deskeyList, &deskeyListLen, aeskeyList, &aeskeyListLen, k3kkeyList, &k3kkeyListLen, &startPattern);
-            continue;
-        }
-
-        if (dict_filenamelen) {
-            if (verbose == false) {
-                PrintAndLogEx(NORMAL, "d" NOLF);
-            }
-
-            uint32_t keycnt = 0;
-            res = loadFileDICTIONARYEx((char *)dict_filename, deskeyList, sizeof(deskeyList), NULL, 16, &keycnt, endFilePosition, &endFilePosition, false);
-            if (res == PM3_SUCCESS && endFilePosition) {
-                deskeyListLen = keycnt;
-            }
-
-            keycnt = 0;
-            res = loadFileDICTIONARYEx((char *)dict_filename, aeskeyList, sizeof(aeskeyList), NULL, 16, &keycnt, endFilePosition, &endFilePosition, false);
-            if (res == PM3_SUCCESS && endFilePosition) {
-                aeskeyListLen = keycnt;
-            }
-
-            keycnt = 0;
-            res = loadFileDICTIONARYEx((char *)dict_filename, k3kkeyList, sizeof(k3kkeyList), NULL, 16, &keycnt, endFilePosition, &endFilePosition, false);
-            if (res == PM3_SUCCESS && endFilePosition) {
-                k3kkeyListLen = keycnt;
-            }
-
-            continue;
-        }
     }
     if (verbose == false) {
         PrintAndLogEx(NORMAL, "");
@@ -1514,9 +1808,10 @@ static int CmdHF14aDesChk(const char *Cmd) {
     if ((jsonnamelen > 0) && result) {
         DropField();
         // MIFARE DESFire info
-        SendCommandMIX(CMD_HF_ISO14443A_READER, ISO14A_CONNECT, 0, 0, NULL, 0);
+        SendIso14aReader(ISO14A_CONNECT | ISO14A_CLEARTRACE, NULL, 0);
         PacketResponseNG resp;
-        if (WaitForResponseTimeout(CMD_ACK, &resp, 2500) == false) {
+        uint8_t sel_1813 = 0;
+        if (WaitForIso14aReply(&resp, 2500, NULL, &sel_1813) == false) {
             PrintAndLogEx(WARNING, "timeout while waiting for reply");
             return PM3_ETIMEOUT;
         }
@@ -1524,7 +1819,7 @@ static int CmdHF14aDesChk(const char *Cmd) {
         iso14a_card_select_t card;
         memcpy(&card, (iso14a_card_select_t *)resp.data.asBytes, sizeof(iso14a_card_select_t));
 
-        uint64_t select_status = resp.oldarg[0]; // 0: couldn't read, 1: OK, with ATS, 2: OK, no ATS, 3: proprietary Anticollision
+        uint64_t select_status = sel_1813; // 0: couldn't read, 1: OK, with ATS, 2: OK, no ATS, 3: proprietary Anticollision
 
         uint8_t data[10 + 1 + 2 + 1 + 256 + (4 * 0xE * (24 + 1))] = {0};
         uint8_t atslen = 0;
@@ -2648,6 +2943,45 @@ static bool mfdesBruteAIDGeneratorNext(mfdes_bruteaid_generator_t *gen, uint32_t
     return mfdesBruteAIDGeneratorFullNext(&gen->g.full, id, progress);
 }
 
+static int DesfireGetDelegatedInfoNoFieldOn(DesfireContext_t *dctx, uint16_t damslot, uint8_t *resp, size_t *resplen) {
+    uint8_t data[2] = {0};
+    Uint2byteToMemLe(data, damslot);
+
+    uint8_t xresp[16] = {0};
+    size_t xresplen = 0;
+    uint8_t respcode = 0xFF;
+
+    int res = DesfireExchangeEx(false, dctx, MFDES_GET_DELEGATE_INFO, data, sizeof(data), &respcode, xresp, &xresplen, true, 0);
+    if (res != PM3_SUCCESS) {
+        if (res == PM3_EAPDU_FAIL && respcode == 0xFF && xresplen == 0) {
+            return PM3_ECARDEXCHANGE;
+        }
+        return res;
+    }
+
+    if (respcode == 0xFF) {
+        return PM3_ECARDEXCHANGE;
+    }
+
+    if (respcode != MFDES_S_OPERATION_OK) {
+        return PM3_EAPDU_FAIL;
+    }
+
+    if (xresplen != 8) {
+        return PM3_EAPDU_FAIL;
+    }
+
+    if (resplen) {
+        *resplen = xresplen;
+    }
+
+    if (resp) {
+        memcpy(resp, xresp, xresplen);
+    }
+
+    return PM3_SUCCESS;
+}
+
 static int CmdHF14ADesBruteApps(const char *Cmd) {
     CLIParserContext *ctx;
     CLIParserInit(&ctx, "hf mfdes bruteaid",
@@ -2775,7 +3109,7 @@ static int CmdHF14ADesBruteApps(const char *Cmd) {
         res = DesfireSelectAIDHexNoFieldOn(&dctx, id);
         if (res == PM3_ECARDEXCHANGE || res == PM3_ETIMEOUT || res == PM3_ERFTRANS) {
             for (int attempt = 1; attempt <= MFDES_BRUTEAID_RESELECT_ATTEMPTS; attempt++) {
-                printf("\33[2K\r"); // clear current inplace progress line before logging
+                PROMPT_CLEARLINE;
                 PrintAndLogEx(WARNING, "No card response while checking AID " _YELLOW_("%06X") ". Reselecting card (%d/%d)...",
                               id, attempt, MFDES_BRUTEAID_RESELECT_ATTEMPTS);
 
@@ -2806,7 +3140,7 @@ static int CmdHF14ADesBruteApps(const char *Cmd) {
         }
 
         if (res == PM3_SUCCESS) {
-            printf("\33[2K\r"); // clear current line before printing
+            PROMPT_CLEARLINE;
             PrintAndLogEx(SUCCESS, "Found New DESFire AID " _GREEN_("%06X"), id);
         }
     }
@@ -2917,7 +3251,7 @@ static int CmdHF14ADesBruteISOFIDs(const char *Cmd) {
 
         if (res == PM3_ECARDEXCHANGE || res == PM3_ETIMEOUT || res == PM3_ERFTRANS) {
             for (int attempt = 1; attempt <= MFDES_BRUTEFID_RESELECT_ATTEMPTS; attempt++) {
-                printf("\33[2K\r"); // clear current inplace progress line before logging
+                PROMPT_CLEARLINE;
                 PrintAndLogEx(WARNING, "No card response while checking ISO ID " _YELLOW_("%04X") ". Reselecting card (%d/%d)...",
                               isofid, attempt, MFDES_BRUTEFID_RESELECT_ATTEMPTS);
 
@@ -2945,7 +3279,7 @@ static int CmdHF14ADesBruteISOFIDs(const char *Cmd) {
 
         if (res == PM3_SUCCESS) {
             found++;
-            printf("\33[2K\r"); // clear current line before printing
+            PROMPT_CLEARLINE;
             PrintAndLogEx(SUCCESS, "Found new ISO file ID " _GREEN_("0x%04X"), isofid);
             if (verbose && resplen > 0) {
                 PrintAndLogEx(INFO, "Response [%zu] " _CYAN_("%s"), resplen, sprint_hex(resp, resplen));
@@ -2961,6 +3295,204 @@ static int CmdHF14ADesBruteISOFIDs(const char *Cmd) {
 
     PrintAndLogEx(NORMAL, "");
     PrintAndLogEx(SUCCESS, "Done! Found " _GREEN_("%llu") " matching file ISO ID candidate(s)",
+                  (unsigned long long)found);
+    DropField();
+    return PM3_SUCCESS;
+}
+
+static int CmdHF14ADesBruteDAMSlots(const char *Cmd) {
+    CLIParserContext *ctx;
+    CLIParserInit(&ctx, "hf mfdes brutedamslot",
+                  "Recover DAM slot to delegated AID mappings by bruteforce.\n"
+                  "WARNING: This command takes a loooong time",
+                  "hf mfdes brutedamslot                                  -> bruteforce all DAM slots\n"
+                  "hf mfdes brutedamslot --start 0000 --end 00ff         -> bruteforce specific DAM slot range\n"
+                  "hf mfdes brutedamslot --step 16                        -> bruteforce DAM slots with step 16\n"
+                  "hf mfdes brutedamslot --no-auth                        -> execute without authentication");
+
+    void *argtable[] = {
+        arg_param_begin,
+        arg_lit0("a",  "apdu",    "Show APDU requests and responses"),
+        arg_lit0("v",  "verbose", "Verbose output"),
+        arg_int0("n",  "keyno",   "<dec>", "Key number (default: 0 / PICC key)"),
+        arg_str0("t",  "algo",    "<DES|2TDEA|3TDEA|AES>",  "Crypt algo"),
+        arg_str0("k",  "key",     "<hex>",   "Key for authenticate (HEX 8(DES), 16(2TDEA or AES) or 24(3TDEA) bytes)"),
+        arg_str0(NULL, "kdf",     "<none|AN10922|gallagher>",   "Key Derivation Function (KDF)"),
+        arg_str0("i",  "kdfi",    "<hex>",  "KDF input (1-31 hex bytes)"),
+        arg_str0("m",  "cmode",   "<plain|mac|encrypt>", "Communicaton mode"),
+        arg_str0("c",  "ccset",   "<native|niso|iso>", "Communicaton command set"),
+        arg_str0(NULL, "schann",  "<d40|ev1|ev2|lrp>", "Secure channel"),
+        arg_str0(NULL, "start",   "<hex>", "Starting DAM slot (2 hex bytes, little endian on card)"),
+        arg_str0(NULL, "end",     "<hex>", "Last DAM slot (2 hex bytes, little endian on card)"),
+        arg_int0(NULL, "step",    "<dec>", "Increment step when bruteforcing DAM slots"),
+        arg_lit0(NULL, "no-auth", "Execute without authentication"),
+        arg_param_end
+    };
+    CLIExecWithReturn(ctx, Cmd, argtable, true);
+
+    bool APDULogging = arg_get_lit(ctx, 1);
+    bool verbose = arg_get_lit(ctx, 2);
+    bool noauth = arg_get_lit(ctx, 14);
+
+    int keynum = arg_get_int_def(ctx, 3, 0x00);
+    if (keynum < 0 || keynum > 0xFF) {
+        CLIParserFree(ctx);
+        PrintAndLogEx(ERR, "Key number must be in range 0..255");
+        return PM3_EINVARG;
+    }
+
+    DesfireContext_t dctx = {0};
+    int securechann = defaultSecureChannel;
+    int res = CmdDesGetSessionParameters(ctx, &dctx, 0, 4, 5, 6, 7, 8, 9, 10, 0, 0, 0,
+                                         &securechann, (noauth) ? DCMPlain : DCMMACed, NULL, NULL);
+    if (res) {
+        CLIParserFree(ctx);
+        return res;
+    }
+
+    dctx.keyNum = keynum & 0xFF;
+
+    uint32_t damslotStart = 0x0000;
+    if (CLIGetUint32Hex(ctx, 11, 0x0000, &damslotStart, NULL, 2, "DAM slot start must have 2 hex bytes")) {
+        CLIParserFree(ctx);
+        return PM3_EINVARG;
+    }
+
+    uint32_t damslotEnd = 0xFFFF;
+    if (CLIGetUint32Hex(ctx, 12, 0xFFFF, &damslotEnd, NULL, 2, "DAM slot end must have 2 hex bytes")) {
+        CLIParserFree(ctx);
+        return PM3_EINVARG;
+    }
+
+    int stepArg = arg_get_int_def(ctx, 13, 1);
+
+    SetAPDULogging(APDULogging);
+    CLIParserFree(ctx);
+
+    if (stepArg <= 0) {
+        PrintAndLogEx(ERR, "Increment step should be greater than zero");
+        return PM3_EINVARG;
+    }
+    uint32_t step = (uint32_t)stepArg;
+
+    if (damslotStart > damslotEnd) {
+        PrintAndLogEx(ERR, "Start should be lower than or equal to end. start: %04x end: %04x", damslotStart, damslotEnd);
+        return PM3_EINVARG;
+    }
+
+    res = DesfireSelectAndAuthenticateEx(&dctx, securechann, 0x000000, noauth, verbose);
+    if (res != PM3_SUCCESS) {
+        DropField();
+        return res;
+    }
+
+    uint64_t totalCount = ((damslotEnd - damslotStart) / step) + 1;
+    uint64_t tested = 0;
+    uint64_t found = 0;
+
+    PrintAndLogEx(INFO, "Bruteforcing DAM slots range " _YELLOW_("%04x") "-" _YELLOW_("%04x") " step " _YELLOW_("%u") " candidates " _YELLOW_("%llu"),
+                  damslotStart, damslotEnd, step, (unsigned long long)totalCount);
+
+    for (uint32_t damslot = damslotStart;; damslot += step) {
+        if (kbd_enter_pressed()) {
+            break;
+        }
+
+        tested++;
+        float progress = (totalCount > 0) ? ((float)tested / (float)totalCount) * 100.0f : 100.0f;
+        PrintAndLogEx(INPLACE, "Brute DESFire DAM slot Progress " _YELLOW_("%0.1f") " %%   current slot: %04X", progress, damslot);
+
+        uint8_t resp[16] = {0};
+        size_t resplen = 0;
+        res = DesfireGetDelegatedInfoNoFieldOn(&dctx, damslot & 0xffff, resp, &resplen);
+
+        if (res == PM3_ECARDEXCHANGE || res == PM3_ETIMEOUT || res == PM3_ERFTRANS) {
+            for (int attempt = 1; attempt <= MFDES_BRUTEDAMSLOT_RESELECT_ATTEMPTS; attempt++) {
+                PROMPT_CLEARLINE;
+                PrintAndLogEx(WARNING, "No card response while checking DAM slot " _YELLOW_("%04X") ". Reselecting card (%d/%d)...",
+                              damslot, attempt, MFDES_BRUTEDAMSLOT_RESELECT_ATTEMPTS);
+
+                msleep(MFDES_BRUTEDAMSLOT_RESELECT_WAIT_MS);
+
+                res = DesfireSelectAndAuthenticateEx(&dctx, securechann, 0x000000, noauth, verbose);
+                if (res != PM3_SUCCESS) {
+                    if (res != PM3_ECARDEXCHANGE && res != PM3_ETIMEOUT && res != PM3_ERFTRANS) {
+                        res = PM3_ECARDEXCHANGE;
+                    }
+                    continue;
+                }
+
+                res = DesfireGetDelegatedInfoNoFieldOn(&dctx, damslot & 0xffff, resp, &resplen);
+                if (res == PM3_SUCCESS || res == PM3_EAPDU_FAIL ||
+                        (res != PM3_ECARDEXCHANGE && res != PM3_ETIMEOUT && res != PM3_ERFTRANS)) {
+                    break;
+                }
+            }
+
+            if (res == PM3_ECARDEXCHANGE || res == PM3_ETIMEOUT || res == PM3_ERFTRANS) {
+                PrintAndLogEx(FAILED, "Card is not responding after %d reselect attempts. Aborting at DAM slot " _YELLOW_("%04X"),
+                              MFDES_BRUTEDAMSLOT_RESELECT_ATTEMPTS, damslot);
+                DropField();
+                return res;
+            }
+        }
+
+        if (res == PM3_EAPDU_FAIL && noauth == false) {
+            bool restored = false;
+            int authres = DesfireAuthenticate(&dctx, securechann, verbose);
+
+            // An APDU-level failure on GetDelegatedInfo drops the authenticated state.
+            // Try to restore auth in-place first, then fall back to a full reselect.
+            if (authres == PM3_SUCCESS && DesfireIsAuthenticated(&dctx)) {
+                restored = true;
+            }
+
+            for (int attempt = 1; attempt <= MFDES_BRUTEDAMSLOT_RESELECT_ATTEMPTS && restored == false; attempt++) {
+                PROMPT_CLEARLINE;
+                PrintAndLogEx(WARNING, "Lost authentication after DAM slot " _YELLOW_("%04X") ". Reselecting card (%d/%d)...",
+                              damslot, attempt, MFDES_BRUTEDAMSLOT_RESELECT_ATTEMPTS);
+
+                msleep(MFDES_BRUTEDAMSLOT_RESELECT_WAIT_MS);
+
+                authres = DesfireSelectAndAuthenticateEx(&dctx, securechann, 0x000000, false, verbose);
+                if (authres == PM3_SUCCESS && DesfireIsAuthenticated(&dctx)) {
+                    restored = true;
+                    break;
+                }
+            }
+
+            if (restored == false) {
+                PROMPT_CLEARLINE;
+                PrintAndLogEx(FAILED, "Failed to restore authentication after DAM slot " _YELLOW_("%04X"),
+                              damslot);
+                DropField();
+                return PM3_ECARDEXCHANGE;
+            }
+        }
+
+        if (res == PM3_SUCCESS) {
+            uint32_t delegatedaid = MemLeToUint3byte(&resp[5]);
+            PROMPT_CLEARLINE;
+            if (delegatedaid == 0x000000) {
+                PrintAndLogEx(SUCCESS, "DAM slot 0x%04X ver 0x%02X AID " _YELLOW_("0x%06X (empty)"),
+                              damslot, resp[0], delegatedaid);
+            } else {
+                PrintAndLogEx(SUCCESS, "DAM slot 0x%04X ver 0x%02X AID " _GREEN_("0x%06X"),
+                              damslot, resp[0], delegatedaid);
+            }
+            found++;
+            if (verbose && resplen > 0) {
+                PrintAndLogEx(INFO, "Response [%zu] " _CYAN_("%s"), resplen, sprint_hex(resp, resplen));
+            }
+        }
+
+        if (damslotEnd - damslot < step) {
+            break;
+        }
+    }
+
+    PrintAndLogEx(NORMAL, "");
+    PrintAndLogEx(SUCCESS, "Done! Found " _GREEN_("%llu") " matching DAM slot candidate(s)",
                   (unsigned long long)found);
     DropField();
     return PM3_SUCCESS;
@@ -3522,6 +4054,420 @@ static int CmdHF14ADesCreateApp(const char *Cmd) {
     return PM3_SUCCESS;
 }
 
+static int CmdHF14ADesCreateDelegateApp(const char *Cmd) {
+    CLIParserContext *ctx;
+    CLIParserInit(&ctx, "hf mfdes createdelegateapp",
+                  "Create delegated application (CreateDelegatedApplication / 0xC9). Master key needs to be provided.",
+                  "Command is built from fields and sends two frames: C9 + AF continuation.\n"
+                  "Authentication is always performed with DAM key number 0x10.\n"
+                  "EncK and DAMMAC are calculated from supplied key material.\n"
+                  "\n"
+                  "Structured mode examples:\n"
+                  "hf mfdes createdelegateapp --aid 123456 --damslot 0001 --damslotver 00 --quota 0010 --ks1 0F --ks2 AE --algo 2TDEA --key 00000000000000000000000000000000 --damenckey 00112233445566778899AABBCCDDEEFF --dammackey 8899AABBCCDDEEFF0011223344556677 --dstkey 00112233445566778899AABBCCDDEEFF --dstkeyver 00\n"
+                  "hf mfdes createdelegateapp --aid 123456 --damslot 0001 --quota 0010 --ks1 0F --dstalgo aes --numkeys 14 --ks3 01 --fid E110 --dfname D2760000850101 --algo 2TDEA --key 00000000000000000000000000000000 --damenckey 00112233445566778899AABBCCDDEEFF --dammackey 8899AABBCCDDEEFF0011223344556677 --dstkey 00112233445566778899AABBCCDDEEFF --dstkeyver 00");
+
+    void *argtable[] = {
+        arg_param_begin,
+        arg_lit0("a",  "apdu",    "Show APDU requests and responses"),
+        arg_lit0("v",  "verbose", "Verbose output"),
+        arg_str0("t",  "algo",    "<DES|2TDEA|3TDEA|AES>",  "Crypt algo"),
+        arg_str0("k",  "key",     "<hex>",   "Key for authenticate (HEX 8(DES), 16(2TDEA or AES) or 24(3TDEA) bytes)"),
+        arg_str0(NULL, "kdf",     "<none|AN10922|gallagher>",   "Key Derivation Function (KDF)"),
+        arg_str0("i",  "kdfi",    "<hex>",  "KDF input (1-31 hex bytes)"),
+        arg_str0("m",  "cmode",   "<plain|mac|encrypt>", "Communicaton mode"),
+        arg_str0("c",  "ccset",   "<native|niso|iso>", "Communicaton command set"),
+        arg_str0(NULL, "schann",  "<d40|ev1|ev2|lrp>", "Secure channel"),
+        arg_str0(NULL, "aid",     "<hex>", "Application ID for create. Mandatory in structured mode. (3 hex bytes, big endian)"),
+        arg_str0(NULL, "damslot", "<hex>", "DAM slot number (2 hex bytes, little endian on card)"),
+        arg_str0(NULL, "damslotver", "<hex>", "DAM slot version (1 hex byte, def: 00)"),
+        arg_str0(NULL, "quota",   "<hex>", "Quota in blocks (2 hex bytes, little endian on card, def: 0000)"),
+        arg_str0(NULL, "ks1",     "<hex>", "Key settings 1 (1 hex byte, def: 0x0F)"),
+        arg_str0(NULL, "ks2",     "<hex>", "Key settings 2 (1 hex byte, def: 0x0E)"),
+        arg_str0(NULL, "ks3",     "<hex>", "Key settings 3 (1 hex byte, optional)"),
+
+        arg_str0(NULL, "fid",     "<hex>", "ISO file ID (2 hex bytes, big endian), optional"),
+        arg_str0(NULL, "dfname",  "<hex>", "ISO DF Name (1..16 bytes, hex), optional"),
+
+        arg_str0(NULL, "dstalgo", "<DES|2TDEA|3TDEA|AES>",  "Application key crypt algo (used when ks2 omitted, def: DES)"),
+        arg_int0(NULL, "numkeys", "<dec>",  "Number of keys 0x01..0x0e (used when ks2 omitted, def: 0x01)"),
+        arg_str0(NULL, "damenckey", "<hex>", "DAM ENC key (16 bytes for AES/2TDEA, 24 bytes for 3TDEA)"),
+        arg_str0(NULL, "dammackey", "<hex>", "DAM MAC key (16 bytes for AES/2TDEA, 24 bytes for 3TDEA)"),
+        arg_str0(NULL, "dstkey", "<hex>", "Initial delegated-app key (16 bytes for 2TDEA/AES, 24 bytes for 3TDEA)"),
+        arg_str0(NULL, "dstkeyver", "<hex>", "Initial delegated-app key version (1 hex byte, def: 00)"),
+        arg_lit0(NULL, "no-auth", "Execute without authentication"),
+        arg_param_end
+    };
+    CLIExecWithReturn(ctx, Cmd, argtable, false);
+
+    bool APDULogging = arg_get_lit(ctx, 1);
+    bool verbose = arg_get_lit(ctx, 2);
+
+    DesfireContext_t dctx = {0};
+    int securechann = defaultSecureChannel;
+    uint32_t appid = 0x000000;
+    int res = CmdDesGetSessionParameters(ctx, &dctx, 0, 3, 4, 5, 6, 7, 8, 9, 10, 0, 0, &securechann, DCMMACed, &appid, NULL);
+    if (res) {
+        CLIParserFree(ctx);
+        return res;
+    }
+
+    dctx.keyNum = 0x10;
+
+    uint32_t damslot = 0x0000;
+    bool damslotpresent = false;
+    if (CLIGetUint32Hex(ctx, 11, 0x0000, &damslot, &damslotpresent, 2, "DAM slot number must have 2 bytes length")) {
+        CLIParserFree(ctx);
+        return PM3_EINVARG;
+    }
+
+    uint32_t damslotver = 0x00;
+    if (CLIGetUint32Hex(ctx, 12, 0x00, &damslotver, NULL, 1, "DAM slot version must have 1 byte length")) {
+        CLIParserFree(ctx);
+        return PM3_EINVARG;
+    }
+
+    uint32_t quota = 0x0000;
+    if (CLIGetUint32Hex(ctx, 13, 0x0000, &quota, NULL, 2, "Quota must have 2 bytes length")) {
+        CLIParserFree(ctx);
+        return PM3_EINVARG;
+    }
+
+    uint32_t ks1 = 0x0f;
+    if (CLIGetUint32Hex(ctx, 14, 0x0f, &ks1, NULL, 1, "Key settings 1 must have 1 byte length")) {
+        CLIParserFree(ctx);
+        return PM3_EINVARG;
+    }
+
+    uint32_t ks2 = 0x0e;
+    bool ks2present = false;
+    if (CLIGetUint32Hex(ctx, 15, 0x0e, &ks2, &ks2present, 1, "Key settings 2 must have 1 byte length")) {
+        CLIParserFree(ctx);
+        return PM3_EINVARG;
+    }
+
+    uint32_t ks3 = 0x00;
+    bool ks3present = false;
+    if (CLIGetUint32Hex(ctx, 16, 0x00, &ks3, &ks3present, 1, "Key settings 3 must have 1 byte length")) {
+        CLIParserFree(ctx);
+        return PM3_EINVARG;
+    }
+
+    uint32_t fileid = 0x0000;
+    bool fileidpresent = false;
+    if (CLIGetUint32Hex(ctx, 17, 0x0000, &fileid, &fileidpresent, 2, "ISO file ID must have 2 bytes length")) {
+        CLIParserFree(ctx);
+        return PM3_EINVARG;
+    }
+
+    uint8_t dfname[32] = {0};
+    int dfnamelen = 16;
+    CLIGetHexWithReturn(ctx, 18, dfname, &dfnamelen);
+    if (dfnamelen > 16) {
+        CLIParserFree(ctx);
+        PrintAndLogEx(ERR, "DF name must be a maximum of 16 bytes in length");
+        return PM3_EINVARG;
+    }
+
+    int dstalgo = T_DES;
+    if (CLIGetOptionList(arg_get_str(ctx, 19), DesfireAlgoOpts, &dstalgo)) {
+        CLIParserFree(ctx);
+        return PM3_ESOFT;
+    }
+
+    int keycount = arg_get_int_def(ctx, 20, 0x01);
+
+    uint8_t damenc[DESFIRE_MAX_KEY_SIZE] = {0};
+    int damenclen = sizeof(damenc);
+    CLIGetHexWithReturn(ctx, 21, damenc, &damenclen);
+
+    uint8_t mac_key[DESFIRE_MAX_KEY_SIZE] = {0};
+    int mac_key_len = sizeof(mac_key);
+    CLIGetHexWithReturn(ctx, 22, mac_key, &mac_key_len);
+
+    uint8_t dstkey[DESFIRE_MAX_KEY_SIZE] = {0};
+    int dstkeylen = sizeof(dstkey);
+    CLIGetHexWithReturn(ctx, 23, dstkey, &dstkeylen);
+
+    uint32_t dstkeyver = 0x00;
+    if (CLIGetUint32Hex(ctx, 24, 0x00, &dstkeyver, NULL, 1, "Delegated-app key version must have 1 byte length")) {
+        CLIParserFree(ctx);
+        return PM3_EINVARG;
+    }
+
+    bool noauth = arg_get_lit(ctx, 25);
+
+    SetAPDULogging(APDULogging);
+    CLIParserFree(ctx);
+
+    uint8_t data[250] = {0};
+    size_t datalen = 0;
+    uint8_t contdata[250] = {0};
+    size_t contdatalen = 0;
+
+    if (appid == 0x000000) {
+        PrintAndLogEx(ERR, "Creating the root aid (0x000000) is " _RED_("forbidden"));
+        return PM3_ESOFT;
+    }
+
+    if (!damslotpresent) {
+        PrintAndLogEx(ERR, "DAM slot number is mandatory");
+        return PM3_EINVARG;
+    }
+
+    if (keycount > 0x0e || keycount < 1) {
+        PrintAndLogEx(ERR, "Key count must be in the range 1..14");
+        return PM3_EINVARG;
+    }
+
+    if (dfnamelen > 0 && !fileidpresent) {
+        PrintAndLogEx(ERR, "ISO DF Name requires --fid");
+        return PM3_EINVARG;
+    }
+
+    DesfireCryptoAlgorithm damalgo = dctx.keyType;
+    if (damalgo != T_3DES && damalgo != T_3K3DES && damalgo != T_AES) {
+        PrintAndLogEx(ERR, "DAM keys support only --algo 2TDEA, 3TDEA or AES");
+        return PM3_EINVARG;
+    }
+
+    int expecteddamkeylen = desfire_get_key_length(damalgo);
+
+    if (damenclen != expecteddamkeylen) {
+        PrintAndLogEx(ERR, "DAM ENC key must have exactly %d bytes for --algo %s", expecteddamkeylen, CLIGetOptionListStr(DesfireAlgoOpts, damalgo));
+        return PM3_EINVARG;
+    }
+
+    if (mac_key_len != expecteddamkeylen) {
+        PrintAndLogEx(ERR, "DAM MAC key must have exactly %d bytes for --algo %s", expecteddamkeylen, CLIGetOptionListStr(DesfireAlgoOpts, damalgo));
+        return PM3_EINVARG;
+    }
+
+    if (dstkeylen == 0) {
+        PrintAndLogEx(ERR, "Initial delegated-app key is mandatory");
+        return PM3_EINVARG;
+    }
+
+    DesfireAIDUintToByte(appid, &data[0]);
+    Uint2byteToMemLe(&data[3], damslot & 0xffff);
+    data[5] = damslotver & 0xff;
+    Uint2byteToMemLe(&data[6], quota & 0xffff);
+    data[8] = ks1 & 0xff;
+    data[9] = ks2 & 0xff;
+
+    if (!ks2present) {
+        data[9] &= 0xf0;
+        data[9] |= keycount & 0x0f;
+        uint8_t kt = DesfireKeyAlgoToType(dstalgo);
+        data[9] &= 0x3f;
+        data[9] |= (kt & 0x03) << 6;
+    }
+
+    datalen = 10;
+
+    if (ks3present) {
+        data[9] |= 0x10;
+        data[datalen++] = ks3 & 0xff;
+    }
+
+    if (fileidpresent) {
+        Uint2byteToMemLe(&data[datalen], fileid & 0xffff);
+        datalen += 2;
+        if (dfnamelen > 0) {
+            memcpy(&data[datalen], dfname, dfnamelen);
+            datalen += dfnamelen;
+        }
+    }
+
+    if (datalen > DESFIRE_TX_FRAME_MAX_LEN) {
+        PrintAndLogEx(ERR, "First frame is too long (%zu > %d)", datalen, DESFIRE_TX_FRAME_MAX_LEN);
+        return PM3_EINVARG;
+    }
+
+    uint8_t keytype = (data[9] >> 6) & 0x03;
+    int expecteddstkeylen = desfire_get_key_length(DesfireKeyTypeToAlgo(keytype));
+
+    if (dstkeylen != expecteddstkeylen) {
+        PrintAndLogEx(ERR, "Initial delegated-app key length must be %d bytes for key type 0x%02x (got %d)", expecteddstkeylen, keytype, dstkeylen);
+        return PM3_EINVARG;
+    }
+
+    uint8_t cryptogram[32] = {0};
+    uint8_t cryptogram_plain[32] = {0};
+    // Delegated app key blob format:
+    // 7-byte random prefix + dst key + dst key version, then zero padding to 32 bytes.
+    for (size_t i = 0; i < 7; i++) {
+        cryptogram_plain[i] = (uint8_t)(rand() & 0xFF);
+    }
+    memcpy(&cryptogram_plain[7], dstkey, dstkeylen);
+    cryptogram_plain[7 + dstkeylen] = dstkeyver & 0xFF;
+
+    DesfireContext_t damctx = {0};
+    DesfireSetKey(&damctx, 0, damalgo, damenc);
+    uint8_t cryptogram_iv[DESFIRE_MAX_CRYPTO_BLOCK_SIZE] = {0};
+    DesfireCryptoEncDecEx(&damctx, DCOMainKey, cryptogram_plain, sizeof(cryptogram_plain), cryptogram, true, true, cryptogram_iv);
+
+    uint8_t mac_input[1 + DESFIRE_TX_FRAME_MAX_LEN + sizeof(cryptogram)] = {0};
+    size_t mac_input_len = 1 + datalen + sizeof(cryptogram);
+    mac_input[0] = MFDES_CREATE_DELEGATE_APP;
+    memcpy(&mac_input[1], data, datalen);
+    memcpy(&mac_input[1 + datalen], cryptogram, sizeof(cryptogram));
+
+    uint8_t mac[8] = {0};
+    uint8_t fullcmac[DESFIRE_MAX_CRYPTO_BLOCK_SIZE] = {0};
+    DesfireSetKey(&damctx, 0, damalgo, mac_key);
+    DesfireClearIV(&damctx);
+    DesfireCryptoCMACEx(&damctx, DCOMainKey, mac_input, mac_input_len, 0, fullcmac);
+    if (damalgo == T_AES) {
+        for (size_t i = 0; i < sizeof(mac); i++) {
+            mac[i] = fullcmac[i * 2 + 1];
+        }
+    } else {
+        memcpy(mac, fullcmac, sizeof(mac));
+    }
+
+    memcpy(contdata, cryptogram, sizeof(cryptogram));
+    memcpy(&contdata[sizeof(cryptogram)], mac, sizeof(mac));
+    contdatalen = sizeof(cryptogram) + sizeof(mac);
+
+    if (contdatalen > DESFIRE_TX_FRAME_MAX_LEN) {
+        PrintAndLogEx(ERR, "Continuation frame is too long (%zu > %d)", contdatalen, DESFIRE_TX_FRAME_MAX_LEN);
+        return PM3_EINVARG;
+    }
+
+    if (verbose) {
+        PrintAndLogEx(INFO, "---------------------------");
+        PrintAndLogEx(INFO, _CYAN_("Creating Delegated Application using:"));
+        PrintAndLogEx(INFO, "AID             0x%02X%02X%02X", data[2], data[1], data[0]);
+        PrintAndLogEx(INFO, "DAM algo        %s", CLIGetOptionListStr(DesfireAlgoOpts, damalgo));
+        if (datalen >= 10) {
+            PrintAndLogEx(INFO, "DAM slot        0x%04x", MemLeToUint2byte(&data[3]));
+            PrintAndLogEx(INFO, "DAM slot ver    0x%02x", data[5]);
+            PrintAndLogEx(INFO, "Quota           0x%04x (%d units)", MemLeToUint2byte(&data[6]), MemLeToUint2byte(&data[6]));
+            PrintAndLogEx(INFO, "Key Set 1       0x%02X", data[8]);
+            PrintAndLogEx(INFO, "Key Set 2       0x%02X", data[9]);
+            PrintKeySettings(data[8], data[9], true, true);
+        }
+        PrintAndLogEx(INFO, "Part1 payload   [%zu]  %s", datalen, sprint_hex(data, datalen));
+        PrintAndLogEx(INFO, "Cryptogram      %s", sprint_hex(cryptogram, sizeof(cryptogram)));
+        PrintAndLogEx(INFO, "MAC             %s", sprint_hex(mac, sizeof(mac)));
+        PrintAndLogEx(INFO, "Part2 payload   [%zu]  %s", contdatalen, sprint_hex(contdata, contdatalen));
+        PrintAndLogEx(INFO, "---------------------------");
+    }
+
+    res = DesfireSelectAndAuthenticateEx(&dctx, securechann, 0x000000, noauth, verbose);
+    if (res != PM3_SUCCESS) {
+        DropField();
+        return res;
+    }
+
+    res = DesfireCreateDelegatedApplication(&dctx, data, datalen, contdata, contdatalen);
+    if (res != PM3_SUCCESS) {
+        PrintAndLogEx(ERR, "Desfire CreateDelegatedApplication command " _RED_("error") ". Result: %d", res);
+        DropField();
+        return res;
+    }
+
+    PrintAndLogEx(SUCCESS, "Desfire delegated application %06x successfully " _GREEN_("created"), MemLeToUint3byte(data));
+
+    DropField();
+    return PM3_SUCCESS;
+}
+
+static int CmdHF14ADesGetDelegateAppInfo(const char *Cmd) {
+    CLIParserContext *ctx;
+    CLIParserInit(&ctx, "hf mfdes getdelegateappinfo",
+                  "Get delegated application information for DAM slot (GetDelegatedInfo / 0x69).",
+                  "By default authentication is performed with PICC key number 0x00.\n"
+                  "Use --keyno to pick another key number, or --no-auth to skip authentication.\n"
+                  "hf mfdes getdelegateappinfo --damslot 0001 --algo 2TDEA --key 00000000000000000000000000000000\n"
+                  "hf mfdes getdelegateappinfo --damslot 0001 --no-auth");
+
+    void *argtable[] = {
+        arg_param_begin,
+        arg_lit0("a",  "apdu",    "Show APDU requests and responses"),
+        arg_lit0("v",  "verbose", "Verbose output"),
+        arg_int0("n",  "keyno",   "<dec>", "Key number (default: 0 / PICC key)"),
+        arg_str0("t",  "algo",    "<DES|2TDEA|3TDEA|AES>",  "Crypt algo"),
+        arg_str0("k",  "key",     "<hex>",   "Key for authenticate (HEX 8(DES), 16(2TDEA or AES) or 24(3TDEA) bytes)"),
+        arg_str0(NULL, "kdf",     "<none|AN10922|gallagher>",   "Key Derivation Function (KDF)"),
+        arg_str0("i",  "kdfi",    "<hex>",  "KDF input (1-31 hex bytes)"),
+        arg_str0("m",  "cmode",   "<plain|mac|encrypt>", "Communicaton mode"),
+        arg_str0("c",  "ccset",   "<native|niso|iso>", "Communicaton command set"),
+        arg_str0(NULL, "schann",  "<d40|ev1|ev2|lrp>", "Secure channel"),
+        arg_str0(NULL, "damslot", "<hex>", "DAM slot number (2 hex bytes, little endian on card)"),
+        arg_lit0(NULL, "no-auth", "Execute without authentication"),
+        arg_param_end
+    };
+    CLIExecWithReturn(ctx, Cmd, argtable, false);
+
+    bool APDULogging = arg_get_lit(ctx, 1);
+    bool verbose = arg_get_lit(ctx, 2);
+    bool noauth = arg_get_lit(ctx, 12);
+
+    int keynum = arg_get_int_def(ctx, 3, 0x00);
+    if (keynum < 0 || keynum > 0xFF) {
+        CLIParserFree(ctx);
+        PrintAndLogEx(ERR, "Key number must be in range 0..255");
+        return PM3_EINVARG;
+    }
+
+    DesfireContext_t dctx = {0};
+    int securechann = defaultSecureChannel;
+    int res = CmdDesGetSessionParameters(ctx, &dctx, 0, 4, 5, 6, 7, 8, 9, 10, 0, 0, 0, &securechann, (noauth) ? DCMPlain : DCMMACed, NULL, NULL);
+    if (res) {
+        CLIParserFree(ctx);
+        return res;
+    }
+
+    dctx.keyNum = keynum & 0xFF;
+
+    uint32_t damslot = 0x0000;
+    bool damslotpresent = false;
+    if (CLIGetUint32Hex(ctx, 11, 0x0000, &damslot, &damslotpresent, 2, "DAM slot number must have 2 bytes length")) {
+        CLIParserFree(ctx);
+        return PM3_EINVARG;
+    }
+
+    SetAPDULogging(APDULogging);
+    CLIParserFree(ctx);
+
+    if (!damslotpresent) {
+        PrintAndLogEx(ERR, "DAM slot number is mandatory");
+        return PM3_EINVARG;
+    }
+
+    res = DesfireSelectAndAuthenticateEx(&dctx, securechann, 0x000000, noauth, verbose);
+    if (res != PM3_SUCCESS) {
+        DropField();
+        return res;
+    }
+
+    uint8_t resp[16] = {0};
+    size_t resplen = 0;
+    res = DesfireGetDelegatedInfoNoFieldOn(&dctx, damslot & 0xffff, resp, &resplen);
+    if (res != PM3_SUCCESS) {
+        PrintAndLogEx(ERR, "Desfire GetDelegatedInfo command " _RED_("error") ". Result: %d", res);
+        DropField();
+        return PM3_ESOFT;
+    }
+
+    if (verbose)
+        PrintAndLogEx(SUCCESS, "received data[%zu]: %s", resplen, sprint_hex(resp, resplen));
+
+    uint16_t quota = MemLeToUint2byte(&resp[1]);
+    uint16_t freeblocks = MemLeToUint2byte(&resp[3]);
+    uint32_t delegatedaid = MemLeToUint3byte(&resp[5]);
+
+    PrintAndLogEx(SUCCESS, "DAM slot....... 0x%04x", damslot & 0xffff);
+    PrintAndLogEx(SUCCESS, "DAM slot ver... 0x%02x", resp[0]);
+    PrintAndLogEx(SUCCESS, "Quota limit.... 0x%04x (%u blocks)", quota, (unsigned int)quota);
+    PrintAndLogEx(SUCCESS, "Free blocks.... 0x%04x (%u blocks)", freeblocks, (unsigned int)freeblocks);
+    PrintAndLogEx(SUCCESS, "Delegated AID.. 0x%06x", delegatedaid);
+
+    DropField();
+    return PM3_SUCCESS;
+}
+
 static int CmdHF14ADesDeleteApp(const char *Cmd) {
     CLIParserContext *ctx;
     CLIParserInit(&ctx, "hf mfdes deleteapp",
@@ -3665,6 +4611,88 @@ static int CmdHF14ADesGetUID(const char *Cmd) {
 
     DropField();
     return PM3_SUCCESS;
+}
+
+static int CmdHF14ADesPC(const char *Cmd) {
+    CLIParserContext *ctx;
+    CLIParserInit(&ctx, "hf mfdes pc",
+                  "Perform DESFire proximity check flow (Prepare_PC -> Proximity_Check -> Verify_PC).\n"
+                  "This command uses plain communication with a dedicated 16-byte AES proximity key.",
+                  "hf mfdes pc --key 00000000000000000000000000000000\n"
+                  "hf mfdes pc --key 00112233445566778899aabbccddeeff --rounds 4\n"
+                  "hf mfdes pc --aid 123456 --key 00112233445566778899aabbccddeeff\n"
+                  "hf mfdes pc --key 00112233445566778899aabbccddeeff -c native -a");
+
+    void *argtable[] = {
+        arg_param_begin,
+        arg_lit0("a",  "apdu",   "Show APDU requests and responses"),
+        arg_lit0("v",  "verbose", "Verbose output"),
+        arg_str1("k",  "key",    "<hex>", "Key (AES-128, exactly 16 bytes)"),
+        arg_int0("r",  "rounds", "<dec>", "Number of rounds (1..8), default 8"),
+        arg_str0("c",  "ccset",  "<native|niso>", "Communication command set (default from `hf mfdes default`)"),
+        arg_str0(NULL, "aid",     "<hex>", "Application ID (3 hex bytes, big endian)"),
+        arg_param_end
+    };
+    CLIExecWithReturn(ctx, Cmd, argtable, true);
+
+    bool APDULogging = arg_get_lit(ctx, 1);
+    bool verbose = arg_get_lit(ctx, 2);
+
+    uint8_t proximity_key[MFDES_PC_KEY_LEN] = {0};
+    int proximity_key_len = 0;
+    CLIGetHexWithReturn(ctx, 3, proximity_key, &proximity_key_len);
+    if (proximity_key_len != MFDES_PC_KEY_LEN) {
+        PrintAndLogEx(ERR, "Proximity key must have 16 bytes length.");
+        CLIParserFree(ctx);
+        return PM3_EINVARG;
+    }
+
+    int rounds = arg_get_int_def(ctx, 4, MFDES_PC_MAX_ROUNDS);
+    if (rounds < 1 || rounds > MFDES_PC_MAX_ROUNDS) {
+        PrintAndLogEx(ERR, "Rounds must be in range 1..8.");
+        CLIParserFree(ctx);
+        return PM3_EINVARG;
+    }
+
+    int cmdset = defaultCommSet;
+    if (CLIGetOptionList(arg_get_str(ctx, 5), DesfireCommandSetOpts, &cmdset)) {
+        CLIParserFree(ctx);
+        return PM3_EINVARG;
+    }
+
+    if (cmdset == DCCISO) {
+        PrintAndLogEx(ERR, "`ccset=iso` is not supported for this command. Use `native` or `niso`.");
+        CLIParserFree(ctx);
+        return PM3_EINVARG;
+    }
+
+    uint32_t appid = 0;
+    bool appid_present = false;
+    if (CLIGetUint32Hex(ctx, 6, 0, &appid, &appid_present, 3, "AID must have 3 bytes length")) {
+        CLIParserFree(ctx);
+        return PM3_EINVARG;
+    }
+
+    SetAPDULogging(APDULogging);
+    CLIParserFree(ctx);
+
+    DesfireContext_t dctx = {0};
+    DesfireSetCommandSet(&dctx, cmdset);
+    DesfireSetCommMode(&dctx, DCMPlain);
+    DesfireSetSecureChannel(&dctx, DACNone);
+
+    int res = PM3_SUCCESS;
+    if (appid_present) {
+        res = DesfireSelectAndAuthenticateAppW(&dctx, DACNone, ISW6bAID, appid, true, verbose);
+        if (res != PM3_SUCCESS) {
+            DropField();
+            return res;
+        }
+    }
+
+    res = DesfirePCRun(&dctx, proximity_key, rounds, !appid_present, verbose);
+    DropField();
+    return res;
 }
 
 static int CmdHF14ADesFormatPICC(const char *Cmd) {
@@ -4109,7 +5137,7 @@ static int CmdHF14ADesGetAIDs(const char *Cmd) {
         PrintAndLogEx(SUCCESS, "--- " _CYAN_("AID list")  " ( " _YELLOW_("%u") " found )", j);
         for (int i = 0; i < buflen; i += 3) {
             uint32_t aid  = DesfireAIDByteToUint(&buf[i]);
-            PrintAndLogEx(SUCCESS, _YELLOW_("%06X") " %s", aid, getAidCommentStr(aid));
+            PrintAndLogEx(SUCCESS, _YELLOW_("%06X") " %s", aid, AIDDFGetCommentStr(aid));
         }
         PrintAndLogEx(NORMAL, "");
     } else {
@@ -5519,6 +6547,523 @@ static int CmdHF14ADesClearRecordFile(const char *Cmd) {
     return PM3_SUCCESS;
 }
 
+/**
+ * Parse MFC blocks given on the command line
+ *
+ * If given for making the license, the blocks must be unique and in ascending order.
+ *
+ * If given for the CreateMFCMapping command, the blocks must be unique and either all data blocks or all trailer blocks.
+ */
+static int parse_mfc_blocks(const char *in, uint8_t blocks_out[], size_t *blocks_out_len, bool for_license) {
+    if (!in || !blocks_out_len) {
+        return PM3_EINVARG;
+    }
+    *blocks_out_len = 0;
+    char blk_str[512];
+    if (strlen(in) + 1 > sizeof(blk_str)) {
+        PrintAndLogEx(ERR, "Argument too long");
+        return PM3_EINVARG;
+    }
+    strcpy(blk_str, in);
+
+    char *ptr = blk_str;
+    char *saveptr = NULL;
+    char *token;
+    int last = -1;
+    uint64_t seen_so_far = 0;
+    bool has_data = false;
+    bool has_trailer = false;
+    for (;;) {
+        token = strtok_r(ptr, ",", &saveptr);
+        ptr = NULL;
+
+        if (!token) {
+            break;
+        }
+
+        char *endptr = NULL;
+        long blk_val = strtol(token, &endptr, 0);
+        if (endptr == NULL || *token == '\0' || *endptr != '\0' || blk_val < 0 || blk_val >= 64) {
+            PrintAndLogEx(ERR, "Invalid block number: %s", token);
+            return PM3_EINVARG;
+        }
+        if (for_license) { // check if sorted in ascending order
+            if (blk_val <= last) {
+                PrintAndLogEx(ERR, "Blocks must be unique and sorted in ascending order");
+                return PM3_EINVARG;
+            }
+        } else { // check if unique and all data / all trailer
+            if (seen_so_far & (1ULL << blk_val)) {
+                PrintAndLogEx(ERR, "Blocks must be unique");
+                return PM3_EINVARG;
+            }
+            seen_so_far |= (1ULL << blk_val);
+            has_data |= !!((blk_val + 1) % 4 != 0);
+            has_trailer |= !!((blk_val + 1) % 4 == 0);
+
+            if (has_data && has_trailer) {
+                PrintAndLogEx(ERR, "Either data blocks or trailer blocks must be given, not both");
+                return PM3_EINVARG;
+            }
+        }
+        blocks_out[(*blocks_out_len)++] = blk_val;
+        last = blk_val;
+
+        if (*blocks_out_len > 64) {
+            PrintAndLogEx(ERR, "Too many blocks");
+            return PM3_EINVARG;
+        }
+    }
+
+    if (*blocks_out_len == 0) {
+        PrintAndLogEx(ERR, "At least one block must be given");
+        return PM3_EINVARG;
+    }
+
+    return PM3_SUCCESS;
+}
+
+static int CmdHF14ADesMakeMFCLicense(const char *Cmd) {
+    CLIParserContext *ctx;
+    CLIParserInit(&ctx, "hf mfdes makemfclicense",
+                  "Create a Mifare Classic license for DESFire EV3C, as well as a license MAC.\n"
+                  "The MFC license MAC key must have the same value as PICC level key 50.\n"
+                  "\n"
+                  "The permissions are a bitwise-or combination of:\n"
+                  "    0x01: allow mapping block\n"
+                  "    0x02: allow updating key B (only for trailers)\n"
+                  "    0x04: allow updating ACs (only for trailers)\n"
+                  "    0x08: allow updating key A (only for trailers)\n"
+                  "    0x10: allow the DESFire RestrictMFCUpdate command",
+                  "hf mfdes makemfclicense -b 4,5,6,8,9,10 --mfc-keys FFFFFFFFFFFF111111111111222222222222\n"
+                  "        -> Create a license for blocks 4, 5, 6, 8, 9, 10 where sector 1 has key A = FFFFFFFFFFFF and key B readable,\n"
+                  "        -> and sector 2 has key A = 111111111111, key B = 222222222222 with key B non readable");
+
+    void *argtable[] = {
+        arg_param_begin,
+        arg_lit0("v", "verbose",                     "Show more output"),
+        arg_str0("k",  "key", "<hex>",               "Key for computing the MAC, must be HEX 16(AES)"),
+        arg_str0("b",  "blk", "<num>[,<num>[,...]]", "The MFC blocks to map, must be given in ascending order (use the special value 'all' for all blocks)"),
+        arg_lit0(NULL, "ka",                         "Allow updating key A from inside sector trailers mapped to DESFire files"),
+        arg_lit0(NULL, "kb",                         "Allow updating key B from inside sector trailers mapped to DESFire files"),
+        arg_lit0(NULL, "restrict",                   "Allow the restriction of data updates by the MFC side"),
+        arg_lit0(NULL, "map",                        "Allow mapping the blocks to DESFire files"),
+        arg_lit0(NULL, "access-conditions",          "Allow updating the access conditions from inside sector trailers mapped to DESFire files"),
+        arg_str0("r",  "raw", "<hex>",               "Raw license in case not all blocks should have the same permissions, of the form num_blocks||block1nr||block1perm||block2nr||block2perm||..."),
+        arg_str0(NULL, "mfc-keys", "<hex>",          "The concatenated MFC sector keys, one (if key B is readable) or two per sector"),
+        arg_lit0("s",  "save",                       "Save the license and license MAC for the next commands in this session"),
+        arg_param_end
+    };
+    CLIExecWithReturn(ctx, Cmd, argtable, false);
+
+    logLevel_t loglevel = arg_get_lit(ctx, 1) ? INFO : DEBUG;
+    bool allow_key_a_update = arg_get_lit(ctx, 4);
+    bool allow_key_b_update = arg_get_lit(ctx, 5);
+    bool allow_restrict = arg_get_lit(ctx, 6);
+    bool allow_map = arg_get_lit(ctx, 7);
+    bool allow_ac = arg_get_lit(ctx, 8);
+    bool save = arg_get_lit(ctx, 11);
+    struct arg_str *key_arg = arg_get_str(ctx, 2);
+    struct arg_str *blk_str_arg = arg_get_str(ctx, 3);
+    struct arg_str *raw_arg = arg_get_str(ctx, 9);
+    struct arg_str *mfc_keys_arg = arg_get_str(ctx, 10);
+
+    bool has_raw = raw_arg->count == 1;
+    bool use_default_keys;
+    uint8_t license[192];
+    int license_len = 0;
+    size_t num_sectors;
+    uint8_t mfc_keys[192];
+    int mfc_keys_len = 0;
+    uint8_t mac_key[16];
+    int mac_key_len = 0;
+
+    if (key_arg->count != 1) {
+        PrintAndLogEx(ERR, "Exactly one instance of --key is required");
+        goto mfclicense_parsing_error;
+    }
+    if (CLIParamHexToBuf(key_arg, mac_key, sizeof(mac_key), &mac_key_len) != 0) {
+        goto mfclicense_parsing_error;
+    }
+    if (mac_key_len != 16) {
+        PrintAndLogEx(ERR, "The MFC License MAC key must be exactly 16 bytes");
+        goto mfclicense_parsing_error;
+    }
+
+    switch (mfc_keys_arg->count) {
+        case 0:
+            use_default_keys = true;
+            break;
+        case 1:
+            use_default_keys = false;
+            break;
+        default:
+            PrintAndLogEx(ERR, "At most instance of --mfc-keys is required");
+            goto mfclicense_parsing_error;
+    }
+
+    if (raw_arg->count + blk_str_arg->count != 1) {
+        PrintAndLogEx(ERR, "Exactly one of --raw or --blk are needed");
+        goto mfclicense_parsing_error;
+    }
+
+    if (has_raw) {
+        if (CLIParamHexToBuf(raw_arg, license, sizeof(license), &license_len) != 0) {
+            goto mfclicense_parsing_error;
+        }
+        if (allow_key_a_update || allow_key_b_update || allow_restrict || allow_map || allow_ac) {
+            PrintAndLogEx(WARNING, "Permission flags are not used when --raw is used");
+        }
+
+        // Verify the license
+        size_t num_blocks = license[0];
+        if (license_len != 2 * num_blocks + 1) {
+            PrintAndLogEx(ERR, "Invalid number of blocks in the license");
+            goto mfclicense_parsing_error;
+        }
+
+        uint8_t last_sector = license[1] / 4;
+        num_sectors = 1;
+        int last_block = -1;
+
+        for (int i = 0; i < num_blocks; i++) {
+            uint8_t block_nr = license[1 + 2 * i];
+            uint8_t permissions = license[1 + 2 * i + 1];
+
+            if (block_nr / 4 != last_sector) {
+                num_sectors++;
+                last_sector = block_nr / 4;
+            }
+
+            if (block_nr <= last_block) {
+                PrintAndLogEx(ERR, "Blocks must be unique and sorted in ascending order");
+                goto mfclicense_parsing_error;
+            }
+            last_block = block_nr;
+
+            if (block_nr >= 64) {
+                PrintAndLogEx(ERR, "Invalid block number %d", block_nr);
+                goto mfclicense_parsing_error;
+            }
+
+            if ((((block_nr + 1) % 4 == 0) && (permissions & ~MFDES_EV3C_ALLOWED_TRAILER_PERMISSIONS)) ||
+                    (((block_nr + 1) % 4 != 0) && (permissions & ~MFDES_EV3C_ALLOWED_DATA_PERMISSIONS)))  {
+                PrintAndLogEx(ERR, "Invalid permissions %02X", permissions);
+                goto mfclicense_parsing_error;
+            }
+
+            PrintAndLogEx(loglevel, "[%d] Block %d: permissions %02X", i, block_nr, permissions);
+        }
+    } else {
+        uint8_t blocks[64];
+        size_t num_blocks = 0;
+
+        if (strcmp("all", blk_str_arg->sval[0]) == 0) {
+            PrintAndLogEx(loglevel, "Using all blocks");
+            for (int i = 0; i < 64; i++) {
+                blocks[i] = i;
+            }
+            num_blocks = 64;
+        } else {
+            if (parse_mfc_blocks(blk_str_arg->sval[0], blocks, &num_blocks, true) != PM3_SUCCESS) {
+                goto mfclicense_parsing_error;
+            }
+        }
+
+        uint8_t data_permissions = 0;
+        uint8_t trailer_permissions = 0;
+        if (allow_map) {
+            data_permissions |= 0x01;
+            trailer_permissions |= 0x01;
+        }
+        if (allow_key_b_update) {
+            trailer_permissions |= 0x02;
+        }
+        if (allow_ac) {
+            trailer_permissions |= 0x04;
+        }
+        if (allow_key_a_update) {
+            trailer_permissions |= 0x08;
+        }
+        if (allow_restrict) {
+            data_permissions |= 0x10;
+            trailer_permissions |= 0x10;
+        }
+
+        uint8_t last_sector = blocks[0] / 4;
+        num_sectors = 1;
+        license[0] = num_blocks;
+        for (int i = 0; i < num_blocks; i++) {
+            if (blocks[i] / 4 != last_sector) {
+                num_sectors++;
+                last_sector = blocks[i] / 4;
+            }
+
+            license[1 + 2 * i] = blocks[i];
+            if ((blocks[i] + 1) % 4 == 0) {
+                // mapping a trailer block
+                license[1 + 2 * i + 1] = trailer_permissions;
+            } else {
+                // mapping a data block
+                license[1 + 2 * i + 1] = data_permissions;
+            }
+            PrintAndLogEx(loglevel, "[%d] Block %d: permissions %02X", i, license[1 + 2 * i], license[1 + 2 * i + 1]);
+        }
+        license_len = 1 + 2 * num_blocks;
+    }
+
+    PrintAndLogEx(loglevel, "Covering %lu sector%s in total", num_sectors, num_sectors != 1 ? "s" : "");
+
+    if (use_default_keys) {
+        // by default: all key A FFFFFFFFFFFF, all key B readable
+        memset(mfc_keys, '\xFF', 6 * num_sectors);
+        mfc_keys_len = 6 * num_sectors;
+    } else {
+        if (CLIParamHexToBuf(mfc_keys_arg, mfc_keys, sizeof(mfc_keys), &mfc_keys_len) != 0) {
+            goto mfclicense_parsing_error;
+        }
+        if (mfc_keys_len % 6 != 0) {
+            PrintAndLogEx(ERR, "MFC keys length must be a multiple of 6 bytes");
+            goto mfclicense_parsing_error;
+        }
+        // Quick sanity check: do we have more or less the right number of keys for the number of sectors?
+        if (mfc_keys_len / 6 < num_sectors || (mfc_keys_len / 6) > 2 * num_sectors) {
+            PrintAndLogEx(ERR, "Not enough or too many keys for the number of sectors (expecting 1 or 2 keys per sector)");
+            goto mfclicense_parsing_error;
+        }
+    }
+
+    CLIParserFree(ctx);
+
+    // Compute the MAC
+    uint8_t license_mac_data[384];
+    uint8_t mac[8];
+    license_mac_data[0] = 0x01;
+    memcpy(license_mac_data + 1, license, license_len);
+    memcpy(license_mac_data + 1 + license_len, mfc_keys, mfc_keys_len);
+
+    aes_cmac8(NULL, mac_key, license_mac_data, mac, 1 + license_len + mfc_keys_len);
+
+    PrintAndLogEx(INFO, "License: %s", sprint_hex_inrow(license, license_len));
+    PrintAndLogEx(INFO, "MAC: %s", sprint_hex_inrow(mac, 8));
+
+    if (save) {
+        memcpy(saved_mfclicense, license, license_len);
+        saved_mfclicense_len = license_len;
+        saved_mfclicense_set = true;
+        memcpy(saved_mfclicense_mac, mac, 8);
+        saved_mfclicense_mac_set = true;
+        PrintAndLogEx(INFO, "Saved license and license MAC for the next commands in this session");
+    }
+
+    return PM3_SUCCESS;
+
+mfclicense_parsing_error:
+    CLIParserFree(ctx);
+    return PM3_EINVARG;
+}
+
+static int CmdHF14ADesCreateMFCMapping(const char *Cmd) {
+    CLIParserContext *ctx;
+    CLIParserInit(&ctx, "hf mfdes createmfcmapping",
+                  "Create a Mifare Classic mapping on a DESFire EV3C. The MFC License MAC key (AES only) must have been set previously as PICC key number 50.",
+                  "hf mfdes createmfcmapping --aid 123456 --fid 01 --mfc-keys FFFFFFFFFFFF111111111111222222222222 --mfc-blocks 4,5,6,8\n"
+                  "                    -> Map blocks 4, 5, 6, 8 where sector 1 key A is FFFFFFFFFFFF with key B readable,\n"
+                  "                    -> sector 2 keys are 111111111111 and 222222222222 with key B used for authentication\n");
+
+    void *argtable[] = {
+        arg_param_begin,
+        arg_lit0("a",  "apdu",                            "Show APDU requests and responses"),
+        arg_lit0("v",  "verbose",                         "Verbose output"),
+        arg_int0("n",  "keyno", "<dec>",                  "Key number"),
+        arg_str0("t",  "algo", "<DES|2TDEA|3TDEA|AES>",   "Crypt algo"),
+        arg_str0("k",  "key", "<hex>",                    "Key for authenticate (HEX 8(DES), 16(2TDEA or AES) or 24(3TDEA) bytes)"),
+        arg_str0(NULL, "kdf", "<none|AN10922|gallagher>", "Key Derivation Function (KDF)"),
+        arg_str0("i",  "kdfi", "<hex>",                   "KDF input (1-31 hex bytes)"),
+        arg_str0("m",  "cmode", "<plain|mac|encrypt>",    "Communicaton mode"),
+        arg_str0("c",  "ccset", "<native|niso|iso>",      "Communicaton command set"),
+        arg_str0(NULL, "schann", "<d40|ev1|ev2|lrp>",     "Secure channel"),
+        arg_str0(NULL, "aid", "<hex>",                    "Application ID (3 hex bytes, big endian)"),
+        arg_str0(NULL, "isoid", "<hex>",                  "Application ISO ID (ISO DF ID) (2 hex bytes, big endian)"),
+        arg_str0(NULL, "fid", "<hex>",                    "File ID to map (1 hex byte)"),
+        arg_str0(NULL, "restore-fid", "<hex>",            "Restore source when mapping value files to value blocks (1 hex byte)"),
+        arg_str0("b",  "blk", "<num>[,<num>[,...]]",      "The MFC blocks to map, must be unique (use -b data for all data blocks, and -b trailer for all trailer blocks)"),
+        arg_str0(NULL, "mfc-license", "<hex>",            "The MFC license (omit to use saved license and license MAC)"),
+        arg_str0(NULL, "mfc-license-mac", "<hex>",        "The MFC license MAC (omit to use saved license and license MAC)"),
+        arg_lit0(NULL, "ka",                              "Allow updating key A from inside sector trailers mapped to DESFire files"),
+        arg_lit0(NULL, "kb",                              "Allow updating key B from inside sector trailers mapped to DESFire files"),
+        arg_lit0(NULL, "access-conditions",               "Allow updating the access conditions from inside sector trailers mapped to DESFire files"),
+        arg_lit0(NULL, "restore-transfer",                "Enable the RestoreTransfer command for the mapped value blocks"),
+        arg_param_end
+    };
+    CLIExecWithReturn(ctx, Cmd, argtable, false);
+
+    bool APDULogging = arg_get_lit(ctx, 1);
+    bool verbose = arg_get_lit(ctx, 2);
+    bool key_a = arg_get_lit(ctx, 18);
+    bool key_b = arg_get_lit(ctx, 19);
+    bool ac = arg_get_lit(ctx, 20);
+    bool restore_transfer = arg_get_lit(ctx, 21);
+
+    uint8_t license[192];
+    int license_len;
+    uint8_t license_mac[8];
+
+    bool use_saved_license;
+    struct arg_str *blk_str_arg = arg_get_str(ctx, 15);
+    struct arg_str *mfc_license_arg = arg_get_str(ctx, 16);
+    struct arg_str *mfc_license_mac_arg = arg_get_str(ctx, 17);
+
+    uint32_t restore_fid = -1;
+    uint32_t fid = -1;
+
+    if (!arg_get_u32_hexstr_def_nlen(ctx, 13, 0, &fid, 1, false)) {
+        PrintAndLogEx(ERR, "--fid is required");
+        goto createmfcmapping_parsing_error;
+    }
+    if (!arg_get_u32_hexstr_def_nlen(ctx, 14, 0, &restore_fid, 1, false)) {
+        if (restore_transfer) {
+            PrintAndLogEx(ERR, "--restore-fid is required");
+            goto createmfcmapping_parsing_error;
+        }
+    } else if (!restore_transfer) {
+        PrintAndLogEx(WARNING, "--restore-fid is ignored if --restore-transfer is not specified");
+    }
+
+    PrintAndLogEx(DEBUG, "FID: %02X", fid);
+    PrintAndLogEx(DEBUG, "Restore FID: %02X", restore_fid);
+
+    if (mfc_license_arg->count == 0 && mfc_license_mac_arg->count == 0) {
+        if (!saved_mfclicense_set || !saved_mfclicense_mac_set) {
+            PrintAndLogEx(ERR, "No saved license, create it with hf mfdes makemfclicense --save");
+            goto createmfcmapping_parsing_error;
+        }
+        use_saved_license = true;
+    } else if (mfc_license_arg->count == 1 && mfc_license_mac_arg->count == 1) {
+        use_saved_license = false;
+    } else {
+        PrintAndLogEx(ERR, "--mfc-license and --mfc-license-mac must be given together");
+        goto createmfcmapping_parsing_error;
+    }
+
+    if (use_saved_license) {
+        memcpy(license, saved_mfclicense, saved_mfclicense_len);
+        license_len = saved_mfclicense_len;
+        memcpy(license_mac, saved_mfclicense_mac, 8);
+    } else {
+        if (CLIParamHexToBuf(mfc_license_arg, license, sizeof(license), &license_len) != 0) {
+            goto createmfcmapping_parsing_error;
+        }
+        int license_mac_len = 0;
+        if (CLIParamHexToBuf(mfc_license_mac_arg, license_mac, 8, &license_mac_len) != 0) {
+            goto createmfcmapping_parsing_error;
+        }
+        if (license_mac_len != 8) {
+            PrintAndLogEx(ERR, "The license MAC must be 8 bytes");
+            goto createmfcmapping_parsing_error;
+        }
+    }
+
+    PrintAndLogEx(INFO, "License: %s", sprint_hex_inrow(license, license_len));
+    PrintAndLogEx(INFO, "MAC: %s", sprint_hex_inrow(license_mac, 8));
+
+    if (blk_str_arg->count != 1) {
+        PrintAndLogEx(ERR, "--blk is mandatory");
+        goto createmfcmapping_parsing_error;
+    }
+    // parse blocks
+    uint8_t blocks[64];
+    size_t num_blocks = 0;
+    if (strcmp(blk_str_arg->sval[0], "data") == 0) {
+        for (int i = 0; i < 64; i++) {
+            if (((i + 1) % 4) != 0) {
+                blocks[num_blocks++] = i;
+            }
+        }
+    } else if (strcmp(blk_str_arg->sval[0], "trailer") == 0) {
+        for (int i = 0; i < 64; i++) {
+            if (((i + 1) % 4) == 0) {
+                blocks[num_blocks++] = i;
+            }
+        }
+    } else if (parse_mfc_blocks(blk_str_arg->sval[0], blocks, &num_blocks, false) != PM3_SUCCESS) {
+        goto createmfcmapping_parsing_error;
+    }
+
+    bool trailer = ((blocks[0] + 1) % 4) == 0;
+
+    if (trailer && restore_transfer) {
+        PrintAndLogEx(ERR, "--restore-transfer not allowed on trailer blocks");
+        goto createmfcmapping_parsing_error;
+    } else if (!trailer && (key_a || key_b || ac)) {
+        PrintAndLogEx(ERR, "--key-a, --key-b, --access-conditions not allowed on data/value blocks");
+        goto createmfcmapping_parsing_error;
+    }
+
+    DesfireContext_t dctx = {0};
+    int securechann = 0;
+    uint32_t id = 0x000000;
+    DesfireISOSelectWay selectway = ISW6bAID;
+    int res = CmdDesGetSessionParameters(ctx, &dctx, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 0, &securechann, DCMEncrypted, &id, &selectway);
+    if (res) {
+        CLIParserFree(ctx);
+        return res;
+    }
+
+    CLIParserFree(ctx);
+    SetAPDULogging(APDULogging);
+
+    uint8_t cmd_data[256];
+    size_t cmd_data_len = 0;
+
+    cmd_data[0] = fid & 0x1F;
+    cmd_data[1] = trailer ? 0x01 : 0x00;
+    if (key_a) {
+        cmd_data[1] |= 0x20;
+    }
+    if (key_b) {
+        cmd_data[1] |= 0x08;
+    }
+    if (restore_transfer) {
+        cmd_data[1] |= 0x04;
+    }
+    if (ac) {
+        cmd_data[1] |= 0x10;
+    }
+    cmd_data[2] = num_blocks;
+    cmd_data_len += 3;
+    memcpy(cmd_data + cmd_data_len, blocks, num_blocks);
+    cmd_data_len += num_blocks;
+
+    if (restore_transfer) {
+        cmd_data[cmd_data_len++] = restore_fid & 0x1F;
+    }
+
+    memcpy(cmd_data + cmd_data_len, license, license_len);
+    cmd_data_len += license_len;
+
+    memcpy(cmd_data + cmd_data_len, license_mac, 8);
+    cmd_data_len += 8;
+
+    res = DesfireSelectAndAuthenticateAppW(&dctx, securechann, selectway, id, false, verbose);
+    if (res != PM3_SUCCESS) {
+        DropField();
+        PrintAndLogEx(FAILED, "Select or authentication %s " _RED_("failed") ". Result [%d] %s", DesfireWayIDStr(selectway, id), res, DesfireAuthErrorToStr(res));
+        return res;
+    }
+
+    res = DesfireCreateMFCMapping(&dctx, cmd_data, cmd_data_len);
+    if (res != PM3_SUCCESS) {
+        PrintAndLogEx(FAILED, "Create MFC mapping " _RED_("failed") ". Result 0x%02X", res);
+    }
+    DropField();
+    return res;
+
+createmfcmapping_parsing_error:
+    CLIParserFree(ctx);
+    return PM3_EINVARG;
+}
+
 static int DesfileReadISOFileAndPrint(DesfireContext_t *dctx,
                                       bool select_current_file, uint8_t fnum,
                                       uint16_t fisoid, int filetype,
@@ -5837,6 +7382,7 @@ static int CmdHF14ADesReadData(const char *Cmd) {
                   "hf mfdes read --aid 123456 --fid 10 --type data -c iso -> read file via ISO channel: app=123456, short iso id=10, offset=0.\n"
                   "hf mfdes read --aid 123456 --fileisoid 1000 --type data -c iso -> read file via ISO channel: app=123456, iso id=1000, offset=0. Select via native ISO wrapper\n"
                   "hf mfdes read --isoid 0102 --fileisoid 1000 --type data -c iso -> read file via ISO channel: app iso id=0102, iso id=1000, offset=0. Select via ISO commands\n"
+                  "hf mfdes read --dfname D2760000850100 --fid 01 -> select DF by name and read file 01\n"
                   "hf mfdes read --isoid 0102 --fileisoid 1100 --type record -c iso --offset 000005 --length 000001 -> get one record (number 5) from file 1100 via iso commands\n"
                   "hf mfdes read --isoid 0102 --fileisoid 1100 --type record -c iso --offset 000005 --length 000000 -> get all record (from 5 to 1) from file 1100 via iso commands\n"
                   "hf mfdes read --isoid df01 --fid 00 --schann lrp -t aes --length 000010 -> read via lrp channel\n"
@@ -5861,6 +7407,7 @@ static int CmdHF14ADesReadData(const char *Cmd) {
         arg_str0("o", "offset",   "<hex>", "File Offset (3 hex bytes, big endian). For records - record number (0 - lastest record). (def: 0)"),
         arg_str0("l", "length",   "<hex>", "Length to read (3 hex bytes, big endian -> 000000 = Read all data). For records - records count (0 - all). (def: 0)"),
         arg_str0(NULL, "isoid",     "<hex>", "Application ISO ID (ISO DF ID) (2 hex bytes, big endian)"),
+        arg_str0(NULL, "dfname",    "<hex>", "Application ISO DF Name (1-16 hex bytes, big endian)"),
         arg_str0(NULL, "fileisoid", "<hex>", "File ISO ID (ISO DF ID) (2 hex bytes, big endian). Works only for ISO read commands"),
         arg_lit0(NULL, "isochain", "use iso chaining commands. Switched on by default if secure channel = lrp"),
         arg_param_end
@@ -5875,7 +7422,7 @@ static int CmdHF14ADesReadData(const char *Cmd) {
     int securechann = defaultSecureChannel;
     uint32_t id = 0x000000;
     DesfireISOSelectWay selectway = ISW6bAID;
-    int res = CmdDesGetSessionParameters(ctx, &dctx, 3, 4, 5, 6, 7, 8, 9, 10, 11, 17, 0, &securechann, DCMMACed, &id, &selectway);
+    int res = CmdDesGetSessionParameters(ctx, &dctx, 3, 4, 5, 6, 7, 8, 9, 10, 11, 17, 18, &securechann, DCMMACed, &id, &selectway);
     if (res) {
         CLIParserFree(ctx);
         return res;
@@ -5907,12 +7454,12 @@ static int CmdHF14ADesReadData(const char *Cmd) {
 
     uint32_t fileisoid = 0x0000;
     bool fileisoidpresent = false;
-    if (CLIGetUint32Hex(ctx, 18, 0x0000, &fileisoid, &fileisoidpresent, 2, "File ISO ID (for DF) must have 2 bytes length")) {
+    if (CLIGetUint32Hex(ctx, 19, 0x0000, &fileisoid, &fileisoidpresent, 2, "File ISO ID (for DF) must have 2 bytes length")) {
         CLIParserFree(ctx);
         return PM3_EINVARG;
     }
 
-    dctx.isoChaining = arg_get_lit(ctx, 19);
+    dctx.isoChaining = arg_get_lit(ctx, 20);
 
     SetAPDULogging(APDULogging);
     CLIParserFree(ctx);
@@ -6595,6 +8142,1604 @@ static int CmdHF14ADesDump(const char *Cmd) {
     return PM3_SUCCESS;
 }
 
+static bool MfdSelectionHasAny(const mfd_app_select *select) {
+    return select != NULL && (select->dfname_present || select->isoid_present || select->aid_present);
+}
+
+static mfd_app_select MfdSelectionInitAID(uint32_t aid) {
+    mfd_app_select select = {0};
+    select.aid_present = true;
+    select.aid = aid;
+    return select;
+}
+
+static mfd_app_select MfdSelectionInitDFName(const uint8_t *dfname, size_t dfname_len) {
+    mfd_app_select select = {0};
+    if (dfname != NULL && dfname_len > 0 && dfname_len <= sizeof(select.dfname)) {
+        select.dfname_present = true;
+        select.dfname_len = (uint8_t)dfname_len;
+        memcpy(select.dfname, dfname, dfname_len);
+    }
+    return select;
+}
+
+static int MfdSelectionApplyCmdParameters(CLIParserContext *ctx, uint8_t aidid, uint8_t isoidid, uint8_t dfnameid, mfd_app_select *select) {
+
+    if (ctx == NULL || select == NULL) {
+        return PM3_EINVARG;
+    }
+
+    mfd_app_select cmd_select = {0};
+
+    if (dfnameid) {
+        uint8_t dfname[64] = {0};
+        int dfname_len = 0;
+        if (CLIParamHexToBuf(arg_get_str(ctx, dfnameid), dfname, sizeof(dfname), &dfname_len)) {
+            return PM3_EINVARG;
+        }
+
+        if (dfname_len > 0) {
+
+            if (dfname_len > (int)sizeof(cmd_select.dfname)) {
+                PrintAndLogEx(ERR, "DF name must be 1-16 bytes, got %d", dfname_len);
+                return PM3_EINVARG;
+            }
+
+            cmd_select.dfname_present = true;
+            cmd_select.dfname_len = dfname_len;
+            memcpy(cmd_select.dfname, dfname, dfname_len);
+        }
+    }
+
+    if (isoidid) {
+        uint32_t isoid = 0;
+        bool isoid_present = false;
+        if (CLIGetUint32Hex(ctx, isoidid, 0x0000, &isoid, &isoid_present, 2, "Application ISO ID (ISO DF FID) must have 2 bytes length") != PM3_SUCCESS) {
+            return PM3_EINVARG;
+        }
+
+        if (isoid_present) {
+            cmd_select.isoid_present = true;
+            cmd_select.isoid = isoid & 0xFFFFU;
+        }
+    }
+
+    if (aidid) {
+        uint8_t aid_bytes[3] = {0};
+        int aid_len = 0;
+        CLIGetHexWithReturn(ctx, aidid, aid_bytes, &aid_len);
+        if (CLIParamHexToBuf(arg_get_str(ctx, aidid), aid_bytes, sizeof(aid_bytes), &aid_len)) {
+            return PM3_EINVARG;
+        }
+
+        if (aid_len > 0) {
+
+            if (aid_len != (int)sizeof(aid_bytes)) {
+                PrintAndLogEx(ERR, "AID must be exactly 3 bytes, got %d", aid_len);
+                return PM3_EINVARG;
+            }
+
+            cmd_select.aid_present = true;
+            cmd_select.aid = DesfireAIDByteToUint(aid_bytes);
+        }
+    }
+
+    if (MfdSelectionHasAny(&cmd_select)) {
+        *select = cmd_select;
+    }
+
+    return PM3_SUCCESS;
+}
+
+static void MfdSelectionPrint(const mfd_app_select *select) {
+    if (select == NULL) {
+        return;
+    }
+    if (select->dfname_present) {
+        PrintAndLogEx(INFO, "DF name...... " _YELLOW_("%s"), sprint_hex_inrow(select->dfname, select->dfname_len));
+    }
+    if (select->isoid_present) {
+        PrintAndLogEx(INFO, "ISO DF ID.... " _YELLOW_("%04X"), select->isoid);
+    }
+    if (select->aid_present) {
+        uint8_t aid_bytes[3] = {0};
+        DesfireAIDUintToByte(select->aid, aid_bytes);
+        PrintAndLogEx(INFO, "AID.......... " _YELLOW_("%02X%02X%02X"), aid_bytes[0], aid_bytes[1], aid_bytes[2]);
+    }
+}
+
+static void MfdSelectionPrintPrefixed(const mfd_app_select *select, const char *prefix) {
+    if (select == NULL) {
+        return;
+    }
+    if (prefix == NULL) {
+        prefix = "";
+    }
+    if (select->dfname_present) {
+        PrintAndLogEx(INFO, "%sDF name...........: " _YELLOW_("%s"), prefix, sprint_hex_inrow(select->dfname, select->dfname_len));
+    }
+    if (select->isoid_present) {
+        PrintAndLogEx(INFO, "%sISO DF ID.........: " _YELLOW_("%04X"), prefix, select->isoid);
+    }
+    if (select->aid_present) {
+        uint8_t aid_bytes[3] = {0};
+        DesfireAIDUintToByte(select->aid, aid_bytes);
+        PrintAndLogEx(INFO, "%sAID...............: " _YELLOW_("%02X%02X%02X"), prefix, aid_bytes[0], aid_bytes[1], aid_bytes[2]);
+    }
+}
+
+static int MfdSelectionSelectApplicationEx(DesfireContext_t *dctx, const mfd_app_select *select, bool verbose, bool fieldon) {
+    if (dctx == NULL || MfdSelectionHasAny(select) == false) {
+        return PM3_EINVARG;
+    }
+
+    if (select->dfname_present) {
+        uint8_t resp[250] = {0};
+        size_t resplen = 0;
+        if (DesfireISOSelectEx(dctx, fieldon, ISSDFName, (uint8_t *)select->dfname, select->dfname_len, resp, &resplen) != PM3_SUCCESS) {
+            PrintAndLogEx(ERR, "Select DF name " _RED_("failed"));
+            return PM3_ESOFT;
+        }
+        fieldon = false;
+    }
+
+    if (select->isoid_present) {
+        if (DesfireSelectEx(dctx, fieldon, ISWIsoID, select->isoid, NULL) != PM3_SUCCESS) {
+            PrintAndLogEx(ERR, "Select ISO DF ID %04X " _RED_("failed"), select->isoid);
+            return PM3_ESOFT;
+        }
+        fieldon = false;
+    }
+
+    if (select->aid_present) {
+        if (DesfireSelectEx(dctx, fieldon, ISW6bAID, select->aid, NULL) != PM3_SUCCESS) {
+            uint8_t aid_bytes[3] = {0};
+            DesfireAIDUintToByte(select->aid, aid_bytes);
+            PrintAndLogEx(ERR, "Select application %02X%02X%02X " _RED_("failed"),
+                          aid_bytes[0], aid_bytes[1], aid_bytes[2]);
+            return PM3_ESOFT;
+        }
+    }
+
+    if (verbose) {
+        PrintAndLogEx(SUCCESS, "Application selected " _GREEN_("ok"));
+    }
+    return PM3_SUCCESS;
+}
+
+static int MfdSelectionSelectApplication(DesfireContext_t *dctx, const mfd_app_select *select, bool verbose) {
+    return MfdSelectionSelectApplicationEx(dctx, select, verbose, true);
+}
+
+// Build and send ISO Internal Authenticate (INS 88), then parse the TLV response.
+// Assumes the application is already selected.
+// On PM3_SUCCESS: out_card_random[DUOX_INTAUTH_CHALLENGE_LEN] and out_sig_rs[DUOX_INTAUTH_SIG_LEN] are filled.
+static int duox_intauth_exchange(bool apdu_logging, bool verbose, uint8_t keynum,
+                                 const uint8_t *challenge,
+                                 uint8_t *out_card_random, uint8_t *out_sig_rs) {
+    // Build ISO Internal Authenticate APDU
+    //
+    // Data field:
+    //   80 00           - OptsA TLV (tag=0x80, len=0x00, empty value)
+    //   7C 12           - Dynamic Authentication Data wrapper (tag=0x7C, len=18)
+    //     81 10 [16B]   - Challenge TLV (tag=0x81, len=16, value=RndA)
+    //
+    // APDU: CLA=00 INS=88 P1=00 P2=00 Lc=16 [data] Le=00
+    static const uint8_t optsa_tlv[] = {DUOX_TAG_OPTSA, 0x00};
+    uint8_t apdu_data[22];
+    size_t apdu_data_len = 0;
+
+    memcpy(apdu_data, optsa_tlv, 2);
+    apdu_data_len += 2;
+    apdu_data[apdu_data_len++] = DUOX_TAG_DYNAMIC_AUTH_DATA;
+    apdu_data[apdu_data_len++] = 2 + DUOX_INTAUTH_CHALLENGE_LEN;
+    apdu_data[apdu_data_len++] = DUOX_TAG_CHALLENGE;
+    apdu_data[apdu_data_len++] = DUOX_INTAUTH_CHALLENGE_LEN;
+    memcpy(apdu_data + apdu_data_len, challenge, DUOX_INTAUTH_CHALLENGE_LEN);
+    apdu_data_len += DUOX_INTAUTH_CHALLENGE_LEN;
+
+    // Encode full APDU: 00 88 00 [keynum] [Lc] [data] 00
+    sAPDU_t apdu = {0x00, ISO7816_INTERNAL_AUTHENTICATION, 0x00, keynum, apdu_data_len, apdu_data};
+    uint8_t encoded[50] = {0};
+    int encoded_len = 0;
+    if (APDUEncodeS(&apdu, false, APDU_INCLUDE_LE_00, encoded, &encoded_len)) {
+        PrintAndLogEx(ERR, "APDU encoding error");
+        return PM3_ESOFT;
+    }
+
+    if (apdu_logging)
+        PrintAndLogEx(SUCCESS, ">>>> %s", sprint_hex(encoded, encoded_len));
+
+    uint8_t response[PM3_CMD_DATA_SIZE] = {0};
+    int resplen = 0;
+    int res = ExchangeAPDU14a(encoded, encoded_len, false, true, response, sizeof(response), &resplen);
+    if (res != PM3_SUCCESS) {
+        PrintAndLogEx(ERR, "APDU exchange " _RED_("failed") " (%d)", res);
+        return res;
+    }
+
+    if (apdu_logging)
+        PrintAndLogEx(SUCCESS, "<<<< %s", sprint_hex(response, resplen));
+
+    // Check status word
+    if (resplen < 2) {
+        PrintAndLogEx(ERR, "Response too short");
+        return PM3_ESOFT;
+    }
+
+    uint16_t sw = get_sw(response, resplen);
+    if (sw != ISO7816_OK) {
+        PrintAndLogEx(ERR, "Internal Authenticate " _RED_("failed") " (SW=%04X)", sw);
+        return PM3_ESOFT;
+    }
+
+    // Strip SW from response data
+    int resp_data_len = resplen - 2;
+    PrintAndLogEx(SUCCESS, "Internal Authenticate " _GREEN_("ok") " (SW=%04X)", sw);
+
+    if (verbose)
+        PrintAndLogEx(INFO, "Response data: %s", sprint_hex(response, resp_data_len));
+
+    // Parse TLV response
+    // Expected: 7C [len] 81 10 [card_random(16)] 82 [sig_len] [signature]
+    uint8_t *resp = response;
+    if (resp_data_len < 4 || resp[0] != DUOX_TAG_DYNAMIC_AUTH_DATA) {
+        PrintAndLogEx(ERR, "Invalid response: missing 0x7C tag");
+        return PM3_ESOFT;
+    }
+
+    uint8_t outer_len = resp[1];
+    if (outer_len + 2 > resp_data_len) {
+        PrintAndLogEx(ERR, "Invalid response: truncated 0x7C data");
+        return PM3_ESOFT;
+    }
+
+    uint8_t *inner = resp + 2;
+    int inner_len = outer_len;
+    int idx = 0;
+
+    bool card_random_found = false;
+    bool signature_found = false;
+
+    while (idx < inner_len) {
+        if (idx + 2 > inner_len) break;
+        uint8_t tag = inner[idx++];
+        uint8_t tlen = inner[idx++];
+        if (idx + tlen > inner_len) break;
+
+        if (tag == DUOX_TAG_CHALLENGE && tlen == DUOX_INTAUTH_CHALLENGE_LEN) {
+            memcpy(out_card_random, inner + idx, DUOX_INTAUTH_CHALLENGE_LEN);
+            card_random_found = true;
+        } else if (tag == DUOX_TAG_SIGNATURE) {
+            // Signature: raw r||s. Some implementations may return 0x44 bytes with padding.
+            if (tlen >= DUOX_INTAUTH_SIG_LEN) {
+                memcpy(out_sig_rs, inner + idx + (tlen - DUOX_INTAUTH_SIG_LEN), DUOX_INTAUTH_SIG_LEN);
+                signature_found = true;
+            }
+        }
+        idx += tlen;
+    }
+    if (!card_random_found) {
+        PrintAndLogEx(ERR, "Failed to parse card random (tag 0x81) from response");
+        return PM3_ESOFT;
+    }
+    if (!signature_found) {
+        PrintAndLogEx(ERR, "Failed to parse signature (tag 0x82) from response");
+        return PM3_ESOFT;
+    }
+
+    PrintAndLogEx(INFO, "Card random.. " _YELLOW_("%s"), sprint_hex_inrow(out_card_random, DUOX_INTAUTH_CHALLENGE_LEN));
+    PrintAndLogEx(INFO, "Signature r.. " _YELLOW_("%s"), sprint_hex_inrow(out_sig_rs, DUOX_INTAUTH_SIG_LEN / 2));
+    PrintAndLogEx(INFO, "Signature s.. " _YELLOW_("%s"), sprint_hex_inrow(out_sig_rs + DUOX_INTAUTH_SIG_LEN / 2, DUOX_INTAUTH_SIG_LEN / 2));
+    return PM3_SUCCESS;
+}
+
+// Build the Internal Authenticate verify message (F0F0 || OptsA || RndB || RndA)
+// and verify the ECDSA-P256-SHA256 signature. Returns PM3_SUCCESS if valid.
+static int duox_intauth_verify_sig(bool verbose, const uint8_t *pubkey_point,
+                                   const uint8_t *challenge, const uint8_t *card_random,
+                                   const uint8_t *sig_rs) {
+    // Message = F0F0 || OptsA TLV || RndB (card random) || RndA (our challenge)
+    static const uint8_t optsa_tlv[] = {DUOX_TAG_OPTSA, 0x00};
+    uint8_t message[2 + 2 + DUOX_INTAUTH_CHALLENGE_LEN + DUOX_INTAUTH_CHALLENGE_LEN];
+    message[0] = DUOX_INTAUTH_MSG_PREFIX;
+    message[1] = DUOX_INTAUTH_MSG_PREFIX;
+    memcpy(message + 2, optsa_tlv, 2);
+    memcpy(message + 4, card_random, DUOX_INTAUTH_CHALLENGE_LEN);
+    memcpy(message + 20, challenge, DUOX_INTAUTH_CHALLENGE_LEN);
+
+    if (verbose)
+        PrintAndLogEx(INFO, "Verify msg... %s", sprint_hex_inrow(message, sizeof(message)));
+
+    return ecdsa_signature_r_s_verify(
+               MBEDTLS_ECP_DP_SECP256R1,
+               (uint8_t *)pubkey_point,
+               message,
+               (int)sizeof(message),
+               (uint8_t *)sig_rs,
+               DUOX_INTAUTH_SIG_LEN,
+               true // hash message with SHA-256 before verifying
+           );
+}
+
+static int CmdHF14ADesIntAuth(const char *Cmd) {
+    CLIParserContext *ctx;
+    CLIParserInit(&ctx, "hf mfdes intauth",
+                  "Perform ISO Internal Authenticate (ECDSA challenge-response) on MIFARE DUOX.\n"
+                  "Card signs a fresh challenge to prove it possesses its private key.\n"
+                  "Optionally verifies the card's ECDSA-P256 signature with a given public key.",
+                  "hf mfdes intauth                                    -> authenticate with default AID (000000), random challenge\n"
+                  "hf mfdes intauth --aid D61CF5                       -> explicit AID\n"
+                  "hf mfdes intauth --isoid DF01                       -> select by ISO DF FID\n"
+                  "hf mfdes intauth --dfname D2760000850100            -> select by DF name\n"
+                  "hf mfdes intauth -d 00112233445566778899AABBCCDDEEFF -> explicit 16-byte challenge\n"
+                  "hf mfdes intauth -p 04AABB...                       -> verify signature with given EC public key (hex, PEM, DER, file path)\n"
+                  "hf mfdes intauth -n 1                               -> use key number 1\n");
+
+    void *argtable[] = {
+        arg_param_begin,
+        arg_lit0("a",  "apdu",      "Show APDU requests and responses"),            // 1
+        arg_lit0("v",  "verbose",   "Verbose output"),                              // 2
+        arg_str0("d",  "challenge", "<hex>", "Challenge / RndA (16 bytes, random if omitted)"), // 3
+        arg_str0("p",  "pubkey",    "<hex|pem|der|path>", "EC public key for signature verification"), // 4
+        arg_str0(NULL, "aid",       "<hex>", "Application ID (3 bytes, default 000000)"), // 5
+        arg_int0("n",  "keynum",   "<dec>", "Key number (P2, default 0)"),          // 6
+        arg_str0(NULL, "dfname",   "<hex>", "Application ISO DF Name (1-16 hex bytes)"), // 7
+        arg_str0(NULL, "isoid",    "<hex>", "Application ISO ID / ISO DF FID (2 bytes)"), // 8
+        arg_param_end
+    };
+    CLIExecWithReturn(ctx, Cmd, argtable, true);
+
+    bool APDULogging = arg_get_lit(ctx, 1);
+    bool verbose = arg_get_lit(ctx, 2);
+
+    // Parse challenge
+    uint8_t challenge[DUOX_INTAUTH_CHALLENGE_LEN] = {0};
+    int challenge_len = 0;
+    CLIGetHexWithReturn(ctx, 3, challenge, &challenge_len);
+    bool challenge_provided = (challenge_len > 0);
+
+    if (challenge_provided && challenge_len != DUOX_INTAUTH_CHALLENGE_LEN) {
+        PrintAndLogEx(ERR, "Challenge must be exactly 16 bytes, got %d", challenge_len);
+        CLIParserFree(ctx);
+        return PM3_EINVARG;
+    }
+
+    // Parse public key input (flexible: hex, PEM, DER, file path)
+    char pubkey_input[DUOX_MAX_KEY_INPUT] = {0};
+    int pubkey_input_len = 0;
+    CLIParamStrToBuf(arg_get_str(ctx, 4), (uint8_t *)pubkey_input, sizeof(pubkey_input) - 1, &pubkey_input_len);
+
+    bool pubkey_provided = (pubkey_input_len > 0);
+
+    int keynum = arg_get_int_def(ctx, 6, 0);
+    if (keynum < 0 || keynum > 255) {
+        PrintAndLogEx(ERR, "Key number must be 0..255");
+        CLIParserFree(ctx);
+        return PM3_EINVARG;
+    }
+
+    mfd_app_select app_select = MfdSelectionInitAID(0x000000);
+    if (MfdSelectionApplyCmdParameters(ctx, 5, 8, 7, &app_select) != PM3_SUCCESS) {
+        CLIParserFree(ctx);
+        return PM3_EINVARG;
+    }
+
+    SetAPDULogging(APDULogging);
+    CLIParserFree(ctx);
+
+    // Load and validate public key if provided
+    uint8_t pubkey_point[65] = {0}; // 04 || X || Y
+    if (pubkey_provided) {
+        int pk_res = ensure_ec_public_key(pubkey_input, MBEDTLS_ECP_DP_SECP256R1, pubkey_point, sizeof(pubkey_point));
+        if (pk_res != PM3_SUCCESS) {
+            PrintAndLogEx(ERR, "Failed to load EC public key");
+            PrintAndLogEx(INFO, "Accepted formats: raw hex (64/65/33 bytes), PEM, DER, base64, or file path");
+            return pk_res;
+        }
+    }
+
+    // Generate random challenge if not provided
+    if (!challenge_provided) {
+        int res = pcrypto_rng_fill_oneshot(challenge, sizeof(challenge), "hf_mfdes_intauth");
+        if (res != PM3_SUCCESS) {
+            PrintAndLogEx(ERR, "Failed to generate random challenge");
+            return res;
+        }
+    }
+
+    PrintAndLogEx(INFO, "--- " _CYAN_("ISO Internal Authenticate"));
+    PrintAndLogEx(INFO, "Challenge.... " _YELLOW_("%s"), sprint_hex_inrow(challenge, DUOX_INTAUTH_CHALLENGE_LEN));
+    if (verbose) {
+        MfdSelectionPrint(&app_select);
+        PrintAndLogEx(INFO, "Key number... " _YELLOW_("%d"), keynum);
+    }
+
+    // Step 1: Select application using the requested/default route.
+    DesfireContext_t dctx = {0};
+    dctx.commMode = DCMPlain;
+    dctx.cmdSet = DCCNativeISO;
+
+    if (MfdSelectionSelectApplication(&dctx, &app_select, verbose) != PM3_SUCCESS) {
+        DropField();
+        return PM3_ESOFT;
+    }
+    // Step 2: Build ISO Internal Authenticate APDU
+    // Step 3: Parse TLV response
+
+    uint8_t card_random[DUOX_INTAUTH_CHALLENGE_LEN] = {0};
+    uint8_t signature_rs[DUOX_INTAUTH_SIG_LEN] = {0};
+    int res = duox_intauth_exchange(APDULogging, verbose, (uint8_t)keynum, challenge, card_random, signature_rs);
+    DropField();
+    if (res != PM3_SUCCESS)
+        return res;
+
+    // Step 4: Verify signature if public key provided
+    if (pubkey_provided) {
+        PrintAndLogEx(INFO, "--- " _CYAN_("Signature Verification"));
+        int sig_res = duox_intauth_verify_sig(verbose, pubkey_point, challenge, card_random, signature_rs);
+        if (sig_res == PM3_SUCCESS) {
+            PrintAndLogEx(SUCCESS, "ECDSA signature " _GREEN_("verified"));
+        } else {
+            PrintAndLogEx(ERR, "ECDSA signature " _RED_("verification failed"));
+        }
+    }
+
+    return PM3_SUCCESS;
+}
+
+static int CmdHF14ADesVdeSign(const char *Cmd) {
+    CLIParserContext *ctx;
+    CLIParserInit(&ctx, "hf mfdes vdesign",
+                  "Perform VDE_ECDSASign on MIFARE DUOX EV charging application.\n"
+                  "Card signs a 32-byte challenge with the EV charging key (KeyNo 0x00).\n"
+                  "Optionally verifies the returned ECDSA signature with a BrainpoolP256r1 public key.",
+                  "hf mfdes vdesign                                             -> sign random 32-byte challenge using default EV DF name\n"
+                  "hf mfdes vdesign --aid 1010F6                                -> select EV app by native AID\n"
+                  "hf mfdes vdesign --isoid 00DF                               -> select EV app by ISO DF FID\n"
+                  "hf mfdes vdesign --dfname A0000008450000000000000000000001   -> select EV app by ISO DF name\n"
+                  "hf mfdes vdesign -d 00112233445566778899AABBCCDDEEFF00112233445566778899AABBCCDDEEFF -> explicit 32-byte challenge\n"
+                  "hf mfdes vdesign -p 04A7C6...                                -> verify signature with given EC public key (hex, PEM, DER, file path)\n");
+
+    void *argtable[] = {
+        arg_param_begin,
+        arg_lit0("a",  "apdu",      "Show APDU requests and responses"),            // 1
+        arg_lit0("v",  "verbose",   "Verbose output"),                              // 2
+        arg_str0("d",  "challenge", "<hex>", "Challenge to sign (32 bytes, random if omitted)"), // 3
+        arg_str0("p",  "pubkey",    "<hex|pem|der|path>", "BrainpoolP256r1 public key for signature verification"), // 4
+        arg_str0(NULL, "aid",       "<hex>", "Application ID (3 bytes, native DESFire select)"), // 5
+        arg_str0(NULL, "isoid",     "<hex>", "Application ISO ID / ISO DF FID (2 bytes)"), // 6
+        arg_str0(NULL, "dfname",    "<hex>", "Application ISO DF Name (1-16 hex bytes, default EV DF name)"), // 7
+        arg_param_end
+    };
+    CLIExecWithReturn(ctx, Cmd, argtable, true);
+
+    bool APDULogging = arg_get_lit(ctx, 1);
+    bool verbose = arg_get_lit(ctx, 2);
+
+    uint8_t challenge[DUOX_VDE_CHALLENGE_LEN] = {0};
+    int challenge_len = 0;
+    CLIGetHexWithReturn(ctx, 3, challenge, &challenge_len);
+    bool challenge_provided = (challenge_len > 0);
+    if (challenge_provided && challenge_len != DUOX_VDE_CHALLENGE_LEN) {
+        PrintAndLogEx(ERR, "Challenge must be exactly 32 bytes, got %d", challenge_len);
+        CLIParserFree(ctx);
+        return PM3_EINVARG;
+    }
+
+    char pubkey_input[DUOX_MAX_KEY_INPUT] = {0};
+    int pubkey_input_len = 0;
+    CLIParamStrToBuf(arg_get_str(ctx, 4), (uint8_t *)pubkey_input, sizeof(pubkey_input) - 1, &pubkey_input_len);
+    bool pubkey_provided = (pubkey_input_len > 0);
+
+    mfd_app_select app_select = MfdSelectionInitDFName(kDuoxVDEDefaultDFName, ARRAYLEN(kDuoxVDEDefaultDFName));
+    if (MfdSelectionApplyCmdParameters(ctx, 5, 6, 7, &app_select) != PM3_SUCCESS) {
+        CLIParserFree(ctx);
+        return PM3_EINVARG;
+    }
+
+    SetAPDULogging(APDULogging);
+    CLIParserFree(ctx);
+
+    uint8_t pubkey_point[65] = {0}; // 04 || X || Y
+    if (pubkey_provided) {
+        int pk_res = ensure_ec_public_key(pubkey_input, MBEDTLS_ECP_DP_BP256R1, pubkey_point, sizeof(pubkey_point));
+        if (pk_res != PM3_SUCCESS) {
+            PrintAndLogEx(ERR, "Failed to load BrainpoolP256r1 public key");
+            PrintAndLogEx(INFO, "Accepted formats: raw hex (64/65/33 bytes), PEM, DER, base64, or file path");
+            return pk_res;
+        }
+    }
+
+    if (!challenge_provided) {
+        int res = pcrypto_rng_fill_oneshot(challenge, sizeof(challenge), "hf_mfdes_vdesign");
+        if (res != PM3_SUCCESS) {
+            PrintAndLogEx(ERR, "Failed to generate random challenge");
+            return res;
+        }
+    }
+
+    PrintAndLogEx(INFO, "--- " _CYAN_("VDE_ECDSASign"));
+    if (verbose) {
+        MfdSelectionPrint(&app_select);
+    }
+
+    DesfireContext_t dctx = {0};
+    dctx.commMode = DCMPlain;
+    dctx.cmdSet = DCCNativeISO;
+
+    if (MfdSelectionSelectApplication(&dctx, &app_select, verbose) != PM3_SUCCESS) {
+        DropField();
+        return PM3_ESOFT;
+    }
+    PrintAndLogEx(INFO, "Challenge.... " _YELLOW_("%s"), sprint_hex_inrow(challenge, sizeof(challenge)));
+
+    sAPDU_t apdu = {0x80, 0x03, 0x0C, 0x09, sizeof(challenge), challenge};
+    uint8_t encoded[64] = {0};
+    int encoded_len = 0;
+    if (APDUEncodeS(&apdu, false, APDU_INCLUDE_LE_00, encoded, &encoded_len)) {
+        PrintAndLogEx(ERR, "APDU encoding error");
+        DropField();
+        return PM3_ESOFT;
+    }
+
+    if (APDULogging)
+        PrintAndLogEx(SUCCESS, ">>>> %s", sprint_hex(encoded, encoded_len));
+
+    uint8_t response[PM3_CMD_DATA_SIZE] = {0};
+    int resplen = 0;
+    int res = ExchangeAPDU14a(encoded, encoded_len, false, true, response, sizeof(response), &resplen);
+    if (res != PM3_SUCCESS) {
+        PrintAndLogEx(ERR, "APDU exchange " _RED_("failed") " (%d)", res);
+        DropField();
+        return res;
+    }
+
+    if (APDULogging)
+        PrintAndLogEx(SUCCESS, "<<<< %s", sprint_hex(response, resplen));
+
+    DropField();
+
+    if (resplen < 2) {
+        PrintAndLogEx(ERR, "Response too short");
+        return PM3_ESOFT;
+    }
+
+    uint16_t sw = get_sw(response, resplen);
+    if (sw != ISO7816_OK) {
+        PrintAndLogEx(ERR, "VDE_ECDSASign " _RED_("failed") " (%04X - %s)", sw, GetAPDUCodeDescription(sw >> 8, sw & 0xff));
+        return PM3_ESOFT;
+    }
+
+    int resp_data_len = resplen - 2;
+    if (resp_data_len != DUOX_VDE_SIG_LEN) {
+        PrintAndLogEx(ERR, "Unexpected signature length: %d bytes", resp_data_len);
+        return PM3_ESOFT;
+    }
+
+    uint8_t signature_rs[DUOX_VDE_SIG_LEN] = {0};
+    memcpy(signature_rs, response, sizeof(signature_rs));
+
+    PrintAndLogEx(SUCCESS, "VDE_ECDSASign " _GREEN_("ok") " (SW=%04X)", sw);
+    if (verbose)
+        PrintAndLogEx(INFO, "Signature.... %s", sprint_hex_inrow(signature_rs, sizeof(signature_rs)));
+    PrintAndLogEx(INFO, "Signature r.. " _YELLOW_("%s"), sprint_hex_inrow(signature_rs, DUOX_VDE_SIG_LEN / 2));
+    PrintAndLogEx(INFO, "Signature s.. " _YELLOW_("%s"), sprint_hex_inrow(signature_rs + (DUOX_VDE_SIG_LEN / 2), DUOX_VDE_SIG_LEN / 2));
+
+    if (pubkey_provided) {
+        PrintAndLogEx(INFO, "--- " _CYAN_("Signature Verification"));
+        if (verbose)
+            PrintAndLogEx(INFO, "Verify msg... %s", sprint_hex_inrow(challenge, sizeof(challenge)));
+
+        int sig_res = ecdsa_signature_r_s_verify(
+                          MBEDTLS_ECP_DP_BP256R1,
+                          pubkey_point,
+                          challenge,
+                          (int)sizeof(challenge),
+                          signature_rs,
+                          sizeof(signature_rs),
+                          true
+                      );
+
+        if (sig_res == PM3_SUCCESS) {
+            PrintAndLogEx(SUCCESS, "ECDSA signature " _GREEN_("verified"));
+        } else {
+            PrintAndLogEx(ERR, "ECDSA signature " _RED_("verification failed"));
+        }
+    }
+
+    return PM3_SUCCESS;
+}
+
+// Look up an attribute in a DN by OID. Returns pointer to mbedtls value buf or NULL.
+static const CLIParserOption mfdesValidateMethodOpts[] = {
+    {MFDES_VALIDATE_METHOD_AUTO, "auto"},
+    {MFDES_VALIDATE_METHOD_INTAUTH, "intauth"},
+    {MFDES_VALIDATE_METHOD_INTAUTH, "internal-auth"},
+    {MFDES_VALIDATE_METHOD_INTAUTH, "internal"},
+    {MFDES_VALIDATE_METHOD_VDE, "vde"},
+    {MFDES_VALIDATE_METHOD_VDE, "vdesign"},
+    {MFDES_VALIDATE_METHOD_VDE, "vde-sign"},
+    {MFDES_VALIDATE_METHOD_SKIP, "skip"},
+    {MFDES_VALIDATE_METHOD_SKIP, "none"},
+    {-1, NULL},
+};
+
+static const CLIParserOption mfdesReadMethodOpts[] = {
+    {MFDES_READ_METHOD_AUTO, "auto"},
+    {MFDES_READ_METHOD_DESFIRE, "desfire"},
+    {-1, NULL},
+};
+
+static const mfdes_certificate_profile_data_t kMfdesVerifyCertLeafCertificateProfileData[] = {
+    {
+        .label = "Open ID",
+        .source = MFDES_VERIFYCERT_CERTIFICATE_PROFILE_DATA_SUBJECT_DN,
+        .dn_component = "serialNumber",
+    },
+    {0},
+};
+
+static const mfdes_verifycert_profile_t kMfdesVerifyCertProfiles[] = {
+    {
+        .names = {"generic"},
+        .cert_select = {.aid_present = true, .aid = 0x000000},
+        .fid = MFDES_VERIFYCERT_NO_FID,
+        .keyidx = 0x00,
+        .validate_methods = {MFDES_VALIDATE_METHOD_INTAUTH, MFDES_VALIDATE_METHOD_VDE},
+    },
+    {
+        .names = {"leaf"},
+        .cert_select = {.aid_present = true, .aid = LEAF_VERIFIED_DEFAULT_AID},
+        .fid = LEAF_VERIFIED_CERT_FILE,
+        .keyidx = 0x00,
+        .validate_methods = {MFDES_VALIDATE_METHOD_INTAUTH},
+        .certificate_profile_data = kMfdesVerifyCertLeafCertificateProfileData,
+    },
+    {
+        .names = {"vde"},
+        .cert_select = {.aid_present = true, .aid = DUOX_VDE_DEFAULT_AID},
+        .fid = DUOX_VDE_CERT_FILE,
+        .keyidx = 0x00,
+        .validate_methods = {MFDES_VALIDATE_METHOD_VDE, MFDES_VALIDATE_METHOD_INTAUTH},
+    },
+    {
+        .names = {"orig", "originality"},
+        .cert_select = {.aid_present = true, .aid = 0x000000},
+        .fid = 0x01,
+        .keyidx = 0x01,
+        .validate_methods = {MFDES_VALIDATE_METHOD_INTAUTH, MFDES_VALIDATE_METHOD_VDE},
+    },
+    {
+        .names = {"picc"},
+        .cert_select = {.aid_present = true, .aid = 0x000000},
+        .fid = 0x00,
+        .keyidx = 0x00,
+        .validate_methods = {MFDES_VALIDATE_METHOD_SKIP},
+    },
+};
+
+static const mfdes_verifycert_profile_t *mfdes_find_verifycert_profile(const char *value) {
+    if (value == NULL || value[0] == '\0') {
+        return &kMfdesVerifyCertProfiles[0];
+    }
+
+    for (size_t i = 0; i < ARRAYLEN(kMfdesVerifyCertProfiles); i++) {
+        const mfdes_verifycert_profile_t *profile = &kMfdesVerifyCertProfiles[i];
+        for (size_t n = 0; n < ARRAYLEN(profile->names); n++) {
+            if (profile->names[n] != NULL && str_equal_case_insensitive(value, profile->names[n])) {
+                return profile;
+            }
+        }
+    }
+    return NULL;
+}
+
+static int mfdes_prepare_data_file_read(DesfireContext_t *dctx, uint8_t fnum, bool noauth, bool verbose, bool *auth_needed) {
+    if (dctx == NULL) {
+        return PM3_EINVARG;
+    }
+    if (auth_needed != NULL) {
+        *auth_needed = false;
+    }
+
+    dctx->isoChaining |= (dctx->secureChannel == DACLRP);
+
+    FileSettings_t fsettings = {0};
+    DesfireCommunicationMode comm_mode = dctx->commMode;
+    DesfireSetCommMode(dctx, DCMMACed);
+    int res = DesfireFileSettingsStruct(dctx, fnum, &fsettings);
+    DesfireSetCommMode(dctx, comm_mode);
+    if (res != PM3_SUCCESS) {
+        PrintAndLogEx(WARNING, "GetFileSettings error. Reading certificate file with current communication mode.");
+        return PM3_SUCCESS;
+    }
+
+    if (fsettings.fileType != 0x00 && fsettings.fileType != 0x01) {
+        PrintAndLogEx(ERR, "Certificate file must be a standard or backup data file, got %s",
+                      GetDesfireFileType(fsettings.fileType));
+        return PM3_EINVARG;
+    }
+
+    bool read_free = (fsettings.rAccess == 0x0e || fsettings.rwAccess == 0x0e);
+    bool read_denied = (fsettings.rAccess == 0x0f && fsettings.rwAccess == 0x0f);
+    bool read_needs_auth = (!read_free && !read_denied && (fsettings.rAccess < 0x0e || fsettings.rwAccess < 0x0e));
+
+    comm_mode = fsettings.commMode;
+    if (read_free && !DesfireIsAuthenticated(dctx)) {
+        comm_mode = DCMPlain;
+    }
+    DesfireSetCommMode(dctx, comm_mode);
+
+    if (fsettings.fileCommMode != 0 && noauth && !read_free) {
+        PrintAndLogEx(WARNING, "File needs communication mode `%s` but there is no authentication",
+                      CLIGetOptionListStr(DesfireCommunicationModeOpts, fsettings.commMode));
+    }
+    if (auth_needed != NULL && read_needs_auth && !DesfireIsAuthenticated(dctx)) {
+        *auth_needed = true;
+    }
+    if ((fsettings.rAccess < 0x0e && fsettings.rAccess != dctx->keyNum) &&
+            (fsettings.rwAccess < 0x0e && fsettings.rwAccess != dctx->keyNum)) {
+        PrintAndLogEx(WARNING, "File needs to be authenticated with key 0x%02x or 0x%02x but current authentication key is 0x%02x",
+                      fsettings.rAccess, fsettings.rwAccess, dctx->keyNum);
+    }
+    if (fsettings.rAccess == 0x0f && fsettings.rwAccess == 0x0f) {
+        PrintAndLogEx(WARNING, "File access denied. All read access rights is 0x0F");
+    }
+
+    if (verbose) {
+        PrintAndLogEx(INFO, _CYAN_("Certificate file type:") " %s  comm mode: %s",
+                      GetDesfireFileType(fsettings.fileType),
+                      CLIGetOptionListStr(DesfireCommunicationModeOpts, fsettings.commMode));
+    }
+    return PM3_SUCCESS;
+}
+
+static int mfdes_read_cert_file_once(const DesfireContext_t *base_dctx, DesfireSecureChannel securechann,
+                                     uint8_t fid, bool authenticate, bool verbose,
+                                     uint8_t *cert_buf, size_t *cert_buf_len, bool *auth_needed) {
+    if (base_dctx == NULL || cert_buf == NULL || cert_buf_len == NULL) {
+        return PM3_EINVARG;
+    }
+
+    DesfireContext_t dctx = *base_dctx;
+    int res = PM3_SUCCESS;
+
+    if (authenticate) {
+        res = DesfireAuthenticate(&dctx, securechann, verbose);
+        if (res != PM3_SUCCESS) {
+            PrintAndLogEx(ERR, "Desfire authenticate " _RED_("error") ". Result: [%d] %s", res, DesfireAuthErrorToStr(res));
+            return res;
+        }
+        if (!DesfireIsAuthenticated(&dctx)) {
+            return 201;
+        }
+    }
+
+    res = mfdes_prepare_data_file_read(&dctx, fid, !authenticate, verbose, auth_needed);
+    if (res != PM3_SUCCESS) {
+        return res;
+    }
+
+    *cert_buf_len = 0;
+    res = DesfireReadFile(&dctx, fid, 0, 0, cert_buf, cert_buf_len);
+    return res;
+}
+
+static int mfdes_read_cert_file_desfire(const DesfireContext_t *base_dctx, DesfireSecureChannel securechann,
+                                        uint8_t fid, bool noauth, bool force_auth, bool verbose,
+                                        uint8_t *cert_buf, size_t *cert_buf_len) {
+    if (base_dctx == NULL || cert_buf == NULL || cert_buf_len == NULL) {
+        return PM3_EINVARG;
+    }
+
+    bool auth_needed = false;
+    int res = PM3_SUCCESS;
+    if (noauth || !force_auth) {
+        res = mfdes_read_cert_file_once(base_dctx, securechann, fid, false, verbose,
+                                        cert_buf, cert_buf_len, &auth_needed);
+        if (res == PM3_SUCCESS) {
+            return PM3_SUCCESS;
+        }
+        if (noauth) {
+            return res;
+        }
+        if (auth_needed) {
+            PrintAndLogEx(INFO, "File settings indicate authentication is needed; retrying with authentication");
+        } else {
+            PrintAndLogEx(WARNING, "Unauthenticated ReadFile failed (%d); retrying with authentication", res);
+        }
+    }
+
+    res = mfdes_read_cert_file_once(base_dctx, securechann, fid, true, verbose,
+                                    cert_buf, cert_buf_len, NULL);
+    return res;
+}
+
+static void mfdes_print_certificate_info(const mfdes_verified_cert_t *cert_info) {
+    if (cert_info == NULL) {
+        return;
+    }
+
+    PrintAndLogEx(INFO, _CYAN_("Certificate"));
+    PrintAndLogEx(INFO, "  format............: " _YELLOW_("%s"), duox_certificate_format_name(cert_info->format));
+    PrintAndLogEx(INFO, "  issuer............: " _YELLOW_("%s"), (cert_info->issuer[0] != '\0') ? cert_info->issuer : "n/a");
+    PrintAndLogEx(INFO, "  subject...........: " _YELLOW_("%s"), (cert_info->subject[0] != '\0') ? cert_info->subject : "n/a");
+    PrintAndLogEx(INFO, "  serial number.....: " _YELLOW_("%s"), (cert_info->serial[0] != '\0') ? cert_info->serial : "n/a");
+    PrintAndLogEx(INFO, "  valid from........: " _YELLOW_("%s"), (cert_info->valid_from[0] != '\0') ? cert_info->valid_from : "n/a");
+    PrintAndLogEx(INFO, "  valid to..........: " _YELLOW_("%s"), (cert_info->valid_to[0] != '\0') ? cert_info->valid_to : "n/a");
+    if (cert_info->certificate_profile_note[0] != '\0') {
+        PrintAndLogEx(INFO, "  profile data......: " _YELLOW_("%s"), cert_info->certificate_profile_note);
+    }
+    for (size_t i = 0; i < cert_info->certificate_profile_data_count && i < ARRAYLEN(cert_info->certificate_profile_data); i++) {
+        const mfdes_certificate_profile_value_t *item = &cert_info->certificate_profile_data[i];
+        if (item->label[0] != '\0' && item->value[0] != '\0') {
+            PrintAndLogEx(INFO, "  profile data......: " _YELLOW_("%s %s"), item->label, item->value);
+        }
+    }
+    PrintAndLogEx(INFO, "  public key........: " _YELLOW_("%s"), (cert_info->pubkey_len > 0) ? sprint_hex_inrow(cert_info->pubkey, cert_info->pubkey_len) : "n/a");
+}
+
+static void mfdes_cert_info_from_duox(const duox_cert_info_t *src, mfdes_verified_cert_t *dst) {
+    if (src == NULL || dst == NULL) {
+        return;
+    }
+
+    memset(dst, 0, sizeof(*dst));
+    dst->format = src->format;
+    dst->curveid = src->curveid;
+    dst->pubkey_len = MIN(src->pubkey_len, sizeof(dst->pubkey));
+    if (dst->pubkey_len > 0) {
+        memcpy(dst->pubkey, src->pubkey, dst->pubkey_len);
+    }
+    snprintf(dst->issuer, sizeof(dst->issuer), "%s", src->issuer);
+    snprintf(dst->subject, sizeof(dst->subject), "%s", src->subject);
+    snprintf(dst->serial, sizeof(dst->serial), "%s", src->serial);
+    snprintf(dst->valid_from, sizeof(dst->valid_from), "%s", src->valid_from);
+    snprintf(dst->valid_to, sizeof(dst->valid_to), "%s", src->valid_to);
+    snprintf(dst->certificate_profile_note, sizeof(dst->certificate_profile_note), "%s", src->certificate_profile_note);
+}
+
+static bool mfdes_extract_dn_component(const char *dn, const char *key, char *out, size_t out_len) {
+    if (dn == NULL || key == NULL || out == NULL || out_len == 0) {
+        return false;
+    }
+
+    out[0] = '\0';
+    const char *p = strstr(dn, key);
+    if (p == NULL) {
+        return false;
+    }
+    p += strlen(key);
+    while (*p == ' ' || *p == '=') {
+        p++;
+    }
+    if (*p == '"') {
+        p++;
+    }
+
+    size_t n = 0;
+    while (p[n] != '\0' && p[n] != ',' && p[n] != '"' && n + 1 < out_len) {
+        out[n] = p[n];
+        n++;
+    }
+    out[n] = '\0';
+    return n > 0;
+}
+
+static bool mfdes_add_certificate_profile_data(mfdes_verified_cert_t *cert_info, const char *label, const char *value) {
+    if (cert_info == NULL || label == NULL || value == NULL || value[0] == '\0' ||
+            cert_info->certificate_profile_data_count >= ARRAYLEN(cert_info->certificate_profile_data)) {
+        return false;
+    }
+
+    mfdes_certificate_profile_value_t *item = &cert_info->certificate_profile_data[cert_info->certificate_profile_data_count++];
+    snprintf(item->label, sizeof(item->label), "%s", label);
+    snprintf(item->value, sizeof(item->value), "%s", value);
+    return true;
+}
+
+static void mfdes_apply_certificate_profile_data(const mfdes_verifycert_profile_t *profile, mfdes_verified_cert_t *cert_info) {
+    if (profile == NULL || cert_info == NULL || profile->certificate_profile_data == NULL) {
+        return;
+    }
+
+    cert_info->certificate_profile_data_count = 0;
+    memset(cert_info->certificate_profile_data, 0, sizeof(cert_info->certificate_profile_data));
+
+    for (const mfdes_certificate_profile_data_t *item = profile->certificate_profile_data; item->label != NULL; item++) {
+        if (item->dn_component == NULL) {
+            continue;
+        }
+
+        const char *dn = NULL;
+        switch (item->source) {
+            case MFDES_VERIFYCERT_CERTIFICATE_PROFILE_DATA_SUBJECT_DN:
+                dn = cert_info->subject;
+                break;
+            case MFDES_VERIFYCERT_CERTIFICATE_PROFILE_DATA_ISSUER_DN:
+                dn = cert_info->issuer;
+                break;
+            default:
+                break;
+        }
+        if (dn == NULL || dn[0] == '\0') {
+            continue;
+        }
+
+        char value[DUOX_CERT_TEXT_LEN] = {0};
+        if (mfdes_extract_dn_component(dn, item->dn_component, value, sizeof(value))) {
+            mfdes_add_certificate_profile_data(cert_info, item->label, value);
+        }
+    }
+}
+
+static int mfdes_verify_certificate_variants(const uint8_t *data, size_t data_len,
+                                             const duox_certificate_anchor_t *ca_anchors, size_t ca_anchor_count,
+                                             bool verify_signature,
+                                             bool verbose, mfdes_verified_cert_t *out, size_t *matched_index) {
+    duox_cert_info_t cert = {0};
+    int res = duox_parse_or_verify_certificate_variants(data, data_len,
+                                                        ca_anchors, ca_anchor_count,
+                                                        verify_signature,
+                                                        verbose, &cert, matched_index);
+    if (res == PM3_SUCCESS || res == PM3_ECRYPTO) {
+        mfdes_cert_info_from_duox(&cert, out);
+    }
+    return res;
+}
+
+static int duox_vde_sign_exchange(bool apdu_logging, bool verbose,
+                                  const uint8_t challenge[DUOX_VDE_CHALLENGE_LEN],
+                                  uint8_t signature_rs[DUOX_VDE_SIG_LEN]) {
+    if (challenge == NULL || signature_rs == NULL) {
+        return PM3_EINVARG;
+    }
+
+    sAPDU_t apdu = {0x80, 0x03, 0x0C, 0x09, DUOX_VDE_CHALLENGE_LEN, (uint8_t *)challenge};
+    uint8_t encoded[64] = {0};
+    int encoded_len = 0;
+    if (APDUEncodeS(&apdu, false, APDU_INCLUDE_LE_00, encoded, &encoded_len)) {
+        PrintAndLogEx(ERR, "APDU encoding error");
+        return PM3_ESOFT;
+    }
+
+    if (apdu_logging) {
+        PrintAndLogEx(SUCCESS, ">>>> %s", sprint_hex(encoded, encoded_len));
+    }
+
+    uint8_t response[PM3_CMD_DATA_SIZE] = {0};
+    int resplen = 0;
+    int res = ExchangeAPDU14a(encoded, encoded_len, false, true, response, sizeof(response), &resplen);
+    if (res != PM3_SUCCESS) {
+        PrintAndLogEx(ERR, "APDU exchange " _RED_("failed") " (%d)", res);
+        return res;
+    }
+
+    if (apdu_logging) {
+        PrintAndLogEx(SUCCESS, "<<<< %s", sprint_hex(response, resplen));
+    }
+
+    if (resplen < 2) {
+        PrintAndLogEx(ERR, "Response too short");
+        return PM3_ESOFT;
+    }
+
+    uint16_t sw = get_sw(response, resplen);
+    if (sw != ISO7816_OK) {
+        PrintAndLogEx(ERR, "VDE_ECDSASign " _RED_("failed") " (%04X - %s)", sw, GetAPDUCodeDescription(sw >> 8, sw & 0xff));
+        return PM3_ESOFT;
+    }
+
+    int resp_data_len = resplen - 2;
+    if (resp_data_len != DUOX_VDE_SIG_LEN) {
+        PrintAndLogEx(ERR, "Unexpected signature length: %d bytes", resp_data_len);
+        return PM3_ESOFT;
+    }
+
+    memcpy(signature_rs, response, DUOX_VDE_SIG_LEN);
+    PrintAndLogEx(SUCCESS, "VDE_ECDSASign " _GREEN_("ok") " (SW=%04X)", sw);
+    if (verbose) {
+        PrintAndLogEx(INFO, "Signature.... %s", sprint_hex_inrow(signature_rs, DUOX_VDE_SIG_LEN));
+    }
+    return PM3_SUCCESS;
+}
+
+static int mfdes_verify_vde_signature(const uint8_t challenge[DUOX_VDE_CHALLENGE_LEN],
+                                      const uint8_t signature_rs[DUOX_VDE_SIG_LEN],
+                                      const uint8_t pubkey_point[65],
+                                      bool verbose) {
+    if (challenge == NULL || signature_rs == NULL || pubkey_point == NULL) {
+        return PM3_EINVARG;
+    }
+
+    if (verbose) {
+        PrintAndLogEx(INFO, "Verify msg... %s", sprint_hex_inrow(challenge, DUOX_VDE_CHALLENGE_LEN));
+    }
+
+    int sig_res = ecdsa_signature_r_s_verify(
+                      MBEDTLS_ECP_DP_BP256R1,
+                      (uint8_t *)pubkey_point,
+                      (uint8_t *)challenge,
+                      DUOX_VDE_CHALLENGE_LEN,
+                      (uint8_t *)signature_rs,
+                      DUOX_VDE_SIG_LEN,
+                      true
+                  );
+    return (sig_res == PM3_SUCCESS) ? PM3_SUCCESS : PM3_ESOFT;
+}
+
+static bool mfdes_validate_method_is_compatible(mfdes_validate_method_t method, const mfdes_verified_cert_t *cert_info, int keyidx, char *reason, size_t reason_len) {
+    if (cert_info == NULL) {
+        return false;
+    }
+    if (reason != NULL && reason_len > 0) {
+        reason[0] = '\0';
+    }
+
+    switch (method) {
+        case MFDES_VALIDATE_METHOD_INTAUTH:
+            if (cert_info->curveid != MBEDTLS_ECP_DP_SECP256R1 || cert_info->pubkey_len != 65) {
+                if (reason != NULL && reason_len > 0) {
+                    snprintf(reason, reason_len, "Internal Authenticate needs a secp256r1 65-byte public key");
+                }
+                return false;
+            }
+            return true;
+        case MFDES_VALIDATE_METHOD_VDE:
+            if (keyidx != 0) {
+                if (reason != NULL && reason_len > 0) {
+                    snprintf(reason, reason_len, "VDE_ECDSASign supports key index 00");
+                }
+                return false;
+            }
+            if (cert_info->curveid != MBEDTLS_ECP_DP_BP256R1 || cert_info->pubkey_len != 65) {
+                if (reason != NULL && reason_len > 0) {
+                    snprintf(reason, reason_len, "VDE_ECDSASign needs a BrainpoolP256r1 65-byte public key");
+                }
+                return false;
+            }
+            return true;
+        case MFDES_VALIDATE_METHOD_SKIP:
+            return true;
+        case MFDES_VALIDATE_METHOD_AUTO:
+        default:
+            return false;
+    }
+}
+
+static size_t mfdes_copy_validate_methods(const mfdes_verifycert_profile_t *profile,
+                                          mfdes_validate_method_t *methods, size_t max_methods) {
+    if (profile == NULL || methods == NULL || max_methods == 0) {
+        return 0;
+    }
+
+    size_t count = 0;
+    while (count < max_methods && profile->validate_methods[count] != MFDES_VALIDATE_METHOD_AUTO) {
+        methods[count] = profile->validate_methods[count];
+        count++;
+    }
+    return count;
+}
+
+static int mfdes_run_intauth_validation(bool APDULogging, bool verbose, const mfd_app_select *key_select,
+                                        int keyidx, const mfdes_verified_cert_t *cert_info) {
+    uint8_t challenge[DUOX_INTAUTH_CHALLENGE_LEN] = {0};
+    int res = pcrypto_rng_fill_oneshot(challenge, sizeof(challenge), "hf_mfdes_verifycert_intauth");
+    if (res != PM3_SUCCESS) {
+        PrintAndLogEx(ERR, "Failed to generate challenge");
+        return res;
+    }
+
+    if (verbose) {
+        PrintAndLogEx(INFO, "  method............: " _YELLOW_("ISO Internal Authenticate"));
+    }
+
+    uint8_t card_random[DUOX_INTAUTH_CHALLENGE_LEN] = {0};
+    uint8_t signature_rs[DUOX_INTAUTH_SIG_LEN] = {0};
+    DesfireContext_t verify_dctx = {0};
+    verify_dctx.commMode = DCMPlain;
+    verify_dctx.cmdSet = DCCNativeISO;
+    res = MfdSelectionSelectApplicationEx(&verify_dctx, key_select, verbose, false);
+    if (res != PM3_SUCCESS) {
+        return res;
+    }
+
+    if (verbose) {
+        PrintAndLogEx(INFO, "Challenge.... " _YELLOW_("%s"), sprint_hex_inrow(challenge, DUOX_INTAUTH_CHALLENGE_LEN));
+    }
+    res = duox_intauth_exchange(APDULogging, verbose, (uint8_t)keyidx, challenge, card_random, signature_rs);
+    if (res != PM3_SUCCESS) {
+        return res;
+    }
+
+    if (verbose) {
+        PrintAndLogEx(INFO, "Card random...... " _YELLOW_("%s"), sprint_hex_inrow(card_random, DUOX_INTAUTH_CHALLENGE_LEN));
+        PrintAndLogEx(INFO, "Signature r...... " _YELLOW_("%s"), sprint_hex_inrow(signature_rs, DUOX_INTAUTH_SIG_LEN / 2));
+        PrintAndLogEx(INFO, "Signature s...... " _YELLOW_("%s"), sprint_hex_inrow(signature_rs + DUOX_INTAUTH_SIG_LEN / 2, DUOX_INTAUTH_SIG_LEN / 2));
+    }
+
+    res = duox_intauth_verify_sig(verbose, cert_info->pubkey, challenge, card_random, signature_rs);
+    if (res == PM3_SUCCESS) {
+        PrintAndLogEx(SUCCESS, "Internal Authenticate signature " _GREEN_("verified"));
+        return PM3_SUCCESS;
+    }
+
+    PrintAndLogEx(ERR, "Internal Authenticate signature " _RED_("verification failed"));
+    return PM3_ESOFT;
+}
+
+static int mfdes_run_vde_validation(bool APDULogging, bool verbose, const mfd_app_select *key_select,
+                                    const mfdes_verified_cert_t *cert_info) {
+    uint8_t challenge[DUOX_VDE_CHALLENGE_LEN] = {0};
+    int res = pcrypto_rng_fill_oneshot(challenge, sizeof(challenge), "hf_mfdes_verifycert_vde");
+    if (res != PM3_SUCCESS) {
+        PrintAndLogEx(ERR, "Failed to generate VDE challenge");
+        return res;
+    }
+
+    if (verbose) {
+        PrintAndLogEx(INFO, "  method............: " _YELLOW_("VDE_ECDSASign"));
+    }
+
+    uint8_t signature_rs[DUOX_VDE_SIG_LEN] = {0};
+    DesfireContext_t verify_dctx = {0};
+    verify_dctx.commMode = DCMPlain;
+    verify_dctx.cmdSet = DCCNativeISO;
+    res = MfdSelectionSelectApplicationEx(&verify_dctx, key_select, verbose, false);
+    if (res != PM3_SUCCESS) {
+        return res;
+    }
+
+    if (verbose) {
+        PrintAndLogEx(INFO, "Challenge.... " _YELLOW_("%s"), sprint_hex_inrow(challenge, DUOX_VDE_CHALLENGE_LEN));
+    }
+    res = duox_vde_sign_exchange(APDULogging, verbose, challenge, signature_rs);
+    if (res != PM3_SUCCESS) {
+        return res;
+    }
+
+    if (verbose) {
+        PrintAndLogEx(INFO, "VDE signature r... " _YELLOW_("%s"), sprint_hex_inrow(signature_rs, DUOX_VDE_SIG_LEN / 2));
+        PrintAndLogEx(INFO, "VDE signature s... " _YELLOW_("%s"), sprint_hex_inrow(signature_rs + DUOX_VDE_SIG_LEN / 2, DUOX_VDE_SIG_LEN / 2));
+    }
+
+    res = mfdes_verify_vde_signature(challenge, signature_rs, cert_info->pubkey, verbose);
+    if (res == PM3_SUCCESS) {
+        PrintAndLogEx(SUCCESS, "VDE_ECDSASign signature " _GREEN_("verified"));
+        return PM3_SUCCESS;
+    }
+
+    PrintAndLogEx(ERR, "VDE_ECDSASign signature " _RED_("verification failed"));
+    return PM3_ESOFT;
+}
+
+static int mfdes_run_key_possession_verification(bool APDULogging, bool verbose,
+                                                 const mfdes_validate_method_t *methods,
+                                                 size_t method_count,
+                                                 bool forced_method,
+                                                 const mfd_app_select *key_select,
+                                                 int keyidx,
+                                                 const mfdes_verified_cert_t *cert_info) {
+    if (methods == NULL || method_count == 0 || key_select == NULL || cert_info == NULL) {
+        return PM3_EINVARG;
+    }
+
+    if (method_count == 1 && methods[0] == MFDES_VALIDATE_METHOD_SKIP) {
+        PrintAndLogEx(SUCCESS, "Key possession verification " _YELLOW_("skipped"));
+        return PM3_SUCCESS;
+    }
+
+    int last_res = PM3_ENOTIMPL;
+    bool tried_any = false;
+    for (size_t i = 0; i < method_count; i++) {
+        char reason[128] = {0};
+        if (!mfdes_validate_method_is_compatible(methods[i], cert_info, keyidx, reason, sizeof(reason))) {
+            if (forced_method) {
+                PrintAndLogEx(ERR, "%s is not compatible with this certificate/key selection: %s",
+                              CLIGetOptionListStr(mfdesValidateMethodOpts, methods[i]), reason);
+                return PM3_ENOTIMPL;
+            }
+            if (verbose && reason[0] != '\0') {
+                PrintAndLogEx(INFO, "Skipping %s: %s", CLIGetOptionListStr(mfdesValidateMethodOpts, methods[i]), reason);
+            }
+            continue;
+        }
+
+        tried_any = true;
+        if (methods[i] == MFDES_VALIDATE_METHOD_INTAUTH) {
+            last_res = mfdes_run_intauth_validation(APDULogging, verbose, key_select, keyidx, cert_info);
+        } else if (methods[i] == MFDES_VALIDATE_METHOD_VDE) {
+            last_res = mfdes_run_vde_validation(APDULogging, verbose, key_select, cert_info);
+        }
+
+        if (last_res == PM3_SUCCESS) {
+            return PM3_SUCCESS;
+        }
+        if (forced_method) {
+            return last_res;
+        }
+        PrintAndLogEx(WARNING, "%s validation failed; trying next compatible method", CLIGetOptionListStr(mfdesValidateMethodOpts, methods[i]));
+    }
+
+    if (!tried_any) {
+        PrintAndLogEx(ERR, "Certificate key is unsupported for key possession verification");
+        PrintAndLogEx(INFO, "Supported methods: secp256r1 via ISO Internal Authenticate, or BrainpoolP256r1 key index 00 via VDE_ECDSASign");
+        return PM3_ENOTIMPL;
+    }
+
+    return last_res;
+}
+
+static int CmdHF14ADesVerifyCert(const char *Cmd) {
+    CLIParserContext *ctx;
+    CLIParserInit(&ctx, "hf mfdes verifycert",
+                  "Read a certificate from DESFire file,\n"
+                  "validate it against root CA keys, extract device public key,\n"
+                  "then verify key possession with ISO Internal Authenticate or VDE_ECDSASign.",
+                  "hf mfdes verifycert leaf\n"
+                  "hf mfdes verifycert vde\n"
+                  "hf mfdes verifycert orig\n"
+                  "hf mfdes verifycert picc\n"
+                  "hf mfdes verifycert --fid 01\n"
+                  "hf mfdes verifycert leaf --aid D61CF5 --keyidx 0\n"
+                  "hf mfdes verifycert vde --dfname A0000008450000000000000000000001 --aid F61010\n"
+                  "hf mfdes verifycert orig --ca nxp-orig-e200\n"
+                  "hf mfdes verifycert vde --ca skip\n"
+                  "hf mfdes verifycert --fid 01 --ca ./rootca.pem --ca ./backup_root.der\n"
+                  "hf mfdes verifycert --fid 01 --ca 04AABB... (public key)\n"
+                  "hf mfdes verifycert --fid 01 --keyaid 123456 --keyidx 2");
+
+    void *argtable[] = {
+        arg_param_begin,
+        arg_str0(NULL, NULL,        "<profile>", "Profile: leaf, vde, orig, originality, picc"), // 1
+        arg_lit0("a",  "apdu",      "Show APDU requests and responses"), // 2
+        arg_lit0("v",  "verbose",   "Verbose output"), // 3
+        arg_int0("n",  "keyno",     "<dec>", "Key number for DESFire authentication"), // 4
+        arg_str0("t",  "algo",      "<DES|2TDEA|3TDEA|AES>",  "DESFire auth crypt algo"), // 5
+        arg_str0("k",  "key",       "<hex>", "DESFire authentication key"), // 6
+        arg_str0(NULL, "kdf",       "<none|AN10922|gallagher>", "Key Derivation Function (KDF)"), // 7
+        arg_str0("i",  "kdfi",      "<hex>", "KDF input (1-31 hex bytes)"), // 8
+        arg_str0("m",  "cmode",     "<plain|mac|encrypt>", "Communication mode"), // 9
+        arg_str0("c",  "ccset",     "<native|niso|iso>", "Communication command set"), // 10
+        arg_str0(NULL, "schann",    "<ev2>", "Secure channel (verifycert supports only ev2 for auth)"), // 11
+        arg_str0(NULL, "aid",       "<hex>", "Certificate application ID (3 bytes)"), // 12
+        arg_str0(NULL, "isoid",     "<hex>", "Certificate application ISO DF ID (2 bytes)"), // 13
+        arg_str0(NULL, "dfname",    "<hex>", "Certificate application DF name (1-16 bytes)"), // 14
+        arg_str0(NULL, "fid",       "<hex>", "Certificate file ID (1 byte)"), // 15
+        arg_lit0(NULL, "no-auth",   "Read certificate file without authentication"), // 16
+        arg_strn(NULL, "ca", "<name|cert|pubkey|path|skip>", 0, MFDES_VERIFYCERT_MAX_CAS,
+                 "CA input, or `skip` to skip certificate signature validation. Repeat --ca for multiple entries"), // 17
+        arg_str0(NULL, "keyaid",    "<hex>", "Key application ID (default: cert app)"), // 18
+        arg_str0(NULL, "keyisoid",  "<hex>", "Key application ISO DF ID (2 bytes)"), // 19
+        arg_str0(NULL, "keydfname", "<hex>", "Key application DF name (default: cert app)"), // 20
+        arg_int0(NULL, "keyidx",    "<dec>", "Key index for possession verification (profile default)"), // 21
+        arg_str0(NULL, "validatemethod", "<auto|intauth|vde|skip>", "Key possession verification method (default: profile/auto)"), // 22
+        arg_str0(NULL, "readmethod", "<auto|desfire>", "Certificate read method (reserved for future methods)"), // 23
+        arg_param_end
+    };
+    CLIExecWithReturn(ctx, Cmd, argtable, false);
+
+    bool APDULogging = arg_get_lit(ctx, 2);
+    bool verbose = arg_get_lit(ctx, 3);
+    bool noauth = arg_get_lit(ctx, 16);
+    bool secure_channel_present = (arg_get_str(ctx, 11)->count > 0);
+    bool auth_params_present = (arg_get_int_count(ctx, 4) > 0 ||
+                                arg_get_str(ctx, 5)->count > 0 ||
+                                arg_get_str(ctx, 6)->count > 0 ||
+                                arg_get_str(ctx, 7)->count > 0 ||
+                                arg_get_str(ctx, 8)->count > 0 ||
+                                arg_get_str(ctx, 9)->count > 0 ||
+                                arg_get_str(ctx, 10)->count > 0 ||
+                                secure_channel_present);
+    bool force_auth = auth_params_present && !noauth;
+
+    const char *profile_arg = (arg_get_str(ctx, 1)->count > 0) ? arg_get_str(ctx, 1)->sval[0] : NULL;
+    const mfdes_verifycert_profile_t *profile = mfdes_find_verifycert_profile(profile_arg);
+    if (profile == NULL) {
+        PrintAndLogEx(ERR, "Unknown verifycert profile `%s`", profile_arg);
+        CLIParserFree(ctx);
+        return PM3_EINVARG;
+    }
+
+    mfd_app_select cert_select = profile->cert_select;
+    mfd_app_select key_select = profile->key_select_present ? profile->key_select : profile->cert_select;
+    uint8_t cert_fid = profile->fid;
+    uint8_t default_keyidx = profile->keyidx;
+    mfdes_validate_method_t validate_methods[MFDES_VERIFYCERT_PROFILE_MAX_METHODS] = {0};
+    size_t validate_method_count = mfdes_copy_validate_methods(profile, validate_methods, ARRAYLEN(validate_methods));
+    bool validate_method_forced = false;
+    int res = PM3_SUCCESS;
+
+    if (MfdSelectionApplyCmdParameters(ctx, 12, 13, 14, &cert_select) != PM3_SUCCESS) {
+        CLIParserFree(ctx);
+        return PM3_EINVARG;
+    }
+
+    bool key_selector_present = (arg_get_str(ctx, 18)->count > 0 ||
+                                 arg_get_str(ctx, 19)->count > 0 ||
+                                 arg_get_str(ctx, 20)->count > 0);
+    if (!key_selector_present) {
+        if (!profile->key_select_present) {
+            key_select = cert_select;
+        }
+    } else if (MfdSelectionApplyCmdParameters(ctx, 18, 19, 20, &key_select) != PM3_SUCCESS) {
+        CLIParserFree(ctx);
+        return PM3_EINVARG;
+    }
+
+    bool fid_present = (arg_get_str(ctx, 15)->count > 0);
+    if (fid_present) {
+        uint32_t parsed_fid = 0;
+        if (CLIGetUint32Hex(ctx, 15, 0, &parsed_fid, NULL, 1, "File ID must have 1 byte length")) {
+            CLIParserFree(ctx);
+            return PM3_EINVARG;
+        }
+        cert_fid = parsed_fid & 0xFF;
+    } else if (cert_fid == MFDES_VERIFYCERT_NO_FID) {
+        PrintAndLogEx(ERR, "Verifycert profile has no default certificate file; specify --fid");
+        CLIParserFree(ctx);
+        return PM3_EINVARG;
+    }
+    if (cert_fid == MFDES_VERIFYCERT_NO_FID || cert_fid > 0x1F) {
+        PrintAndLogEx(ERR, "File number range is invalid (exp 0x00 - 0x1f), got 0x%02x", cert_fid);
+        CLIParserFree(ctx);
+        return PM3_EINVARG;
+    }
+
+    int keyidx = arg_get_int_def(ctx, 21, default_keyidx);
+    if (keyidx < 0 || keyidx > 255) {
+        PrintAndLogEx(ERR, "Key index must be 0..255");
+        CLIParserFree(ctx);
+        return PM3_EINVARG;
+    }
+
+    mfdes_validate_method_t cli_validate_method = MFDES_VALIDATE_METHOD_AUTO;
+    if (CLIGetOptionList(arg_get_str(ctx, 22), mfdesValidateMethodOpts, (int *)&cli_validate_method)) {
+        CLIParserFree(ctx);
+        return PM3_EINVARG;
+    }
+    if (arg_get_str(ctx, 22)->count > 0 && cli_validate_method != MFDES_VALIDATE_METHOD_AUTO) {
+        validate_methods[0] = cli_validate_method;
+        validate_method_count = 1;
+        validate_method_forced = true;
+    }
+    if (validate_method_count == 0) {
+        PrintAndLogEx(ERR, "Verifycert profile has no validation methods configured");
+        CLIParserFree(ctx);
+        return PM3_EINVARG;
+    }
+
+    mfdes_read_method_t read_method = MFDES_READ_METHOD_AUTO;
+    if (CLIGetOptionList(arg_get_str(ctx, 23), mfdesReadMethodOpts, (int *)&read_method)) {
+        CLIParserFree(ctx);
+        return PM3_EINVARG;
+    }
+
+    char ca_inputs[MFDES_VERIFYCERT_MAX_CAS][DUOX_MAX_KEY_INPUT] = {{0}};
+    int ca_input_count = arg_get_str(ctx, 17)->count;
+    bool ca_validation_skipped = false;
+    if (ca_input_count > MFDES_VERIFYCERT_MAX_CAS) {
+        PrintAndLogEx(ERR, "Too many --ca options (%d), max %d", ca_input_count, MFDES_VERIFYCERT_MAX_CAS);
+        CLIParserFree(ctx);
+        return PM3_EINVARG;
+    }
+    for (int i = 0; i < ca_input_count; i++) {
+        const char *src = arg_get_str(ctx, 17)->sval[i];
+        if (src == NULL || src[0] == '\0') {
+            PrintAndLogEx(ERR, "Empty --ca argument");
+            CLIParserFree(ctx);
+            return PM3_EINVARG;
+        }
+        if (str_equal_case_insensitive(src, "skip")) {
+            if (ca_input_count != 1) {
+                PrintAndLogEx(ERR, "`--ca skip` cannot be combined with other CA inputs");
+                CLIParserFree(ctx);
+                return PM3_EINVARG;
+            }
+            ca_validation_skipped = true;
+            continue;
+        }
+        snprintf(ca_inputs[i], sizeof(ca_inputs[i]), "%s", src);
+    }
+
+    DesfireContext_t dctx = {0};
+    int securechann = defaultSecureChannel;
+    res = CmdDesGetSessionParameters(ctx, &dctx,
+                                     4, 5, 6, 7, 8, 9, 10, 11,
+                                     0, 0, 0,
+                                     &securechann,
+                                     force_auth ? DCMMACed : DCMPlain,
+                                     NULL, NULL);
+    if (res) {
+        CLIParserFree(ctx);
+        return res;
+    }
+    if (secure_channel_present && securechann != DACEV2) {
+        PrintAndLogEx(ERR, "DUOX verifycert supports only EV2 secure channel, got %s",
+                      CLIGetOptionListStr(DesfireSecureChannelOpts, securechann));
+        CLIParserFree(ctx);
+        return PM3_EINVARG;
+    }
+    securechann = DACEV2;
+    if (!noauth && !auth_params_present) {
+        uint8_t zero_key[CRYPTO_AES128_KEY_SIZE] = {0};
+        DesfireSetKeyNoClear(&dctx, dctx.keyNum, T_AES, zero_key);
+    }
+
+    SetAPDULogging(APDULogging);
+    CLIParserFree(ctx);
+
+    duox_certificate_anchor_t ca_list[MFDES_VERIFYCERT_MAX_CAS] = {0};
+    size_t ca_count = 0;
+    if (ca_validation_skipped) {
+        ca_count = 0;
+    } else if (ca_input_count > 0) {
+        for (int i = 0; i < ca_input_count; i++) {
+            if (ca_count >= ARRAYLEN(ca_list)) {
+                PrintAndLogEx(ERR, "Too many CA entries, max %d", MFDES_VERIFYCERT_MAX_CAS);
+                return PM3_EOVFLOW;
+            }
+            res = duox_load_certificate_anchor_from_input(ca_inputs[i], DUOX_DEFAULT_CA_DIR, &ca_list[ca_count]);
+            if (res != PM3_SUCCESS) {
+                PrintAndLogEx(ERR, "Unable to parse `--ca %s` as X.509 certificate or EC public key", ca_inputs[i]);
+                return PM3_EINVARG;
+            }
+            ca_count++;
+        }
+    } else {
+        res = duox_load_certificate_anchors_from_store(DUOX_DEFAULT_CA_DIR, ca_list, ARRAYLEN(ca_list), &ca_count);
+        if (res != PM3_SUCCESS) {
+            PrintAndLogEx(ERR, "Unable to load default DUOX CA files from resources");
+            return PM3_ESOFT;
+        }
+    }
+
+    if (!ca_validation_skipped && ca_count == 0) {
+        PrintAndLogEx(ERR, "No CA entries available for certificate validation");
+        return PM3_EINVARG;
+    }
+
+    if (verbose) {
+        PrintAndLogEx(INFO, "--- " _CYAN_("Certificate read"));
+        MfdSelectionPrintPrefixed(&cert_select, "  ");
+        PrintAndLogEx(INFO, "  file id...........: " _YELLOW_("%02X"), (uint8_t)cert_fid);
+        PrintAndLogEx(INFO, "  read method.......: " _YELLOW_("%s"), CLIGetOptionListStr(mfdesReadMethodOpts, read_method));
+        PrintAndLogEx(INFO, "  auth mode.........: " _YELLOW_("%s"), noauth ? "no-auth" : (force_auth ? "forced" : "auto"));
+    }
+
+    uint8_t *cert_buf = calloc(DESFIRE_BUFFER_SIZE, sizeof(uint8_t));
+    if (cert_buf == NULL) {
+        PrintAndLogEx(ERR, "Failed to allocate memory");
+        return PM3_EMALLOC;
+    }
+    size_t cert_buf_len = 0;
+    mfdes_verified_cert_t cert_info = {0};
+    size_t matched_ca_index = 0;
+
+    int retval = PM3_SUCCESS;
+    bool field_active = false;
+
+    res = MfdSelectionSelectApplication(&dctx, &cert_select, verbose);
+    if (res != PM3_SUCCESS) {
+        DropField();
+        PrintAndLogEx(ERR, "Certificate application selection failed");
+        retval = res;
+        goto out;
+    }
+    field_active = true;
+
+    res = mfdes_read_cert_file_desfire(&dctx, (DesfireSecureChannel)securechann, cert_fid,
+                                       noauth, force_auth, verbose, cert_buf, &cert_buf_len);
+    if (res != PM3_SUCCESS) {
+        PrintAndLogEx(ERR, "Certificate file read " _RED_("failed") ". Result: %d", res);
+        retval = res;
+        goto out;
+    }
+
+    if (cert_buf_len == 0) {
+        PrintAndLogEx(ERR, "Certificate file is empty");
+        retval = PM3_ESOFT;
+        goto out;
+    }
+
+    if (verbose) {
+        PrintAndLogEx(INFO, "  file size.........: " _YELLOW_("%zu bytes"), cert_buf_len);
+        PrintAndLogEx(INFO, "  raw certificate data:");
+        print_hex_break(cert_buf, cert_buf_len, 16);
+    }
+
+    res = mfdes_verify_certificate_variants(cert_buf, cert_buf_len,
+                                            ca_list, ca_count,
+                                            !ca_validation_skipped,
+                                            verbose, &cert_info, &matched_ca_index);
+    if (res == PM3_ENODATA && !noauth && !auth_params_present) {
+        PrintAndLogEx(WARNING, "Certificate data was not parseable; retrying read with default AES authentication");
+        DesfireContext_t aes_dctx = dctx;
+        uint8_t zero_key[CRYPTO_AES128_KEY_SIZE] = {0};
+        DesfireSetKeyNoClear(&aes_dctx, aes_dctx.keyNum, T_AES, zero_key);
+        cert_buf_len = 0;
+        int read_res = mfdes_read_cert_file_desfire(&aes_dctx, (DesfireSecureChannel)securechann, cert_fid,
+                                                    false, true, verbose, cert_buf, &cert_buf_len);
+        if (read_res == PM3_SUCCESS && cert_buf_len > 0) {
+            if (verbose) {
+                PrintAndLogEx(INFO, "  retry file size....: " _YELLOW_("%zu bytes"), cert_buf_len);
+                PrintAndLogEx(INFO, "  retry certificate data:");
+                print_hex_break(cert_buf, cert_buf_len, 16);
+            }
+            memset(&cert_info, 0, sizeof(cert_info));
+            matched_ca_index = 0;
+            res = mfdes_verify_certificate_variants(cert_buf, cert_buf_len,
+                                                    ca_list, ca_count,
+                                                    !ca_validation_skipped,
+                                                    verbose, &cert_info, &matched_ca_index);
+        } else if (verbose) {
+            PrintAndLogEx(INFO, "Default AES authenticated retry did not return certificate data (%d)", read_res);
+        }
+    }
+
+    if (cert_info.format != DUOX_CERTIFICATE_FORMAT_UNKNOWN) {
+        mfdes_apply_certificate_profile_data(profile, &cert_info);
+        mfdes_print_certificate_info(&cert_info);
+    }
+
+    if (res != PM3_SUCCESS) {
+        if (res == PM3_ENODATA) {
+            PrintAndLogEx(ERR, "Unable to parse certificate file data as X.509 or GP VDE certificate");
+        } else if (res == PM3_ECRYPTO) {
+            PrintAndLogEx(ERR, ca_validation_skipped
+                          ? "Certificate parsed, but public key extraction failed"
+                          : "Certificate parsed, but signature validation failed with CA entries");
+        } else {
+            PrintAndLogEx(ERR, "Certificate validation failed (%d)", res);
+        }
+        retval = res;
+        goto out;
+    }
+
+    if (ca_validation_skipped) {
+        PrintAndLogEx(WARNING, "Certificate signature validation skipped (--ca skip)");
+    } else {
+        const duox_certificate_anchor_t *matched_ca = &ca_list[matched_ca_index];
+        const char *verified_ca_name = duox_certificate_anchor_display_name(matched_ca);
+        PrintAndLogEx(SUCCESS, "Certificate signature verified successfully using " _GREEN_("%s"), verified_ca_name);
+    }
+
+    if (verbose) {
+        PrintAndLogEx(INFO, _CYAN_("Key possession verification"));
+        MfdSelectionPrintPrefixed(&key_select, "  ");
+        PrintAndLogEx(INFO, "  key index.........: " _YELLOW_("%d"), keyidx);
+        PrintAndLogEx(INFO, "  method............: " _YELLOW_("%s"),
+                      (validate_method_count == 1) ? CLIGetOptionListStr(mfdesValidateMethodOpts, validate_methods[0]) : "auto");
+    }
+
+    res = mfdes_run_key_possession_verification(APDULogging, verbose, validate_methods,
+                                                validate_method_count, validate_method_forced,
+                                                &key_select, keyidx, &cert_info);
+    if (res != PM3_SUCCESS) {
+        retval = res;
+        goto out;
+    }
+
+    bool key_possession_skipped = (validate_method_count == 1 && validate_methods[0] == MFDES_VALIDATE_METHOD_SKIP);
+    if (ca_validation_skipped && key_possession_skipped) {
+        PrintAndLogEx(SUCCESS, "Certificate parsed; signature validation and key possession verification " _GREEN_("skipped"));
+    } else if (ca_validation_skipped) {
+        PrintAndLogEx(SUCCESS, "Certificate parsed and key possession " _GREEN_("verified"));
+    } else if (key_possession_skipped) {
+        PrintAndLogEx(SUCCESS, "Certificate chain validated; key possession verification " _GREEN_("skipped"));
+    } else {
+        PrintAndLogEx(SUCCESS, "Certificate chain validated; key possession " _GREEN_("verified"));
+    }
+
+out:
+    if (field_active) {
+        DropField();
+    }
+    free(cert_buf);
+    return retval;
+}
+
 static int CmdHF14ADesTest(const char *Cmd) {
     CLIParserContext *ctx;
     CLIParserInit(&ctx, "hf mfdes test",
@@ -6621,7 +9766,9 @@ static command_t CommandTable[] = {
     {"detect",           CmdHF14aDesDetect,           IfPm3Iso14443a,  "Detect key type and tries to find one from the list"},
     {"formatpicc",       CmdHF14ADesFormatPICC,       IfPm3Iso14443a,  "Format PICC"},
     {"freemem",          CmdHF14ADesGetFreeMem,       IfPm3Iso14443a,  "Get free memory size"},
+    {"getversion",       CmdHF14ADesGetVersion,       IfPm3Iso14443a,  "Get version/type information"},
     {"getuid",           CmdHF14ADesGetUID,           IfPm3Iso14443a,  "Get uid from card"},
+    {"pc",               CmdHF14ADesPC,               IfPm3Iso14443a,  "Run proximity check"},
     {"info",             CmdHF14ADesInfo,             IfPm3Iso14443a,  "Tag information"},
     {"mad",              CmdHF14aDesMAD,              IfPm3Iso14443a,  "Prints MAD records / files from the card"},
     {"setconfig",        CmdHF14ADesSetConfiguration, IfPm3Iso14443a,  "Set card configuration"},
@@ -6630,7 +9777,10 @@ static command_t CommandTable[] = {
     {"getaids",          CmdHF14ADesGetAIDs,          IfPm3Iso14443a,  "Get Application IDs list"},
     {"getappnames",      CmdHF14ADesGetAppNames,      IfPm3Iso14443a,  "Get Applications list"},
     {"bruteaid",         CmdHF14ADesBruteApps,        IfPm3Iso14443a,  "Recover AIDs by bruteforce"},
+    {"brutedamslot",     CmdHF14ADesBruteDAMSlots,    IfPm3Iso14443a,  "Recover DAM slots to delegated AIDs by bruteforce"},
     {"createapp",        CmdHF14ADesCreateApp,        IfPm3Iso14443a,  "Create Application"},
+    {"createdelegateapp", CmdHF14ADesCreateDelegateApp, IfPm3Iso14443a, "Create Delegated Application"},
+    {"getdelegateappinfo", CmdHF14ADesGetDelegateAppInfo, IfPm3Iso14443a,  "Get Delegated Application info by DAM slot"},
     {"deleteapp",        CmdHF14ADesDeleteApp,        IfPm3Iso14443a,  "Delete Application"},
     {"selectapp",        CmdHF14ADesSelectApp,        IfPm3Iso14443a,  "Select Application ID"},
     {"selectisofid",     CmdHF14ADesSelectISOFID,     IfPm3Iso14443a,  "Select file by ISO ID"},
@@ -6656,6 +9806,12 @@ static command_t CommandTable[] = {
     {"write",            CmdHF14ADesWriteData,        IfPm3Iso14443a,  "Write data to standard/backup/record/value file"},
     {"value",            CmdHF14ADesValueOperations,  IfPm3Iso14443a,  "Operations with value file (get/credit/limited credit/debit/clear)"},
     {"clearrecfile",     CmdHF14ADesClearRecordFile,  IfPm3Iso14443a,  "Clear record File"},
+    {"makemfclicense",   CmdHF14ADesMakeMFCLicense,   AlwaysAvailable, "Generate a Mifare Classic license for DESFire EV3C"},
+    {"createmfcmapping", CmdHF14ADesCreateMFCMapping, IfPm3Iso14443a,  "Create a Mifare Classic mapping on a DESFire EV3C"},
+    {"-----------",      CmdHelp,                     IfPm3Iso14443a,  "----------------------- " _CYAN_("DUOX") " ------------------------"},
+    {"verifycert",       CmdHF14ADesVerifyCert,       IfPm3Iso14443a,  "Validate cert from file and verify key possession"},
+    {"intauth",          CmdHF14ADesIntAuth,          IfPm3Iso14443a,  "ISO Internal Authenticate (ECDSA challenge-response)"},
+    {"vdesign",          CmdHF14ADesVdeSign,          IfPm3Iso14443a,  "VDE ECDSASign (EV charging signature over 32-byte challenge)"},
     {"-----------",      CmdHelp,                     IfPm3Iso14443a,  "----------------------- " _CYAN_("System") " -----------------------"},
     {"test",             CmdHF14ADesTest,             AlwaysAvailable, "Regression crypto tests"},
     {NULL, NULL, NULL, NULL}

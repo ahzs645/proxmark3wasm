@@ -23,13 +23,14 @@
 #include "desfire_crypto.h"
 #include "cmd.h"
 #include "dbprint.h"
-#include "fpgaloader.h"
+#include "fpga_loader.h"
+#include "fpga_apis.h"
 #include "iso14443a.h"
 #include "crc16.h"
 #include "commonutil.h"
 #include "util.h"
 #include "mifare.h"
-#include "ticks.h"
+#include "ticks_apis.h"
 #include "protocols.h"
 
 #define MAX_APPLICATION_COUNT 28
@@ -62,7 +63,7 @@ bool InitDesfireCard(void) {
 
     if (iso14443a_select_card(NULL, &card, NULL, true, 0, false) == 0) {
         if (g_dbglevel >= DBG_ERROR) DbpString("Can't select card");
-        OnError(1);
+        OnErrorNG(CMD_HF_DESFIRE_COMMAND, 1);
         return false;
     }
     return true;
@@ -81,7 +82,7 @@ void MifareSendCommand(uint8_t *datain) {
     } PACKED;
     struct p *payload = (struct p *) datain;
 
-    uint8_t resp[RECEIVE_SIZE];
+    uint8_t resp[MAX_FRAME_SIZE];
     memset(resp, 0, sizeof(resp));
 
     if (g_dbglevel >= DBG_EXTENDED) {
@@ -94,7 +95,7 @@ void MifareSendCommand(uint8_t *datain) {
         clear_trace();
 
     if (payload->flags & INIT) {
-        if (!InitDesfireCard()) {
+        if (InitDesfireCard() == false) {
             return;
         }
     }
@@ -103,15 +104,15 @@ void MifareSendCommand(uint8_t *datain) {
     if (g_dbglevel >= DBG_EXTENDED)
         print_result("RESP <--: ", resp, len);
 
-    if (!len) {
-        OnError(2);
+    if (len == 0) {
+        OnErrorNG(CMD_HF_DESFIRE_COMMAND, 2);
         return;
     }
 
     if (payload->flags & DISCONNECT)
         OnSuccess();
 
-    //reply_mix(CMD_ACK, 1, len, 0, resp, len);
+    //reply_ng(CMD_HF_DESFIRE_COMMAND, PM3_SUCCESS, resp, len);
     LED_B_ON();
 
 
@@ -323,6 +324,10 @@ void MifareDES_Auth1(uint8_t *datain) {
             memcpy(keybytes, PICC_MASTER_KEY24, 24);
         }
     } else {
+        if (payload->keylen > sizeof(keybytes)) {
+            OnErrorNG(CMD_HF_DESFIRE_AUTH1, PM3_EINVARG);
+            return;
+        }
         memcpy(keybytes, payload->key, payload->keylen);
     }
 
@@ -697,7 +702,9 @@ int DesfireAPDU(uint8_t *cmd, size_t cmd_len, uint8_t *dataout) {
 
     len = ReaderReceive(resp, sizeof(resp), par);
     if (len == 0) {
-        if (g_dbglevel >= DBG_EXTENDED) Dbprintf("fukked");
+        if (g_dbglevel >= DBG_EXTENDED) {
+            Dbprintf("Error: data link failed");
+        }
         return false; //DATA LINK ERROR
 
     }
@@ -725,12 +732,15 @@ size_t CreateAPDU(uint8_t *datain, size_t len, uint8_t *dataout) {
     cmd[0] = 0x02;  //  0x0A = send cid,  0x02 = no cid.
     cmd[0] |= pcb_blocknum; // OR the block number into the PCB
 
-    if (g_dbglevel >= DBG_EXTENDED) Dbprintf("pcb_blocknum %d == %d ", pcb_blocknum, cmd[0]);
+    if (g_dbglevel >= DBG_EXTENDED) {
+        Dbprintf("pcb_blocknum %d == %d ", pcb_blocknum, cmd[0]);
+    }
 
     //cmd[1] = 0x90;  //  CID: 0x00 //TODO: allow multiple selected cards
 
-    memcpy(cmd + 1, datain, len);
-    AddCrc14A(cmd, len + 1);
+    // bytes that actually fit; may be less than len
+    memcpy(cmd + 1, datain,  cmdlen - 3);
+    AddCrc14A(cmd,  cmdlen - 3 + 1);
 
     /*
     hf 14a apdu -sk 90 60 00 00 00
@@ -747,17 +757,20 @@ size_t CreateAPDU(uint8_t *datain, size_t len, uint8_t *dataout) {
 // uint32_t crc = crc_finish(&desfire_crc32);
 
 void OnSuccess(void) {
+    size_t len = 0;
+    uint8_t resp[MAX_FRAME_SIZE];
+    uint8_t par[MAX_PARITY_SIZE];
+
     pcb_blocknum = 0;
     ReaderTransmit(deselect_cmd, 3, NULL);
-    if (mifare_ultra_halt()) {
-        if (g_dbglevel >= DBG_ERROR) Dbprintf("Halt error");
+    len = ReaderReceive(resp, sizeof(resp), par);
+    if (len == 0) {
+        if (mifare_ultra_halt()) {
+            if (g_dbglevel >= DBG_ERROR) Dbprintf("Halt error");
+        }
     }
-    switch_off();
-}
 
-void OnError(uint8_t reason) {
-    reply_mix(CMD_ACK, 0, reason, 0, 0, 0);
-    OnSuccess();
+    switch_off();
 }
 
 void OnErrorNG(uint16_t cmd, uint8_t reason) {

@@ -1472,7 +1472,9 @@ static bool Unpack_IR56(wiegand_message_t *packed, wiegand_card_t *card) {
 
     if (packed->Length != 56) return false;
 
-    card->FacilityCode = packed->Mid;
+    // Mask off the header/sentinel bit that add_HID_header sets at position 56
+    // (Mid |= 1 << 24) so it doesn't leak into the 24-bit facility code.
+    card->FacilityCode = packed->Mid & 0x00FFFFFF;
     card->CardNumber = packed->Bot;
     return true;
 }
@@ -1487,6 +1489,11 @@ void print_desc_wiegand(cardformat_t *fmt, wiegand_message_t *packed) {
 
     size_t s_len = 128;
     char *s = calloc(s_len, sizeof(uint8_t));
+    if (s == NULL) {
+        PrintAndLogEx(WARNING, "Failed to allocate memory");
+        return;
+    }
+
     snprintf(s, s_len * sizeof(uint8_t), _YELLOW_("%-10s")" %-32s",  fmt->Name, fmt->Description);
 
     if (packed->Top != 0) {

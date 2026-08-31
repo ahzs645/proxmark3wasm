@@ -39,6 +39,14 @@ static int CmdHelp(const char *Cmd);
 static uint8_t *gs_trace;
 static uint16_t gs_traceLen = 0;
 
+typedef enum {
+    TRACE_CRC_FAIL = 0,
+    TRACE_CRC_OK = 1,
+    TRACE_CRC_NONE = 2,
+    TRACE_CRC_A_OK = 3,
+    TRACE_CRC_B_OK = 4,
+} trace_crc_status_t;
+
 static bool is_last_record(uint16_t tracepos, uint16_t traceLen) {
     return ((tracepos + TRACELOG_HDR_LEN) >= traceLen);
 }
@@ -542,7 +550,7 @@ static uint16_t printTraceLine(uint16_t tracepos, uint16_t traceLen, uint8_t *tr
     }
 
     //Check the CRC status
-    uint8_t crcStatus = 2;
+    trace_crc_status_t crcStatus = TRACE_CRC_NONE;
 
     if (data_len > 2) {
         switch (protocol) {
@@ -569,9 +577,28 @@ static uint16_t printTraceLine(uint16_t tracepos, uint16_t traceLen, uint8_t *tr
                 crcStatus = seos_CRC_check(hdr->isResponse, frame, data_len);
                 break;
             case ISO_7816_4:
-                crcStatus = iso14443A_CRC_check(hdr->isResponse, frame, data_len) == 1 ? 3 : 0;
-                crcStatus = iso14443B_CRC_check(frame, data_len) == 1 ? 4 : crcStatus;
+                // A contact ISO 7816-3 frame carries no trailing CRC.  T=0 has
+                // no frame checksum at all, and T=1 keeps its EDC inside the
+                // block - so running the ISO 14443 A/B CRC checks over one only
+                // ever produced a red "!!" on every line.
+                //
+                // The T=1 LRC is not verified here either: TRACE_CRC_OK/FAIL
+                // make the renderer below highlight the last *two* bytes as the
+                // checksum, which would be wrong for a one byte LRC.
+                crcStatus = TRACE_CRC_NONE;
                 break;
+            case PROTO_CALYPSO: {
+                uint8_t crcA = iso14443A_CRC_check(hdr->isResponse, frame, data_len);
+                uint8_t crcB = iso14443B_CRC_check(frame, data_len);
+                if (crcA == TRACE_CRC_OK) {
+                    crcStatus = TRACE_CRC_A_OK;
+                } else if (crcB == TRACE_CRC_OK) {
+                    crcStatus = TRACE_CRC_B_OK;
+                } else {
+                    crcStatus = crcA;
+                }
+                break;
+            }
             case THINFILM:
                 frame[data_len - 1] ^= frame[data_len - 2];
                 frame[data_len - 2] ^= frame[data_len - 1];
@@ -627,6 +654,7 @@ static uint16_t printTraceLine(uint16_t tracepos, uint16_t traceLen, uint8_t *tr
                 && protocol != ISO_15693
                 && protocol != ICLASS
                 && protocol != ISO_7816_4
+                && protocol != PROTO_CALYPSO
                 && protocol != PROTO_HITAG1
                 && protocol != PROTO_HITAG2
                 && protocol != PROTO_HITAGS
@@ -697,7 +725,7 @@ static uint16_t printTraceLine(uint16_t tracepos, uint16_t traceLen, uint8_t *tr
             (*(pos2 + 1)) = '\0';
         } else {
 
-            if (crcStatus == 0 || crcStatus == 1) {
+            if (crcStatus == TRACE_CRC_FAIL || crcStatus == TRACE_CRC_OK) {
 
                 char *pos1 = line[(data_len - 2) / TRACE_MAX_HEX_BYTES];
                 int delta = (data_len - 2) % TRACE_MAX_HEX_BYTES ? 1 : 0;
@@ -708,7 +736,7 @@ static uint16_t printTraceLine(uint16_t tracepos, uint16_t traceLen, uint8_t *tr
                 char *cb_str = str_dup(pos1 + delta);
 
                 if (g_session.supports_colors) {
-                    if (crcStatus == 0) {
+                    if (crcStatus == TRACE_CRC_FAIL) {
                         snprintf(pos1, 24, AEND " " _RED_("%s"), cb_str);
                     } else {
                         snprintf(pos1, 24, AEND " " _GREEN_("%s"), cb_str);
@@ -726,7 +754,7 @@ static uint16_t printTraceLine(uint16_t tracepos, uint16_t traceLen, uint8_t *tr
                     cb_str = str_dup(pos1);
 
                     if (g_session.supports_colors) {
-                        if (crcStatus == 0) {
+                        if (crcStatus == TRACE_CRC_FAIL) {
                             snprintf(pos1, 24, _RED_("%s"), cb_str);
                         } else {
                             snprintf(pos1, 24, _GREEN_("%s"), cb_str);
@@ -742,7 +770,13 @@ static uint16_t printTraceLine(uint16_t tracepos, uint16_t traceLen, uint8_t *tr
     }
 
     // Draw the CRC column
-    const char *crcstrings[] = { _RED_(" !! "), _GREEN_(" ok "), "    ", _GREEN_("A ok"), _GREEN_("B ok") };
+    const char *crcstrings[] = {
+        [TRACE_CRC_FAIL] = _RED_(" !! "),
+        [TRACE_CRC_OK] = _GREEN_(" ok "),
+        [TRACE_CRC_NONE] = "    ",
+        [TRACE_CRC_A_OK] = _GREEN_("A ok"),
+        [TRACE_CRC_B_OK] = _GREEN_("B ok"),
+    };
     const char *crc = crcstrings[crcStatus];
 
     // mark short bytes (less than 8 Bit + Parity)
@@ -796,6 +830,12 @@ static uint16_t printTraceLine(uint16_t tracepos, uint16_t traceLen, uint8_t *tr
         case PROTO_FMCOS20:
             annotateIso14443a(explanation, sizeof(explanation), frame, data_len, hdr->isResponse);
             break;
+        case ISO_14443B:
+            annotateIso14443b(explanation, sizeof(explanation), frame, data_len, hdr->isResponse);
+            break;
+        case PROTO_CALYPSO:
+            annotateCalypso(explanation, sizeof(explanation), frame, data_len, hdr->isResponse);
+            break;
         case PROTO_MIFARE:
         case PROTO_MFPLUS:
             annotateMifare(explanation, sizeof(explanation), frame, data_len, parityBytes, TRACELOG_PARITY_LEN(hdr), hdr->isResponse);
@@ -808,6 +848,9 @@ static uint16_t printTraceLine(uint16_t tracepos, uint16_t traceLen, uint8_t *tr
             break;
         case PROTO_HITAGS:
             annotateHitagS(explanation, sizeof(explanation), frame, (data_len * 8) - ((8 - parityBytes[0]) % 8), hdr->isResponse);
+            break;
+        case FELICA:
+            annotateFelica(explanation, sizeof(explanation), frame, data_len, hdr->isResponse);
             break;
         case PROTO_HITAGU:
             annotateHitagU(explanation, sizeof(explanation), frame, data_len, hdr->isResponse);
@@ -833,20 +876,15 @@ static uint16_t printTraceLine(uint16_t tracepos, uint16_t traceLen, uint8_t *tr
             case PROTO_MFPLUS:
                 annotateMfPlus(explanation, sizeof(explanation), frame, data_len);
                 break;
-            case ISO_14443B:
-                annotateIso14443b(explanation, sizeof(explanation), frame, data_len);
-                break;
             case TOPAZ:
                 annotateTopaz(explanation, sizeof(explanation), frame, data_len);
                 break;
             case ISO_7816_4:
-                annotateIso7816(explanation, sizeof(explanation), frame, data_len, hdr->isResponse);
+                // trace type "7816" is the contact reader, i.e. `smart list`
+                annotateIso7816(explanation, sizeof(explanation), frame, data_len, hdr->isResponse, true);
                 break;
             case ISO_15693:
                 annotateIso15693(explanation, sizeof(explanation), frame, data_len);
-                break;
-            case FELICA:
-                annotateFelica(explanation, sizeof(explanation), frame, data_len);
                 break;
             case LTO:
                 annotateLTO(explanation, sizeof(explanation), frame, data_len);
@@ -1118,7 +1156,14 @@ static int download_trace(void) {
         return PM3_ETIMEOUT;
     }
 
-    gs_traceLen = resp.oldarg[2];
+    // the download terminator carries the trace length in download_done_t.extra
+    if (resp.length < sizeof(download_done_t)) {
+        PrintAndLogEx(WARNING, "short download reply from device");
+        free(gs_trace);
+        gs_trace = NULL;
+        return PM3_ESOFT;
+    }
+    gs_traceLen = ((const download_done_t *)resp.data.asBytes)->extra;
 
     // if tracelog buffer was larger and we need to download more.
     if (gs_traceLen > PM3_CMD_DATA_SIZE) {
@@ -1317,6 +1362,7 @@ int CmdTraceList(const char *Cmd) {
                   "trace list -t 14b      -> interpret as " _YELLOW_("ISO14443-B") "\n"
                   "trace list -t 15       -> interpret as " _YELLOW_("ISO15693") "\n"
                   "trace list -t 7816     -> interpret as " _YELLOW_("ISO7816-4") "\n"
+                  "trace list -t calypso  -> interpret as " _YELLOW_("Calypso") "\n"
                   "trace list -t cryptorf -> interpret as " _YELLOW_("CryptoRF") "\n"
                   "trace list -t des      -> interpret as " _YELLOW_("MIFARE DESFire") "\n"
                   "trace list -t felica   -> interpret as " _YELLOW_("ISO18092 / FeliCa") "\n"
@@ -1385,6 +1431,7 @@ int CmdTraceList(const char *Cmd) {
     else if (strcmp(type, "14b") == 0)      protocol = ISO_14443B;
     else if (strcmp(type, "15") == 0)       protocol = ISO_15693;
     else if (strcmp(type, "7816") == 0)     protocol = ISO_7816_4;
+    else if (strcmp(type, "calypso") == 0)  protocol = PROTO_CALYPSO;
     else if (strcmp(type, "cryptorf") == 0) protocol = PROTO_CRYPTORF;
     else if (strcmp(type, "des") == 0)      protocol = MFDES;
     else if (strcmp(type, "felica") == 0)   protocol = FELICA;
@@ -1469,7 +1516,7 @@ int CmdTraceList(const char *Cmd) {
 
         if (protocol == LEGIC)
             PrintAndLogEx(INFO, _YELLOW_("LEGIC") " - Reader Mode: Timings are in ticks (1us == 1.5ticks)\n"
-                                         "        Tag Mode: Timings are in sub carrier periods (1/212 kHz == 4.7us)");
+                          "        Tag Mode: Timings are in sub carrier periods (1/212 kHz == 4.7us)");
 
         if (protocol == ISO_14443B || protocol == PROTO_CRYPTORF) {
             if (use_us)
@@ -1479,7 +1526,10 @@ int CmdTraceList(const char *Cmd) {
         }
 
         if (protocol == ISO_7816_4)
-            PrintAndLogEx(INFO, _YELLOW_("ISO7816-4 / Smartcard") " - Timings n/a");
+            PrintAndLogEx(INFO, _YELLOW_("ISO7816-4 / Smartcard") " - Timings in ticks (1/1.5MHz == 0.67us)");
+
+        if (protocol == PROTO_CALYPSO)
+            PrintAndLogEx(INFO, _YELLOW_("Calypso") " - Timings n/a");
 
         if (protocol == PROTO_HITAG1 || protocol == PROTO_HITAG2 || protocol == PROTO_HITAGS || protocol == PROTO_HITAGU) {
             PrintAndLogEx(INFO, _YELLOW_("Hitag 1 / Hitag 2 / Hitag S / Hitag µ") " - Timings in ETU (8us)");
@@ -1499,26 +1549,36 @@ int CmdTraceList(const char *Cmd) {
 
         const uint64_t *dicKeys = NULL;
         uint32_t dicKeysCount = 0;
-        bool dictionaryLoad = false;
+        bool load_dictionary = false;
 
         if (protocol == PROTO_MIFARE || protocol == PROTO_MFPLUS) {
+
             if (diclen > 0) {
+
                 uint8_t *keyBlock = NULL;
+
                 int res = loadFileDICTIONARY_safe(dictionary, (void **) &keyBlock, 6, &dicKeysCount);
                 if (res != PM3_SUCCESS || dicKeysCount == 0 || keyBlock == NULL) {
                     PrintAndLogEx(FAILED, "An error occurred while loading the dictionary! (we will use the default keys now)");
                 } else {
+
                     dicKeys = calloc(dicKeysCount, sizeof(uint64_t));
-                    for (int i = 0; i < dicKeysCount; i++) {
-                        uint64_t key = bytes_to_num(keyBlock + i * 6, 6);
-                        memcpy((uint8_t *) &dicKeys[i], &key, sizeof(uint64_t));
+                    if (dicKeys == NULL) {
+                        PrintAndLogEx(WARNING, "Failed to allocate memory");
+                    } else {
+                        for (int i = 0; i < dicKeysCount; i++) {
+                            uint64_t key = bytes_to_num(keyBlock + i * 6, 6);
+                            memcpy((uint8_t *) &dicKeys[i], &key, sizeof(uint64_t));
+                        }
+                        load_dictionary = true;
                     }
-                    dictionaryLoad = true;
                 }
+
                 if (keyBlock != NULL) {
                     free(keyBlock);
                 }
             }
+
             if (dicKeys == NULL) {
                 dicKeys = g_mifare_default_keys;
                 dicKeysCount = ARRAYLEN(g_mifare_default_keys);
@@ -1533,17 +1593,24 @@ int CmdTraceList(const char *Cmd) {
 
             // load keys
             uint8_t *keyBlock = NULL;
+
             int res = loadFileDICTIONARY_safe(dictionary, (void **) &keyBlock, HITAG_CRYPTOKEY_SIZE, &dicKeysCount);
             if (res != PM3_SUCCESS || dicKeysCount == 0 || keyBlock == NULL) {
                 PrintAndLogEx(FAILED, "An error occurred while loading the dictionary!");
             } else {
+
                 dicKeys = calloc(dicKeysCount, sizeof(uint64_t));
-                for (int i = 0; i < dicKeysCount; i++) {
-                    uint64_t key = bytes_to_num(keyBlock + i * HITAG_CRYPTOKEY_SIZE, HITAG_CRYPTOKEY_SIZE);
-                    memcpy((uint8_t *) &dicKeys[i], &key, sizeof(uint64_t));
+                if (dicKeys == NULL) {
+                    PrintAndLogEx(WARNING, "Failed to allocate memory");
+                } else {
+                    for (int i = 0; i < dicKeysCount; i++) {
+                        uint64_t key = bytes_to_num(keyBlock + i * HITAG_CRYPTOKEY_SIZE, HITAG_CRYPTOKEY_SIZE);
+                        memcpy((uint8_t *) &dicKeys[i], &key, sizeof(uint64_t));
+                    }
+                    load_dictionary = true;
                 }
-                dictionaryLoad = true;
             }
+
             if (keyBlock != NULL) {
                 free(keyBlock);
             }
@@ -1582,13 +1649,13 @@ int CmdTraceList(const char *Cmd) {
             }
         }
 
-        if (dictionaryLoad)  {
+        if (load_dictionary)  {
             free((void *) dicKeys);
         }
     }
 
     if (show_hex) {
-        PrintAndLogEx(HINT, "Hint: Syntax to use: `" _YELLOW_("text2pcap -t \"%%S.\" -l 264 -n <input-text-file> <output-pcapng-file>") "`");
+        PrintAndLogEx(HINT, "Hint: Syntax is: `" _YELLOW_("text2pcap -t \"%%S.\" -l 264 -n <input-text-file> <output-pcapng-file>") "`");
     }
 
     return PM3_SUCCESS;

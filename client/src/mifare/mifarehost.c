@@ -261,19 +261,30 @@ int mf_check_keys_fast_ex(uint8_t sectorsCnt, uint8_t firstChunk, uint8_t lastCh
 
     uint64_t t2 = msclock();
 
+    if (size > MFC_CHKKEYS_FAST_MAX_KEYS) {
+        PrintAndLogEx(WARNING, "chunk of %u keys is too large for one frame, max %zu", size, (size_t)MFC_CHKKEYS_FAST_MAX_KEYS);
+        return PM3_EOUTOFBOUND;
+    }
+
+    uint8_t buf[PM3_CMD_DATA_SIZE] = {0};
+    mf_chkkeys_fast_t *payload = (mf_chkkeys_fast_t *)buf;
+    payload->sectorcnt = sectorsCnt;
+    payload->first_chunk = firstChunk;
+    payload->last_chunk = lastChunk;
+    payload->strategy = strategy;
+    payload->use_flashmemory = use_flashmemory;
+    payload->key_count = size;
+    payload->singlesector_params = singleSectorParams;
+    memcpy(payload->keys, keyBlock, MIFARE_KEY_SIZE * size);
+
     // send keychunk
     clearCommandBuffer();
-    SendCommandOLD(CMD_HF_MIFARE_CHKKEYS_FAST
-                   , (sectorsCnt | (firstChunk << 8) | (lastChunk << 12) | (singleSectorParams << 16))
-                   , ((use_flashmemory << 8) | strategy)
-                   , size
-                   , keyBlock
-                   , (MIFARE_KEY_SIZE * size)
-                  );
+    SendCommandNG(CMD_HF_MIFARE_CHKKEYS_FAST, buf, sizeof(mf_chkkeys_fast_t) + (MIFARE_KEY_SIZE * size));
+
     PacketResponseNG resp;
 
     uint32_t timeout = 0;
-    while (WaitForResponseTimeout(CMD_ACK, &resp, 2000) == false) {
+    while (WaitForResponseTimeout(CMD_HF_MIFARE_CHKKEYS_FAST, &resp, 2000) == false) {
 
         while (kbd_enter_pressed()) {
             SendCommandNG(CMD_BREAK_LOOP, NULL, 0);
@@ -304,18 +315,27 @@ int mf_check_keys_fast_ex(uint8_t sectorsCnt, uint8_t firstChunk, uint8_t lastCh
         PrintAndLogEx(NORMAL, "");
     }
     // time to convert the returned data.
-    uint8_t curr_keys = resp.oldarg[0];
+    uint8_t curr_keys = (uint8_t)resp.status;
 
     if ((singleSectorParams >> 15) & 1) {
 
         if (curr_keys) {
+            uint8_t block_no = singleSectorParams & 0xFF;
+            uint8_t key_type = (singleSectorParams >> 8) & 1;
+            uint8_t sector_no = mfSectorNum(block_no);
+            if (sector_no < sectorsCnt) {
+                e_sector[sector_no].Key[key_type] = bytes_to_num(resp.data.asBytes, MIFARE_KEY_SIZE);
+                e_sector[sector_no].foundKey[key_type] = true;
+            }
 
-            PrintAndLogEx(NORMAL, "");
-            PrintAndLogEx(SUCCESS, "\nTarget block " _GREEN_("%4u") " key type " _GREEN_("%c") " -- found valid key [ " _GREEN_("%s") " ]",
-                          singleSectorParams & 0xFF,
-                          ((singleSectorParams >> 8) & 1) ? 'B' : 'A',
-                          sprint_hex_inrow(resp.data.asBytes, MIFARE_KEY_SIZE)
-                         );
+            if (quiet == false) {
+                PrintAndLogEx(NORMAL, "");
+                PrintAndLogEx(SUCCESS, "Target block " _GREEN_("%4u") " key type " _GREEN_("%c") " -- found valid key [ " _GREEN_("%s") " ]",
+                              block_no,
+                              key_type ? 'B' : 'A',
+                              sprint_hex_inrow(resp.data.asBytes, MIFARE_KEY_SIZE)
+                             );
+            }
 
             return PM3_SUCCESS;
         }
@@ -970,14 +990,23 @@ out:
 // MIFARE
 int mf_read_sector(uint8_t sectorNo, uint8_t keyType, const uint8_t *key, uint8_t *data) {
 
-    clearCommandBuffer();
-    SendCommandMIX(CMD_HF_MIFARE_READSC, sectorNo, keyType, 0, (uint8_t *)key, MIFARE_KEY_SIZE);
-    PacketResponseNG resp;
-    if (WaitForResponseTimeout(CMD_ACK, &resp, 1500)) {
-        uint8_t isOK  = resp.oldarg[0] & 0xFF;
+    mf_readsector_t payload = {
+        .sectorno = sectorNo,
+        .keytype = keyType,
+    };
+    memcpy(payload.key, key, MIFARE_KEY_SIZE);
 
-        if (isOK) {
-            memcpy(data, resp.data.asBytes, mfNumBlocksPerSector(sectorNo) * MFBLOCK_SIZE);
+    clearCommandBuffer();
+    SendCommandNG(CMD_HF_MIFARE_READSC, (uint8_t *)&payload, sizeof(payload));
+    PacketResponseNG resp;
+    if (WaitForResponseTimeout(CMD_HF_MIFARE_READSC, &resp, 1500)) {
+
+        if (resp.status == PM3_SUCCESS) {
+            size_t need = mfNumBlocksPerSector(sectorNo) * MFBLOCK_SIZE;
+            if (resp.length < need) {
+                return PM3_EUNDEF;
+            }
+            memcpy(data, resp.data.asBytes, need);
             return PM3_SUCCESS;
         } else {
             return PM3_EUNDEF;
@@ -1020,14 +1049,24 @@ int mf_write_block(uint8_t blockno, uint8_t keyType, const uint8_t *key, const u
     memcpy(data + 10, block, MFBLOCK_SIZE);
 
     clearCommandBuffer();
-    SendCommandMIX(CMD_HF_MIFARE_WRITEBL, blockno, keyType, 0, data, sizeof(data));
+    mf_writeblock_ex_t payload = {
+        .wakeup = MF_WAKE_WUPA,
+        .auth_cmd = MIFARE_AUTH_KEYA + (keyType & 0xF),
+        .write_cmd = ISO14443A_CMD_WRITEBLOCK,
+        .block_no = blockno,
+    };
+    memcpy(payload.key, data, MIFARE_KEY_SIZE);
+    memcpy(payload.block_data, data + 10, MFBLOCK_SIZE);
+
+    SendCommandNG(CMD_HF_MIFARE_WRITEBL_EX, (uint8_t *)&payload, sizeof(payload));
+
     PacketResponseNG resp;
-    if (WaitForResponseTimeout(CMD_ACK, &resp, 1500) == false) {
+    if (WaitForResponseTimeout(CMD_HF_MIFARE_WRITEBL_EX, &resp, 1500) == false) {
         PrintAndLogEx(FAILED, "mfWriteBlock execution time out");
         return PM3_ETIMEOUT;
     }
     int res = PM3_SUCCESS;
-    if ((resp.oldarg[0] & 0xff) != 1) {
+    if (resp.status != PM3_SUCCESS) {
         res = PM3_EFAILED;
     }
     return res;
@@ -1241,23 +1280,28 @@ int mf_chinese_wipe(uint8_t *uid, const uint8_t *atqa, const uint8_t *sak, uint8
 
 int mf_chinese_set_block(uint8_t blockNo, uint8_t *data, uint8_t *uid, uint8_t params) {
 
+    uint8_t buf[PM3_CMD_DATA_SIZE] = {0};
+    mf_chinese_blk_t *payload = (mf_chinese_blk_t *)buf;
+    payload->params = params;
+    payload->blockno = blockNo;
+    memcpy(payload->data, data, MFBLOCK_SIZE);
+
     clearCommandBuffer();
-    SendCommandMIX(CMD_HF_MIFARE_CSETBL, params, blockNo, 0, data, MFBLOCK_SIZE);
+    SendCommandNG(CMD_HF_MIFARE_CSETBL, buf, sizeof(mf_chinese_blk_t) + MFBLOCK_SIZE);
     PacketResponseNG resp;
-    if (WaitForResponseTimeout(CMD_ACK, &resp, 3500) == false) {
+    if (WaitForResponseTimeout(CMD_HF_MIFARE_CSETBL, &resp, 3500) == false) {
         PrintAndLogEx(NORMAL, "");
         PrintAndLogEx(WARNING, "Command execution time out");
         return PM3_ETIMEOUT;
     }
 
-    uint8_t isOK  = resp.oldarg[0] & 0xFF;
-    if (uid != NULL) {
+    if ((uid != NULL) && (resp.status == PM3_SUCCESS) && (resp.length >= 4)) {
         memcpy(uid, resp.data.asBytes, 4);
     }
 
-    if (isOK == 0) {
+    if (resp.status != PM3_SUCCESS) {
 
-        uint8_t reason = (resp.oldarg[1] & 0xFF);
+        uint8_t reason = (uint8_t)resp.reason;
         if (reason == 4) {
             PrintAndLogEx(NORMAL, "");
             PrintAndLogEx(WARNING, "GDM magic write signature block failed");
@@ -1273,12 +1317,16 @@ int mf_chinese_set_block(uint8_t blockNo, uint8_t *data, uint8_t *uid, uint8_t p
 }
 
 int mf_chinese_get_block(uint8_t blockNo, uint8_t *data, uint8_t params) {
+    mf_chinese_blk_t payload = {
+        .params = params,
+        .blockno = blockNo,
+    };
+
     clearCommandBuffer();
-    SendCommandMIX(CMD_HF_MIFARE_CGETBL, params, blockNo, 0, NULL, 0);
+    SendCommandNG(CMD_HF_MIFARE_CGETBL, (uint8_t *)&payload, sizeof(payload));
     PacketResponseNG resp;
-    if (WaitForResponseTimeout(CMD_ACK, &resp, 1500)) {
-        uint8_t isOK  = resp.oldarg[0] & 0xff;
-        if (isOK == 0) {
+    if (WaitForResponseTimeout(CMD_HF_MIFARE_CGETBL, &resp, 1500)) {
+        if (resp.status != PM3_SUCCESS || resp.length < MFBLOCK_SIZE) {
             return PM3_EUNDEF;
         }
         memcpy(data, resp.data.asBytes, MFBLOCK_SIZE);
@@ -1290,8 +1338,13 @@ int mf_chinese_get_block(uint8_t blockNo, uint8_t *data, uint8_t params) {
 }
 
 int mf_chinese_gen_3_uid(uint8_t *uid, uint8_t uidlen, uint8_t *oldUid) {
+    uint8_t buf[PM3_CMD_DATA_SIZE] = {0};
+    mf_gen3uid_t *payload = (mf_gen3uid_t *)buf;
+    payload->uidlen = uidlen;
+    memcpy(payload->uid, uid, uidlen);
+
     clearCommandBuffer();
-    SendCommandMIX(CMD_HF_MIFARE_GEN3UID, uidlen, 0, 0, uid, uidlen);
+    SendCommandNG(CMD_HF_MIFARE_GEN3UID, buf, sizeof(mf_gen3uid_t) + uidlen);
     PacketResponseNG resp;
     if (WaitForResponseTimeout(CMD_HF_MIFARE_GEN3UID, &resp, 3500)) {
         if (resp.status == PM3_SUCCESS && oldUid) {
@@ -1305,8 +1358,13 @@ int mf_chinese_gen_3_uid(uint8_t *uid, uint8_t uidlen, uint8_t *oldUid) {
 }
 
 int mf_chinese_gen_3_block(uint8_t *block, int blockLen, uint8_t *newBlock) {
+    uint8_t buf[PM3_CMD_DATA_SIZE] = {0};
+    mf_gen3blk_t *payload = (mf_gen3blk_t *)buf;
+    payload->blocklen = blockLen;
+    memcpy(payload->block, block, MFBLOCK_SIZE);
+
     clearCommandBuffer();
-    SendCommandMIX(CMD_HF_MIFARE_GEN3BLK, blockLen, 0, 0, block, MFBLOCK_SIZE);
+    SendCommandNG(CMD_HF_MIFARE_GEN3BLK, buf, sizeof(mf_gen3blk_t) + MFBLOCK_SIZE);
     PacketResponseNG resp;
     if (WaitForResponseTimeout(CMD_HF_MIFARE_GEN3BLK, &resp, 3500) == false) {
         PrintAndLogEx(WARNING, "command execution time out");
@@ -1392,32 +1450,36 @@ int detect_classic_prng(void) {
 
     PacketResponseNG resp, respA;
     uint8_t cmd[] = {MIFARE_AUTH_KEYA, 0x00};
-    uint32_t flags = ISO14A_CONNECT | ISO14A_RAW | ISO14A_APPEND_CRC | ISO14A_NO_RATS;
+    uint32_t flags = ISO14A_CONNECT | ISO14A_CLEARTRACE | ISO14A_RAW | ISO14A_APPEND_CRC | ISO14A_NO_RATS;
 
     clearCommandBuffer();
-    SendCommandMIX(CMD_HF_ISO14443A_READER, flags, sizeof(cmd), 0, cmd, sizeof(cmd));
-    if (WaitForResponseTimeout(CMD_ACK, &resp, 2000) == false) {
+    SendIso14aReader(flags, cmd, sizeof(cmd));
+
+    // CONNECT + RAW, so the device answers twice: select first, then the raw exchange
+    uint8_t select_status = 0;
+    if (WaitForIso14aReply(&resp, 2000, NULL, &select_status) == false) {
         PrintAndLogEx(WARNING, "timeout while waiting for reply");
         return PM3_ETIMEOUT;
     }
 
     // if select tag failed.
-    if (resp.oldarg[0] == 0) {
+    if (select_status == 0) {
         PrintAndLogEx(ERR, "error:  selecting tag failed,  can't detect prng\n");
         return PM3_ERFTRANS;
     }
-    if (WaitForResponseTimeout(CMD_ACK, &respA, 2500) == false) {
+    uint16_t rlen = 0;
+    if (WaitForIso14aReply(&respA, 2500, &rlen, NULL) == false) {
         PrintAndLogEx(WARNING, "timeout while waiting for reply");
         return PM3_ETIMEOUT;
     }
 
     // check respA
-    if (respA.oldarg[0] != 4) {
-        PrintAndLogEx(ERR, "PRNG data error: Wrong length: %"PRIu64, respA.oldarg[0]);
+    if (rlen != 4) {
+        PrintAndLogEx(ERR, "PRNG data error: Wrong length: %u", rlen);
         return PM3_ESOFT;
     }
 
-    uint32_t nonce = bytes_to_num(respA.data.asBytes, respA.oldarg[0]);
+    uint32_t nonce = bytes_to_num(respA.data.asBytes, rlen);
     return validate_prng_nonce(nonce);
 }
 
@@ -1432,27 +1494,31 @@ int detect_classic_auth(uint8_t key_type) {
 
     PacketResponseNG resp, respA;
     uint8_t cmd[] = {MIFARE_AUTH_KEYA + key_type, 0x00};
-    uint32_t flags = ISO14A_CONNECT | ISO14A_RAW | ISO14A_APPEND_CRC | ISO14A_NO_RATS;
+    uint32_t flags = ISO14A_CONNECT | ISO14A_CLEARTRACE | ISO14A_RAW | ISO14A_APPEND_CRC | ISO14A_NO_RATS;
 
     clearCommandBuffer();
-    SendCommandMIX(CMD_HF_ISO14443A_READER, flags, sizeof(cmd), 0, cmd, sizeof(cmd));
-    if (WaitForResponseTimeout(CMD_ACK, &resp, 2000) == false) {
+    SendIso14aReader(flags, cmd, sizeof(cmd));
+
+    // CONNECT + RAW, so the device answers twice: select first, then the raw exchange
+    uint8_t select_status = 0;
+    if (WaitForIso14aReply(&resp, 2000, NULL, &select_status) == false) {
         PrintAndLogEx(WARNING, "timeout while waiting for reply");
         return PM3_ETIMEOUT;
     }
 
     // if select tag failed.
-    if (resp.oldarg[0] == 0) {
+    if (select_status == 0) {
         PrintAndLogEx(ERR, "error:  selecting tag failed,  can't detect nonce\n");
         return PM3_ERFTRANS;
     }
-    if (WaitForResponseTimeout(CMD_ACK, &respA, 2500) == false) {
+    uint16_t rlen = 0;
+    if (WaitForIso14aReply(&respA, 2500, &rlen, NULL) == false) {
         PrintAndLogEx(WARNING, "timeout while waiting for reply");
         return PM3_ETIMEOUT;
     }
 
     // check respA for a nonce
-    return respA.oldarg[0] == 4;
+    return (rlen == 4);
 }
 
 /* Detect Mifare Classic NACK bug

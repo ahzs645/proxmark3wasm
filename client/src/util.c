@@ -33,6 +33,8 @@
 #include <time.h> // Mingw
 
 #include "ui.h"     // PrintAndLog
+#include "comms.h"  // SendCommandNG / WaitForResponseTimeout (set_rgb)
+#include "pm3_cmd.h" // CMD_PM5_RGB_SET
 
 #define UTIL_BUFFER_SIZE_SPRINT 8196
 // global client debug variable
@@ -287,7 +289,10 @@ void hex_to_buffer(uint8_t *buf, const uint8_t *hex_data, const size_t hex_len, 
         m = hex_max_len;
     }
 
-    while (m--) {
+    // Pad up to m, the way ascii_to_buffer() above does. This used to write m
+    // spaces from wherever it had got to, so a padded field came out i
+    // characters too wide - a 7 byte AID asked to fill 16 produced 30.
+    for (; i < m; i++) {
         *(tmp++) = ' ';
     }
 
@@ -353,6 +358,38 @@ void print_hex_noascii_break(const uint8_t *data, const size_t len, uint8_t brea
         // add the spaces...
         snprintf(buf + strlen(buf), sizeof(buf) - strlen(buf), "%*s", ((breaks - mod) * 3), " ");
         PrintAndLogEx(INFO, "%s", buf);
+    }
+}
+
+void print_hex_noascii_break_ex(const uint8_t *data, const size_t len, uint8_t breaks, const char *prefix, char separator, const char *suffix) {
+    if (data == NULL || len == 0 || breaks == 0) return;
+
+    if (prefix == NULL) {
+        prefix = "";
+    }
+    if (suffix == NULL) {
+        suffix = "";
+    }
+    char sep[2] = {separator, '\0'};
+
+    for (size_t pos = 0; pos < len; pos += breaks) {
+        char buf[UTIL_BUFFER_SIZE_SPRINT + 3] = {0};
+        size_t chunk_len = len - pos;
+        if (chunk_len > breaks) {
+            chunk_len = breaks;
+        }
+
+        char *p = buf;
+        size_t remaining = sizeof(buf);
+        for (size_t i = 0; i < chunk_len; i++) {
+            int written = snprintf(p, remaining, "%s%02X", (i > 0 && separator != '\0') ? sep : "", data[pos + i]);
+            if (written < 0 || (size_t)written >= remaining) {
+                break;
+            }
+            p += written;
+            remaining -= (size_t)written;
+        }
+        PrintAndLogEx(INFO, "%s%s%s", prefix, buf, suffix);
     }
 }
 
@@ -700,7 +737,7 @@ int parse_uint32_hex_or_dec(const char *text, uint32_t *out) {
         base = 16;
     } else {
         for (const char *p = text; *p; p++) {
-            if (isalpha((unsigned char)*p)) {
+            if (isalpha((unsigned char) * p)) {
                 base = 16;
                 break;
             }
@@ -1416,6 +1453,71 @@ void strn_upper(char *s, size_t n) {
         s[i] = toupper(s[i]);
     }
 }
+
+static int char_compare_case_insensitive(char a, char b) {
+    return tolower((unsigned char)a) - tolower((unsigned char)b);
+}
+
+bool str_equal_case_insensitive(const char *a, const char *b) {
+    if (a == NULL || b == NULL) {
+        return false;
+    }
+
+    while (*a != '\0' && *b != '\0') {
+        if (char_compare_case_insensitive(*a, *b) != 0) {
+            return false;
+        }
+        a++;
+        b++;
+    }
+
+    return *a == '\0' && *b == '\0';
+}
+
+bool str_startswith_case_insensitive(const char *s, const char *pre) {
+    if (s == NULL || pre == NULL) {
+        return false;
+    }
+
+    while (*pre != '\0') {
+        if (*s == '\0' || char_compare_case_insensitive(*s, *pre) != 0) {
+            return false;
+        }
+        s++;
+        pre++;
+    }
+
+    return true;
+}
+
+bool str_contains_case_insensitive(const char *s, const char *needle) {
+    if (s == NULL || needle == NULL) {
+        return false;
+    }
+
+    size_t needle_len = strlen(needle);
+    if (needle_len == 0) {
+        return true;
+    }
+
+    size_t s_len = strlen(s);
+    if (needle_len > s_len) {
+        return false;
+    }
+
+    for (size_t i = 0; i <= (s_len - needle_len); i++) {
+        size_t j = 0;
+        while (j < needle_len && char_compare_case_insensitive(s[i + j], needle[j]) == 0) {
+            j++;
+        }
+        if (j == needle_len) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
 // check for prefix in string
 bool str_startswith(const char *s,  const char *pre) {
     return strncmp(pre, s, strlen(pre)) == 0;
@@ -1522,6 +1624,112 @@ size_t str_nlen(const char *src, size_t maxlen) {
         }
     }
     return len;
+}
+
+size_t str_copy(char *dst, size_t dst_size, const char *src) {
+    if (src == NULL) {
+        if (dst != NULL && dst_size > 0) {
+            dst[0] = '\0';
+        }
+        return 0;
+    }
+
+    size_t src_len = strlen(src);
+    if (dst == NULL || dst_size == 0) {
+        return src_len;
+    }
+
+    size_t copy_len = src_len;
+    if (copy_len >= dst_size) {
+        copy_len = dst_size - 1;
+    }
+    memcpy(dst, src, copy_len);
+    dst[copy_len] = '\0';
+    return src_len;
+}
+
+static bool str_regex_atom_matches(char atom, bool escaped, char c) {
+    if (!escaped && atom == '.') {
+        return true;
+    }
+    return (atom == c);
+}
+
+static bool str_regex_match_here(const char *regexp, const char *text);
+
+static bool str_regex_match_star(char atom, bool escaped, const char *regexp, const char *text) {
+    do {
+        if (str_regex_match_here(regexp, text)) {
+            return true;
+        }
+    } while (*text != '\0' && str_regex_atom_matches(atom, escaped, *text++));
+
+    return false;
+}
+
+static bool str_regex_match_here(const char *regexp, const char *text) {
+    if (regexp[0] == '\0') {
+        return true;
+    }
+
+    if (regexp[0] == '$' && regexp[1] == '\0') {
+        return (text[0] == '\0');
+    }
+
+    bool escaped = false;
+    char atom = regexp[0];
+    size_t atom_len = 1;
+    if (regexp[0] == '\\' && regexp[1] != '\0') {
+        escaped = true;
+        atom = regexp[1];
+        atom_len = 2;
+    }
+
+    if (regexp[atom_len] == '*') {
+        return str_regex_match_star(atom, escaped, regexp + atom_len + 1, text);
+    }
+
+    if (text[0] != '\0' && str_regex_atom_matches(atom, escaped, text[0])) {
+        return str_regex_match_here(regexp + atom_len, text + 1);
+    }
+
+    return false;
+}
+
+bool str_regex_match(const char *regexp, const char *text) {
+    if (regexp[0] == '^') {
+        return str_regex_match_here(regexp + 1, text);
+    }
+
+    do {
+        if (str_regex_match_here(regexp, text)) {
+            return true;
+        }
+    } while (*text++ != '\0');
+
+    return false;
+}
+
+bool str_regex_match_case_insensitive(const char *regexp, const char *text) {
+    if (regexp == NULL || text == NULL) {
+        return false;
+    }
+
+    char *pattern_lc = str_dup(regexp);
+    char *text_lc = str_dup(text);
+    if (pattern_lc == NULL || text_lc == NULL) {
+        free(pattern_lc);
+        free(text_lc);
+        return false;
+    }
+
+    str_lower(pattern_lc);
+    str_lower(text_lc);
+    bool matched = str_regex_match(pattern_lc, text_lc);
+
+    free(pattern_lc);
+    free(text_lc);
+    return matched;
 }
 
 void str_reverse(char *buf,  size_t len) {
@@ -1726,9 +1934,18 @@ int byte_strrstr(const uint8_t *src, size_t srclen, const uint8_t *pattern, size
 }
 
 void sb_append_char(smartbuf *sb, unsigned char c) {
+
     if (sb->idx >= sb->size) {
+
         sb->size *= 2;
-        sb->ptr = realloc(sb->ptr, sb->size);
+
+        void *tmp = realloc(sb->ptr, sb->size);
+        if (tmp == NULL) {
+            PrintAndLogEx(WARNING, "Failed to allocate memory");
+            return;
+        }
+
+        sb->ptr = tmp;
     }
     sb->ptr[sb->idx] = c;
     sb->idx++;
@@ -1788,4 +2005,88 @@ size_t unduplicate(uint8_t *d, size_t n, const uint8_t item_n) {
     }
 
     return write_index;
+}
+
+void str_trim_ascii_inplace(char *s) {
+    if (s == NULL) {
+        return;
+    }
+
+    size_t start = 0;
+    size_t len = strlen(s);
+    while (start < len && isspace((unsigned char)s[start])) {
+        start++;
+    }
+    while (len > start && isspace((unsigned char)s[len - 1])) {
+        len--;
+    }
+
+    if (start > 0) {
+        memmove(s, s + start, len - start);
+    }
+    s[len - start] = '\0';
+}
+
+void str_unescape_newlines_inplace(char *s) {
+    if (s == NULL) {
+        return;
+    }
+
+    size_t read_pos = 0;
+    size_t write_pos = 0;
+    size_t len = strlen(s);
+    while (read_pos < len) {
+        if (s[read_pos] == '\\' && (read_pos + 1) < len) {
+            char esc = s[read_pos + 1];
+            if (esc == 'n') {
+                s[write_pos++] = '\n';
+                read_pos += 2;
+                continue;
+            }
+            if (esc == 'r') {
+                s[write_pos++] = '\r';
+                read_pos += 2;
+                continue;
+            }
+            if (esc == 't') {
+                s[write_pos++] = '\t';
+                read_pos += 2;
+                continue;
+            }
+        }
+        s[write_pos++] = s[read_pos++];
+    }
+    s[write_pos] = '\0';
+}
+
+int str_copy_without_whitespace(const char *src, char *dst, size_t dst_size, size_t *dst_len) {
+    if (src == NULL || dst == NULL || dst_len == NULL || dst_size == 0) {
+        return PM3_EINVARG;
+    }
+
+    size_t out = 0;
+    for (size_t i = 0; src[i] != '\0'; i++) {
+        if (isspace((unsigned char)src[i])) {
+            continue;
+        }
+        if ((out + 1) >= dst_size) {
+            return PM3_EOVFLOW;
+        }
+        dst[out++] = src[i];
+    }
+    dst[out] = '\0';
+    *dst_len = out;
+    return PM3_SUCCESS;
+}
+
+void set_rgb(uint8_t r, uint8_t g, uint8_t b) {
+    struct {
+        uint8_t r;
+        uint8_t g;
+        uint8_t b;
+    } PACKED payload = { r, g, b };
+    clearCommandBuffer();
+    SendCommandNG(CMD_PM5_RGB_SET, (uint8_t *)&payload, sizeof(payload));
+    PacketResponseNG resp;
+    WaitForResponseTimeout(CMD_PM5_RGB_SET, &resp, 200);
 }

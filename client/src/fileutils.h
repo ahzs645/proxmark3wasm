@@ -32,6 +32,7 @@
 #include "protocols.h"    // iclass defines
 #include "cmdhftopaz.h"   // TOPAZ defines
 #include "mifare/mifaredefault.h"     // MFP / AES defines
+#include "iso15.h"        // iso15_tag_t
 
 typedef union {
     void *v;
@@ -40,6 +41,7 @@ typedef union {
     topaz_tag_t *topaz;
     iso14a_mf_extdump_t *mfc;
     iso14a_mf_dump_ev1_t *mfc_ev1;
+    iso15_tag_t *iso15;
 } udata_t;
 
 typedef enum {
@@ -48,7 +50,10 @@ typedef enum {
     jsfMfc_v2,
     jsfMfc_v3,
     jsfMfuMemory,
-    jsfHitag,
+    jsfHitag1,
+    jsfHitag2,
+    jsfHitagS,
+    jsfHitagU,
     jsfIclass,
     jsf14b,
     jsf14b_v2,
@@ -56,6 +61,7 @@ typedef enum {
     jsf15_v2,
     jsf15_v3,
     jsf15_v4,
+    jsf15_v5,
     jsfLegic,
     jsfLegic_v2,
     jsfT55x7,
@@ -113,6 +119,42 @@ typedef enum {
 } iso15_df_e;
 
 int fileExists(const char *filename);
+
+/**
+ * @brief Check whether a path exists and is a directory.
+ */
+bool path_is_directory(const char *path);
+
+/**
+ * @brief Check whether a path exists and is a regular file.
+ */
+bool path_is_regular_file(const char *path);
+
+/**
+ * @brief Return the final path component, or an empty string for NULL input.
+ */
+const char *path_basename(const char *path);
+
+/**
+ * @brief Copy the final path component without its last file extension.
+ */
+void path_basename_without_ext(const char *path, char *out, size_t out_len);
+
+/**
+ * @brief Recursively collect regular file paths under a directory into fixed-size slots.
+ *
+ * A max_depth of 0 scans only dirpath and does not descend into subdirectories.
+ */
+int collect_file_paths_recursive(const char *dirpath, char *paths, size_t path_len,
+                                 size_t max_paths, size_t *count, bool include_hidden, size_t max_depth);
+
+/**
+ * @brief Resolve a resources subdirectory and recursively collect regular file paths from it.
+ *
+ * A max_depth of 0 scans only the resolved resource_dir and does not descend into subdirectories.
+ */
+int collect_resource_file_paths(const char *resource_dir, char *paths, size_t path_len,
+                                size_t max_paths, size_t *count, bool include_hidden, size_t max_depth);
 
 // set a path in the path list g_session.defaultPaths
 bool setDefaultPath(savePaths_t pathIndex, const char *path);
@@ -353,6 +395,17 @@ int loadFileBinaryKey(const char *preferredName, const char *suffix, void **keya
  * @return PM3_SUCCESS for ok, PM3_ESOFT for fails
 */
 int convert_mfu_dump_format(uint8_t **dump, size_t *dumplen, bool verbose);
+
+/**
+ * @brief Convert an ISO15693 dump to the current iso15_tag_t revision.
+ * A .bin has no version field, only a length, so the length selects the layout.
+ * A dump that already is the current revision is left untouched.
+ * @param dump pointer to loaded dump, replaced on conversion
+ * @param dumplen the number of bytes loaded, updated on conversion
+ * @param verbose - extra debug output
+ * @return PM3_SUCCESS for ok, PM3_ESOFT for an unrecognised length
+*/
+int convert_15_dump_format(uint8_t **dump, size_t *dumplen, bool verbose);
 mfu_df_e detect_mfu_dump_format(uint8_t **dump, bool verbose);
 int detect_nfc_dump_format(const char *preferredName, nfc_df_e *dump_type, bool verbose);
 
@@ -392,6 +445,10 @@ int pm3_load_dump(const char *fn, void **pdump, size_t *dumplen, size_t maxdumpl
  * @return PM3_SUCCESS if OK
  */
 int pm3_save_dump(const char *fn, uint8_t *d, size_t n, JSONFileType jsft);
+// as pm3_save_dump, but lets the caller add fields the raw dump cannot carry,
+// such as the Hitag u UID and ICR which arrive separately from the pages
+int pm3_save_dump_cb(const char *fn, uint8_t *d, size_t n, JSONFileType jsft, void (*callback)(json_t *));
+int pm3_save_dump_json(const char *fn, uint8_t *d, size_t n, JSONFileType jsft);
 
 /** STUB
  * @brief Utility function to save data to three file files (BIN/JSON).

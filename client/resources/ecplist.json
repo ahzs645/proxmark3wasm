@@ -51,6 +51,13 @@
     },
     {
         "type": "transit",
+        "key": ["marta", "atlanta", "breeze"],
+        "value": "6a02c801000304080000000000",
+        "name": "Transit: MARTA",
+        "description": ""
+    },
+    {
+        "type": "transit",
         "key": ["wmata", "smarttrip", "washington"],
         "value": "6a02c801000300010000000000",
         "name": "Transit: WMATA",
@@ -62,6 +69,20 @@
         "value": "6a02c801000300027900000000",
         "name": "Transit: TFL",
         "description": "Found by a member of Proxmark community. Data bytes define a mask of supported EMV payment networks for fallback. In this case: Amex, Visa, Mastercard, Maestro, Vpay"
+    },
+    {
+        "type": "transit",
+        "key": ["mbta", "boston"],
+        "value": "6a02c801000300030000000000",
+        "name": "Transit: MBTA",
+        "description": ""
+    },
+    {
+        "type": "transit",
+        "key": ["brisbane"],
+        "value": "6a02c801000300040000000000",
+        "name": "Transit: Brisbane",
+        "description": ""
     },
     {
         "type": "transit",
@@ -92,11 +113,32 @@
         "description": ""
     },
     {
+        "type": "transit",
+        "key": ["lyon"],
+        "value": "6a02c80100030b300000000000",
+        "name": "Transit: Lyon",
+        "description": ""
+    },
+    {
+        "type": "transit",
+        "key": ["regielignedazur", "rla", "nice"],
+        "value": "6a02c80100030c540000000000",
+        "name": "Transit: Régie Ligne d'Azur",
+        "description": ""
+    },
+    {
         "type": "access",
         "key": ["demo", "placeholder"],
         "value": "6a02c3020002ffff",
         "name": "Access: Demo TCI 02FFFF",
         "description": "Demo TCI assigned by Apple to test access control systems; Also used as a placeholder in some cases"
+    },
+    {
+        "type": "access",
+        "key": ["intuitdome", "intuit"],
+        "value": "6a02c30200023c20",
+        "name": "Access: Intuit Dome",
+        "description": ""
     },
     {
         "type": "access",
