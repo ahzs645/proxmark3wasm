@@ -41,6 +41,9 @@ static uart_ringbuf_t g_uart_rx;
 static uart_ringbuf_t g_uart_tx;
 static uart_ringbuf_t g_uart_stdin;
 static uint32_t timeout_value = 30;
+// Set by uart_wakeup() from the main thread; consumed by the comm thread in
+// uart_receive() so a queued command is not stuck behind a full receive wait.
+static _Atomic uint32_t g_wakeup_pending;
 
 static size_t rb_read(uart_ringbuf_t *rb, uint8_t *dst, size_t maxlen) {
     uint32_t head = atomic_load_explicit(&rb->head, memory_order_acquire);
@@ -164,6 +167,10 @@ int uart_read_stdin(void) {
     return rb_read(&g_uart_stdin, &c, 1) > 0 ? (int)c : 0;
 }
 
+void uart_wakeup(void) {
+    atomic_store_explicit(&g_wakeup_pending, 1, memory_order_release);
+}
+
 int uart_reconfigure_timeouts(uint32_t value) {
     timeout_value = value;
     return PM3_SUCCESS;
@@ -225,6 +232,13 @@ int uart_receive(const serial_port sp, uint8_t *pbtRx, uint32_t pszMaxRxLen, uin
         }
 
         if (emscripten_get_now() - start_time > 500.0) {
+            break;
+        }
+
+        // Only honour a wakeup while no part of a frame is in hand, mirroring
+        // uart_posix.c: cutting a frame short would hand back a partial packet.
+        if (total_read == 0 &&
+            atomic_exchange_explicit(&g_wakeup_pending, 0, memory_order_acq_rel) != 0) {
             break;
         }
 

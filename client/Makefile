@@ -494,6 +494,9 @@ CFLAGS += $(MYDEFS) $(MYCFLAGS) $(MYINCLUDES)
 
 ifdef EMSCRIPTEN
     CFLAGS += -pthread
+    # Emscripten ships a newer clang than upstream targets; keep its extra
+    # diagnostics (e.g. -Wunused-but-set-global) from failing the build.
+    CFLAGS += -Wno-error
 endif
 
 # We cannot just use CFLAGS+=... because it has impact on sub-makes if CFLAGS is defined in env:
@@ -587,7 +590,7 @@ endif
 endif
 
 ifdef EMSCRIPTEN
-    PM3LDFLAGS += -pthread -sUSE_PTHREADS=1 -sPROXY_TO_PTHREAD=1
+    PM3LDFLAGS += -pthread -sPROXY_TO_PTHREAD=1
     PM3LDFLAGS += -sPTHREAD_POOL_SIZE=8
     PM3LDFLAGS += -sSTACK_SIZE=1048576
     PM3LDFLAGS += -sDEFAULT_PTHREAD_STACK_SIZE=1048576
