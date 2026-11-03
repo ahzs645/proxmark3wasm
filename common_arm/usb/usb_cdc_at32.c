@@ -5,6 +5,7 @@
 #include "usb_read_ng.h"
 #include "usb_cdc_desc.h"
 
+#include "at32f435_437.h"
 #include "at32f435_437_crm.h"
 #include "at32f435_437_acc.h"
 #include "at32f435_437_gpio.h"
@@ -18,12 +19,35 @@ static otg_core_type otg_core_struct;
 static usbd_core_type *udev = &(otg_core_struct.dev);
 static usbd_desc_t vp_desc;
 
-// Spin-wait iteration bound for usb_write()'s tx-complete wait, not a time
-// unit - g_tx_completed is set from the USB core's own IN-endpoint ISR, so
-// this can't use the shared ticks timer (see ticks_apis.h StartTicks()/
+// How long usb_write() waits for the host to collect a transfer before giving
+// up and dropping the frame. The host decides when the IN endpoint is polled:
+// a native client reads continuously, but a browser's Web Serial stack can
+// pause its USB reads for tens of milliseconds, and the old ~2M-spin bound
+// silently dropped whole frames from bulk replies there. A cable pull still
+// fails at once through usb_check().
+//
+// g_tx_completed is set from the USB core's own IN-endpoint ISR, so this
+// can't use the shared ticks timer (see ticks_apis.h StartTicks()/
 // StopTicks() callers elsewhere in armsrc - it's routinely stopped by
-// LF/HF code at the exact moments a reply may need to go out).
-#define USB_TX_COMPLETE_TIMEOUT  2000000
+// LF/HF code at the exact moments a reply may need to go out). It uses the
+// core cycle counter instead, which nothing stops.
+#define USB_TX_COMPLETE_TIMEOUT_US  250000
+
+static uint32_t usb_tx_wait_start(void) {
+    // Idempotent: pm5_power may already run the counter; never reset it here.
+    CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
+    DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
+    return DWT->CYCCNT;
+}
+
+static bool usb_tx_wait_expired(uint32_t start) {
+    uint32_t cycles_per_us = system_core_clock / 1000000;
+    if (cycles_per_us == 0) {
+        cycles_per_us = 1;
+    }
+    // Unsigned difference survives the counter wrapping (~15 s at 288 MHz).
+    return ((DWT->CYCCNT - start) / cycles_per_us) > USB_TX_COMPLETE_TIMEOUT_US;
+}
 
 /**
   * @brief  get device descriptor
@@ -522,12 +546,12 @@ int usb_write(const uint8_t *data, const size_t len) {
 
     // wait for send complete
     cdc_struct_type *pcdc = (cdc_struct_type *)(udev->class_handler->pdata);
-    uint32_t tx_timeout = 0;
+    uint32_t tx_wait = usb_tx_wait_start();
     while (pcdc->g_tx_completed != 1) {
         if (usb_check() == false) {
             return PM3_EIO;
         }
-        if (tx_timeout++ > USB_TX_COMPLETE_TIMEOUT) {
+        if (usb_tx_wait_expired(tx_wait)) {
             return PM3_EIO;
         }
         // working for send to HOST...
@@ -542,12 +566,12 @@ int usb_write(const uint8_t *data, const size_t len) {
         if (usb_vcp_send_data(udev, (uint8_t *) data, 0) != SUCCESS) {
             return PM3_EIO;
         }
-        tx_timeout = 0;
+        tx_wait = usb_tx_wait_start();
         while (pcdc->g_tx_completed != 1) {
             if (usb_check() == false) {
                 return PM3_EIO;
             }
-            if (tx_timeout++ > USB_TX_COMPLETE_TIMEOUT) {
+            if (usb_tx_wait_expired(tx_wait)) {
                 return PM3_EIO;
             }
         }
