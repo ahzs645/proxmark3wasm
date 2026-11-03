@@ -66,6 +66,8 @@
 #define FELICA_OPTIONAL_CMD_RETRIES 3U
 // Per FeliCa spec, Polling max response at 16 timeslots is ~25ms; keep extra margin.
 #define FELICA_POLLING_TIMEOUT_MS 100U
+#define FELICA_READER_SYSTEM_POLL_TIMEOUT_MS 2500U
+#define FELICA_READER_SYSTEM_POLL_ATTEMPTS 4U
 #define FELICA_SEAC_POLL_TIMEOUT_MS 200U
 #define FELICA_SEAC_POLL_RETRY_COUNT 5U
 #define FELICA_SEAC_POLL_FRAME_LEN 6U
@@ -466,6 +468,7 @@ typedef enum {
 
 static int CmdHelp(const char *Cmd);
 static void clear_and_send_command(uint8_t flags, uint16_t datalen, uint8_t *data, bool verbose);
+static void clear_and_send_command_ex(uint8_t flags, uint16_t datalen, uint8_t *data, uint16_t numbits, bool verbose, bool normalize_frame);
 static int send_felica_payload_with_retries(uint8_t flags, uint16_t datalen, uint8_t *data, bool verbose,
                                             int expected_response_cmd, uint32_t timeout_ms, uint32_t retries, uint32_t backoff_ms, bool logging,
                                             PacketResponseNG *resp, const char *request_name);
@@ -2685,27 +2688,79 @@ int read_felica_uid(bool loop, bool verbose) {
     return res;
 }
 
+static int read_felica_system(uint16_t system_code, bool loop, bool verbose) {
+    uint8_t system_bytes[2];
+    felica_system_code_to_bytes(system_code, system_bytes);
+    const uint8_t flags = FELICA_CONNECT | FELICA_CLEARTRACE | FELICA_NO_DISCONNECT | FELICA_SYSTEM_SELECT;
+    int res = PM3_ETIMEOUT;
+
+    for (uint32_t attempt = 0; loop || attempt < FELICA_READER_SYSTEM_POLL_ATTEMPTS; attempt++) {
+        clear_and_send_command_ex(flags, sizeof(system_bytes), system_bytes, 0, false, false);
+        PacketResponseNG resp;
+        if (WaitForResponseTimeout(CMD_HF_FELICA_COMMAND, &resp, FELICA_READER_SYSTEM_POLL_TIMEOUT_MS) &&
+                resp.status == PM3_SUCCESS && resp.length >= sizeof(felica_card_select_t)) {
+            felica_card_select_t card;
+            memcpy(&card, resp.data.asBytes, sizeof(card));
+            set_last_known_card(card);
+            if (verbose) {
+                PrintAndLogEx(SUCCESS, "IDm: " _GREEN_("%s"), sprint_hex_inrow(card.IDm, sizeof(card.IDm)));
+            }
+            res = PM3_SUCCESS;
+            if (loop == false) {
+                break;
+            }
+        }
+        if (kbd_enter_pressed()) {
+            if (res != PM3_SUCCESS) {
+                res = PM3_EOPABORTED;
+            }
+            break;
+        }
+    }
+
+    DropField();
+    return res;
+}
+
 static int CmdHFFelicaReader(const char *Cmd) {
     CLIParserContext *ctx;
     CLIParserInit(&ctx, "hf felica reader",
                   "Act as a ISO 18092 / FeliCa reader. Look for FeliCa tags until Enter or the pm3 button is pressed",
-                  "hf felica reader -@    -> Continuous mode");
+                  "hf felica reader -@\n"
+                  "hf felica reader --sys 0003 -@    -> Continuous polling for system 0003");
 
     void *argtable[] = {
         arg_param_begin,
         arg_lit0("s", "silent", "silent (no messages)"),
         arg_lit0("@", NULL, "optional - continuous reader mode"),
+        arg_str0(NULL, "sys", "<hex>", "poll a specific 2-byte system code (4 attempts, or continuous with -@)"),
         arg_param_end
     };
     CLIExecWithReturn(ctx, Cmd, argtable, true);
     bool verbose = (arg_get_lit(ctx, 1) == false);
     bool cm = arg_get_lit(ctx, 2);
+    struct arg_str *system_arg = arg_get_str(ctx, 3);
+    bool has_system = system_arg->count > 0;
+    uint8_t system_bytes[2] = {0};
+    int system_len = 0;
+    int parse_status = has_system ? CLIParamHexToBuf(system_arg, system_bytes, sizeof(system_bytes), &system_len) : PM3_SUCCESS;
+    bool invalid_system = parse_status != PM3_SUCCESS ||
+                          (has_system && (strlen(system_arg->sval[0]) != 4 || system_len != 2));
     CLIParserFree(ctx);
+
+    if (invalid_system) {
+        PrintAndLogEx(ERR, "System code must be exactly 4 hex digits");
+        return PM3_EINVARG;
+    }
 
     if (cm) {
         PrintAndLogEx(INFO, "Press " _GREEN_("<Enter>") " to exit");
     }
 
+    if (has_system) {
+        uint16_t system_code = felica_system_code_from_bytes(system_bytes);
+        return read_felica_system(system_code, cm, verbose);
+    }
     return read_felica_uid(cm, verbose);
 }
 
@@ -5313,13 +5368,12 @@ static void felica_scsvcode_print_footer(const felica_scsvcode_context_t *scsv_c
         return;
     }
 
-    char bar[128];
-    size_t pos = 0;
-    pos += snprintf(bar + pos, sizeof(bar) - pos, "└");
-    for (int i = 0; i < scsv_ctx->depth - 1 && pos < sizeof(bar); i++) {
-        pos += snprintf(bar + pos, sizeof(bar) - pos, "───┴");
+    char bar[128] = {0};
+    str_append(bar, sizeof(bar), "└");
+    for (int i = 0; i < scsv_ctx->depth - 1; i++) {
+        str_append(bar, sizeof(bar), "───┴");
     }
-    snprintf(bar + pos, sizeof(bar) - pos, "───────────────────────");
+    str_append(bar, sizeof(bar), "───────────────────────");
     PrintAndLogEx(INFO, "%s", bar);
 }
 
@@ -7157,7 +7211,8 @@ static int CmdHFFelicaDump(const char *Cmd) {
     if (res != PM3_SUCCESS || discovered_systems.count == 0) {
         DropField();
         PrintAndLogEx(FAILED, "Unable to discover FeliCa systems.");
-        return res;
+        // discovery can succeed and still find nothing, res is PM3_SUCCESS then
+        return (res != PM3_SUCCESS) ? res : PM3_ESOFT;
     }
 
     PrintAndLogEx(INFO, "Discovered " _GREEN_("%u") " system(s).", (unsigned int)discovered_systems.count);
@@ -8252,7 +8307,7 @@ static int felica_sim_model_from_json(json_t *root, felica_sim_model_t *model_ou
 
 static int felica_sim_send_control(uint8_t subcommand, uint32_t total_len, uint32_t offset, uint16_t model_crc,
                                    const uint8_t *data, uint16_t data_len, uint32_t timeout_ms) {
-    if (data_len > (PM3_CMD_DATA_SIZE - sizeof(felica_sim_upload_t))) {
+    if (data_len > (g_conn.max_cmd_data_size - sizeof(felica_sim_upload_t))) {
         return PM3_EOVFLOW;
     }
 
@@ -8287,7 +8342,7 @@ static int felica_sim_upload_model(const felica_sim_model_t *model) {
         return ret;
     }
 
-    const uint16_t chunk_size = PM3_CMD_DATA_SIZE - sizeof(felica_sim_upload_t);
+    const uint16_t chunk_size = g_conn.max_cmd_data_size - sizeof(felica_sim_upload_t);
     uint32_t offset = 0;
     PrintAndLogEx(INFO, "Uploading simulator model");
     PrintAndLogEx(INFO, "." NOLF);
@@ -9438,7 +9493,7 @@ static int CmdHFFelicaCmdRaw(const char *Cmd) {
     }
 
     // Max transport buffer is PM3_CMD_DATA_SIZE
-    datalen = (datalen > PM3_CMD_DATA_SIZE) ? PM3_CMD_DATA_SIZE : datalen;
+    datalen = (datalen > g_conn.max_cmd_data_size) ? g_conn.max_cmd_data_size : datalen;
 
     PrintAndLogEx(SUCCESS, "Data: %s", sprint_hex(data, datalen));
 

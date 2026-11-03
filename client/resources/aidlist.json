@@ -17,7 +17,7 @@
         "Country": "United States",
         "Name": "EMV Payment System Environment - PSE (1PAY.SYS.DDF01)",
         "Description": "",
-        "Type": ""
+        "Type": "EMV"
     },
     {
         "AID": "325041592E5359532E4444463031",
@@ -25,7 +25,7 @@
         "Country": "United States",
         "Name": "EMV Proximity Payment System Environment - PPSE (2PAY.SYS.DDF01)",
         "Description": "Visa payWave for Mobile",
-        "Type": ""
+        "Type": "EMV"
     },
     {
         "AID": "44464D46412E44466172653234313031",
@@ -314,7 +314,7 @@
         "Country": "United States",
         "Name": "[UNKNOWN]",
         "Description": "Some co-branded card",
-        "Type": ""
+        "Type": "EMV"
     },
     {
         "AID": "A0000000042010",
@@ -330,7 +330,7 @@
         "Country": "United States",
         "Name": "MasterCard Specific",
         "Description": "MasterCard U.S. Maestro",
-        "Type": ""
+        "Type": "EMV"
     },
     {
         "AID": "A0000000043010",
@@ -434,7 +434,7 @@
         "Country": "Belgium",
         "Name": "Maestro-CH",
         "Description": "",
-        "Type": ""
+        "Type": "EMV"
     },
     {
         "AID": "A00000001800",
@@ -517,7 +517,7 @@
         "Country": "United Kingdom",
         "Name": "American Express",
         "Description": "",
-        "Type": ""
+        "Type": "EMV"
     },
     {
         "AID": "A000000025010402",
@@ -653,7 +653,7 @@
         "Country": "Germany",
         "Name": "Girocard Electronic Cash",
         "Description": "",
-        "Type": ""
+        "Type": "EMV"
     },
     {
         "AID": "A000000063504B43532D3135",
@@ -869,7 +869,7 @@
         "Country": "United States",
         "Name": "Visa Common Debit",
         "Description": "",
-        "Type": ""
+        "Type": "EMV"
     },
     {
         "AID": "A0000000980848",
@@ -1293,7 +1293,7 @@
         "Country": "Kingdom of Saudi Arabia",
         "Name": "SPAN",
         "Description": "SPAN2 (Saudi Payments Network) - Saudi Arabia domestic credit/debit card (Saudi Arabia Monetary Agency)",
-        "Type": ""
+        "Type": "EMV"
     },
     {
         "AID": "A0000002471001",
@@ -1352,6 +1352,14 @@
         "Type": "EMV"
     },
     {
+        "AID": "A000000322100701",
+        "Vendor": "EasyCard Corporation",
+        "Country": "Taiwan",
+        "Name": "SuperCard",
+        "Description": "EasyCard stored-value card with NFC mobile top-up",
+        "Type": ""
+    },
+    {
         "AID": "A00000032301",
         "Vendor": "Identity Alliance",
         "Country": "United States",
@@ -1373,7 +1381,7 @@
         "Country": "United States",
         "Name": "Discover Expresspay (ZIP)",
         "Description": "",
-        "Type": ""
+        "Type": "EMV"
     },
     {
         "AID": "A000000333010101",
@@ -1381,7 +1389,7 @@
         "Country": "China",
         "Name": "UnionPay Debit",
         "Description": "",
-        "Type": ""
+        "Type": "EMV"
     },
     {
         "AID": "A000000333010102",
@@ -1389,7 +1397,7 @@
         "Country": "China",
         "Name": "UnionPay Credit",
         "Description": "",
-        "Type": ""
+        "Type": "EMV"
     },
     {
         "AID": "A000000333010103",
@@ -1397,7 +1405,7 @@
         "Country": "China",
         "Name": "UnionPay Quasi Credit",
         "Description": "",
-        "Type": ""
+        "Type": "EMV"
     },
     {
         "AID": "A000000333010106",
@@ -1405,7 +1413,7 @@
         "Country": "China",
         "Name": "UnionPay Electronic Cash",
         "Description": "",
-        "Type": ""
+        "Type": "EMV"
     },
     {
         "AID": "A000000333010108",
@@ -1413,7 +1421,7 @@
         "Country": "China",
         "Name": "U.S. UnionPay Common Debit AID",
         "Description": "",
-        "Type": ""
+        "Type": "EMV"
     },
     {
         "AID": "A000000337301000",
@@ -1485,7 +1493,7 @@
         "Country": "Belgium",
         "Name": "",
         "Description": "PagoBANCOMAT",
-        "Type": ""
+        "Type": "EMV"
     },
     {
         "AID": "A0000003660001",
@@ -1517,7 +1525,7 @@
         "Country": "Australia",
         "Name": "Savings (debit card)",
         "Description": "",
-        "Type": ""
+        "Type": "EMV"
     },
     {
         "AID": "A00000038420",
@@ -1525,7 +1533,7 @@
         "Country": "Australia",
         "Name": "Cheque (debit card)",
         "Description": "",
-        "Type": ""
+        "Type": "EMV"
     },
     {
         "AID": "A0000003964D66344D0002",
@@ -1557,7 +1565,7 @@
         "Country": "Brazil",
         "Name": "Hiperchip",
         "Description": "",
-        "Type": ""
+        "Type": "EMV"
     },
     {
         "AID": "A0000004320001",
@@ -1802,7 +1810,7 @@
         "Country": "United States",
         "Name": "Debit Network Alliance (DNA)",
         "Description": "Common U.S. Debit",
-        "Type": ""
+        "Type": "EMV"
     },
     {
         "AID": "A0000006581010",
@@ -1810,7 +1818,7 @@
         "Country": "Russia",
         "Name": "MIR Credit",
         "Description": "",
-        "Type": ""
+        "Type": "EMV"
     },
     {
         "AID": "A0000006581011",
@@ -1818,7 +1826,7 @@
         "Country": "Russia",
         "Name": "MIR Credit",
         "Description": "",
-        "Type": ""
+        "Type": "EMV"
     },
     {
         "AID": "A0000006582010",
@@ -1826,7 +1834,7 @@
         "Country": "Russia",
         "Name": "MIR Debit",
         "Description": "",
-        "Type": ""
+        "Type": "EMV"
     },
     {
         "AID": "A0000006723010",
@@ -1887,6 +1895,14 @@
         "Sources": [
             "android://com.jaklingkoindonesia.app"
         ]
+    },
+    {
+        "AID": "A000424E49999999",
+        "Vendor": "Bank Negara Indonesia (BNI)",
+        "Country": "Indonesia",
+        "Name": "BNI TapCash",
+        "Description": "Alternative AID for the BNI TapCash stored-value and transit card",
+        "Type": "transport"
     },
     {
         "AID": "B012345678",
@@ -1974,32 +1990,16 @@
         "AID": "D040000013000001",
         "Vendor": "Austria Card",
         "Country": "Austria",
-        "Name": "DF_UNI_Kepler1",
-        "Description": "Domestic Loyalty Program (Version 2.0)",
-        "Type": ""
-    },
-    {
-        "AID": "D040000013000001",
-        "Vendor": "Austria Card",
-        "Country": "Austria",
-        "Name": "DF_Schler1",
-        "Description": "Domestic Loyalty Program (Version 1.3)",
+        "Name": "DF_UNI_Kepler1 / DF_Schler1",
+        "Description": "Domestic Loyalty Program (Version 2.0, and DF_Schler1 as version 1.3)",
         "Type": ""
     },
     {
         "AID": "D040000013000002",
         "Vendor": "Austria Card",
         "Country": "Austria",
-        "Name": "DF_UNI_Kepler2",
-        "Description": "Domestic Loyalty Program (Version 2.0)",
-        "Type": ""
-    },
-    {
-        "AID": "D040000013000002",
-        "Vendor": "Austria Card",
-        "Country": "Austria",
-        "Name": "DF_Schler2",
-        "Description": "Domestic Loyalty Program (Version 1.3)",
+        "Name": "DF_UNI_Kepler2 / DF_Schler2",
+        "Description": "Domestic Loyalty Program (Version 2.0, and DF_Schler2 as version 1.3)",
         "Type": ""
     },
     {
@@ -2014,16 +2014,8 @@
         "AID": "D040000015000001",
         "Vendor": "Austria Card",
         "Country": "Austria",
-        "Name": "DF_UNI_Ausweis",
-        "Description": "Domestic Loyalty Program (Version 2.0)",
-        "Type": ""
-    },
-    {
-        "AID": "D040000015000001",
-        "Vendor": "Austria Card",
-        "Country": "Austria",
-        "Name": "DF_Ausweis",
-        "Description": "Domestic Loyalty Program (Version 1.3)",
+        "Name": "DF_UNI_Ausweis / DF_Ausweis",
+        "Description": "Domestic Loyalty Program (Version 2.0, and DF_Ausweis as version 1.3)",
         "Type": ""
     },
     {
@@ -2032,7 +2024,7 @@
         "Country": "Austria",
         "Name": "EMV ATM Maestro",
         "Description": "Domestic EMV Application (Version 2.1)",
-        "Type": ""
+        "Type": "EMV"
     },
     {
         "AID": "D0400000190002",
@@ -2040,7 +2032,7 @@
         "Country": "Austria",
         "Name": "EMV POS Maestro",
         "Description": "Domestic EMV Application (Version 2.1)",
-        "Type": ""
+        "Type": "EMV"
     },
     {
         "AID": "D0400000190003",
@@ -2048,7 +2040,7 @@
         "Country": "Austria",
         "Name": "EMV ATM MasterCard",
         "Description": "Domestic EMV Application (Version 2.1)",
-        "Type": ""
+        "Type": "EMV"
     },
     {
         "AID": "D0400000190004",
@@ -2056,7 +2048,7 @@
         "Country": "Austria",
         "Name": "EMV POS MasterCard",
         "Description": "Domestic EMV Application (Version 2.1)",
-        "Type": ""
+        "Type": "EMV"
     },
     {
         "AID": "D0400000190010",
@@ -2384,7 +2376,7 @@
         "Type": "Tesla"
     },
     {
-        "AID": "5465736c61444150",
+        "AID": "5465736C61444150",
         "Vendor": "Tesla",
         "Country": "",
         "Name": "TeslaDAP",
@@ -2643,6 +2635,14 @@
         ]
     },
     {
+        "AID": "A000000936000101",
+        "Vendor": "Metropolitan Atlanta Rapid Transit Authority (MARTA)",
+        "Country": "United States",
+        "Name": "MARTA Breeze",
+        "Description": "MARTA Breeze transit card",
+        "Type": "transport"
+    },
+    {
         "AID": "A000000396564341",
         "Vendor": "NXP",
         "Country": "",
@@ -2827,7 +2827,7 @@
         ]
     },
     {
-        "AID": "637001ff4c41",
+        "AID": "637001FF4C41",
         "Vendor": "Cubic",
         "Country": "United States",
         "Name": "LA Tap",
@@ -2930,7 +2930,7 @@
         "Type": ""
     },
     {
-        "AID": "a0000004400001010001",
+        "AID": "A0000004400001010001",
         "Vendor": "HID Global",
         "Country": "",
         "Name": "SEOS",

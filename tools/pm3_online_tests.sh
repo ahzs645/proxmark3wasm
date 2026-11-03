@@ -9,11 +9,13 @@ cd "$PM3PATH" || exit 1
 
 TESTALL=false
 TESTDESFIREVALUE=false
+TESTDESFIREREADER=false
 TESTHIDWIEGAND=false
 TESTMFHIDENCODE=false
 TESTICLASSREADER=false
 TESTSMARTCARD=false
 TESTICLASSEMU=false
+TESTHITAG2=false
 NEED_MF_HID_ENCODE_WIPE=false
 TESTMANUAL=false
 
@@ -23,16 +25,18 @@ while (( "$#" )); do
   case "$1" in
     -h|--help)
       echo """
-Usage: $0 [--pm3bin /path/to/pm3] [--pm3port /dev/tty...] [desfire_value|hid_wiegand|mf_hid_encode|iclass_emu|iclass_reader]
+Usage: $0 [--pm3bin /path/to/pm3] [--pm3port /dev/tty...] [desfire_value|desfire_reader|hid_wiegand|mf_hid_encode|iclass_emu|iclass_reader|hitag2]
     --pm3bin ...:    Specify path to pm3 binary to test
     --pm3port ...:   Specify serial port for client/proxmark3
     --manual ...:    Pause after successful online LF HID clone/read checks for external reader verification
     desfire_value:   Test DESFire value operations with card
+    desfire_reader:  Load DESFire HID credentials for external reader verification
     hid_wiegand:     Test LF HID T55xx clone and PM3 readback flows
     mf_hid_encode:   Test MIFARE Classic HID encoding flows
     iclass_emu:      Test iCLASS emulator memory load/write/read flows
     iclass_reader:   Load iCLASS HID credentials into emulator memory for external reader verification
     smartcard:       Test the RDV4 SIM module and an ISO 7816 contact card
+    hitag2:          Test Hitag 2 against a genuine card and a genuine reader
     You must specify a test target - no default 'all' for online tests
 """
       exit 0
@@ -64,6 +68,11 @@ Usage: $0 [--pm3bin /path/to/pm3] [--pm3port /dev/tty...] [desfire_value|hid_wie
       TESTDESFIREVALUE=true
       shift
       ;;
+    desfire_reader)
+      TESTALL=false
+      TESTDESFIREREADER=true
+      shift
+      ;;
     hid_wiegand)
       TESTALL=false
       TESTHIDWIEGAND=true
@@ -89,6 +98,11 @@ Usage: $0 [--pm3bin /path/to/pm3] [--pm3port /dev/tty...] [desfire_value|hid_wie
       TESTICLASSEMU=true
       shift
       ;;
+    hitag2)
+      TESTALL=false
+      TESTHITAG2=true
+      shift
+      ;;
     -*|--*=) # unsupported flags
       echo "Error: Unsupported flag $1" >&2
       exit 1
@@ -101,6 +115,8 @@ Usage: $0 [--pm3bin /path/to/pm3] [--pm3port /dev/tty...] [desfire_value|hid_wie
 done
 # set positional arguments in their proper place
 eval set -- "$PARAMS"
+
+HITAG2_DUMP="${HITAG2_DUMP:-traces/lf-hitag-CE129911-dump.bin}"
 
 C_RED='\033[0;31m'
 C_GREEN='\033[0;32m'
@@ -248,6 +264,13 @@ function CleanupMfHidEncodeCard() {
   fi
 }
 
+function CleanupOnlineTests() {
+  CleanupMfHidEncodeCard
+  if [ -n "${DFC_FACTORY_JSON:-}" ] || [ -n "${DFC_FIELD_JSON:-}" ]; then
+    rm -f "${DFC_FACTORY_JSON:-/tmp/pm3-no-dfc-factory}" "${DFC_FIELD_JSON:-/tmp/pm3-no-dfc-field}"
+  fi
+}
+
 function CheckMfHidEncodeRoundTrip() {
   printf "%-40s" "$1 "
 
@@ -348,16 +371,31 @@ function CheckMfHidEncodeCleanup() {
 function WaitForEnter() {
   echo ""
   echo "$1"
-  echo "Press Enter when ready, or Ctrl-C to abort."
-  if [ -r /dev/tty ]; then
+
+  # Only prompt when there is really a terminal to prompt on.
+  #
+  # `[ -r /dev/tty ]` is not that test: the node can exist and be readable by
+  # mode bits while the process has no controlling terminal, and the redirect
+  # then fails with "No such device or address" and the run carries on with the
+  # rig unconfirmed.  Opening it is the only reliable check.
+  if [ -n "${PM3_ONLINE_NOPROMPT:-}" ]; then
+    echo "PM3_ONLINE_NOPROMPT set - assuming the rig is ready."
+    return
+  fi
+
+  if (exec < /dev/tty) 2>/dev/null; then
+    echo "Press Enter when ready, or Ctrl-C to abort."
     stty sane < /dev/tty 2>/dev/null || true
     IFS= read -r < /dev/tty
+  elif [ -t 0 ]; then
+    echo "Press Enter when ready, or Ctrl-C to abort."
+    IFS= read -r
   else
-    read -r
+    echo "No terminal to prompt on - assuming the rig is ready."
   fi
 }
 
-trap CleanupMfHidEncodeCard EXIT
+trap CleanupOnlineTests EXIT
 
 echo -e "${C_BLUE}Iceman Proxmark3 online test tool${C_NC}"
 echo ""
@@ -372,7 +410,7 @@ if command -v git >/dev/null && git rev-parse --is-inside-work-tree >/dev/null 2
 fi
 
 # Check that user specified a test
-if [ "$TESTDESFIREVALUE" = false ] && [ "$TESTHIDWIEGAND" = false ] && [ "$TESTMFHIDENCODE" = false ] && [ "$TESTICLASSEMU" = false ] && [ "$TESTICLASSREADER" = false ] && [ "$TESTSMARTCARD" = false ]; then
+if [ "$TESTDESFIREVALUE" = false ] && [ "$TESTDESFIREREADER" = false ] && [ "$TESTHIDWIEGAND" = false ] && [ "$TESTMFHIDENCODE" = false ] && [ "$TESTICLASSEMU" = false ] && [ "$TESTICLASSREADER" = false ] && [ "$TESTSMARTCARD" = false ] && [ "$TESTHITAG2" = false ]; then
   echo "Error: You must specify a test target. Use -h for help."
   exit 1
 fi
@@ -386,19 +424,55 @@ while true; do
       
       echo "  Formatting card to clean state..."
       if ! CheckExecute "format card"                  "$PM3BIN -c 'hf mfdes formatpicc'" "done"; then break; fi
-      
-      echo "  Running value operation tests..."
+
+      # The PICC serves a file in plain whenever access is granted by the free
+      # access right (0x0E) instead of by a key we hold, whatever the file
+      # communication mode says. The client has to work that out per operation,
+      # so every file below is a different answer to it. No -m flags on purpose:
+      # the point is that the client derives the mode, not that we ask for one.
+      echo "  Building the fixture..."
       if ! CheckExecute "card auth test"          "$PM3BIN -c 'hf mfdes auth -n 0 -t 2tdea -k 00000000000000000000000000000000 --kdf none'" "authenticated.*succes"; then break; fi
-      if ! CheckExecute "card app creation"       "$PM3BIN -c 'hf mfdes createapp --aid 123456 --ks1 0F --ks2 0E --numkeys 1'" "successfully created"; then break; fi
-      if ! CheckExecute "card value file creation" "$PM3BIN -c 'hf mfdes createvaluefile --aid 123456 --fid 02 --lower 00000000 --upper 000003E8 --value 00000064'" "created successfully"; then break; fi
-      if ! CheckExecute "card value get plain"    "$PM3BIN -c 'hf mfdes value --aid 123456 --fid 02 --op get -m plain'" "Value.*100"; then break; fi
-      if ! CheckExecute "card value get mac"      "$PM3BIN -c 'hf mfdes value --aid 123456 --fid 02 --op get -m mac'" "Value.*100"; then break; fi
-      if ! CheckExecute "card value credit plain" "$PM3BIN -c 'hf mfdes value --aid 123456 --fid 02 --op credit -d 00000032 -m plain'" "Value.*changed"; then break; fi
-      if ! CheckExecute "card value get after credit" "$PM3BIN -c 'hf mfdes value --aid 123456 --fid 02 --op get -m plain'" "Value.*150"; then break; fi
-      if ! CheckExecute "card value credit mac"   "$PM3BIN -c 'hf mfdes value --aid 123456 --fid 02 --op credit -d 0000000A -m mac'" "Value.*changed"; then break; fi
-      if ! CheckExecute "card value debit plain"  "$PM3BIN -c 'hf mfdes value --aid 123456 --fid 02 --op debit -d 00000014 -m plain'" "Value.*changed"; then break; fi
-      if ! CheckExecute "card value debit mac"    "$PM3BIN -c 'hf mfdes value --aid 123456 --fid 02 --op debit -d 00000014 -m mac'" "Value.*changed"; then break; fi
-      if ! CheckExecute "card value final check"  "$PM3BIN -c 'hf mfdes value --aid 123456 --fid 02 --op get -m mac'" "Value.*120"; then break; fi
+      if ! CheckExecute "card app creation"       "$PM3BIN -c 'hf mfdes createapp --aid 123456 --ks1 0F --dstalgo aes --numkeys 2'" "successfully created"; then break; fi
+
+      # data files: free vs key protected, in each communication mode
+      for F in "00 mac EEEE" "01 mac 0000" "02 encrypt EEEE" "03 encrypt 0000"; do
+        set -- $F
+        if ! CheckExecute "data file $1 $2 $3 created" "$PM3BIN -c 'hf mfdes createfile --aid 123456 -n 0 -t aes -k 00000000000000000000000000000000 --fid $1 --amode $2 --size 000008 --rawrights $3'" "created successfully"; then break 2; fi
+      done
+
+      # value files. 10 is the discriminating one: credit is granted by
+      # read&write only, which is free here, while debit is also granted by the
+      # write right, which is key 0 - so credit goes plain and debit goes MAC on
+      # the same file in the same session. 13 has the FreeValue option, which
+      # makes GetValue plain on an otherwise fully enciphered file.
+      if ! CheckExecute "value file 10 mac 00E0 created"   "$PM3BIN -c 'hf mfdes createvaluefile --aid 123456 -n 0 -t aes -k 00000000000000000000000000000000 --fid 10 --amode mac --rawrights 00E0 --lower 00000000 --upper 000003E8 --value 00000064'" "created successfully"; then break; fi
+      if ! CheckExecute "value file 11 mac 0000 created"   "$PM3BIN -c 'hf mfdes createvaluefile --aid 123456 -n 0 -t aes -k 00000000000000000000000000000000 --fid 11 --amode mac --rawrights 0000 --lower 00000000 --upper 000003E8 --value 00000064'" "created successfully"; then break; fi
+      if ! CheckExecute "value file 12 plain EEEE created" "$PM3BIN -c 'hf mfdes createvaluefile --aid 123456 -n 0 -t aes -k 00000000000000000000000000000000 --fid 12 --amode plain --rawrights EEEE --lower 00000000 --upper 000003E8 --value 00000064'" "created successfully"; then break; fi
+      if ! CheckExecute "value file 13 enc FreeValue created" "$PM3BIN -c 'hf mfdes createvaluefile --aid 123456 -n 0 -t aes -k 00000000000000000000000000000000 --fid 13 --amode encrypt --rawrights 0000 --lcredit 3 --lower 00000000 --upper 000003E8 --value 00000064'" "created successfully"; then break; fi
+
+      echo "  Running data file tests..."
+      for F in 00 01 02 03; do
+        if ! CheckExecute "data file $F write"      "$PM3BIN -c 'hf mfdes write --aid 123456 -n 0 -t aes -k 00000000000000000000000000000000 --fid $F -d A0A1A2A3A4A5A6$F'" "Write data file $F success"; then break 2; fi
+        if ! CheckExecute "data file $F read back"  "$PM3BIN -c 'hf mfdes read --aid 123456 -n 0 -t aes -k 00000000000000000000000000000000 --fid $F'" "A0 A1 A2 A3 A4 A5 A6 $F"; then break 2; fi
+      done
+
+      # the app has no ISO file ids, so the client's GetISOFileIDs probe is
+      # refused and the PICC ends the session on it. dump has to notice, or it
+      # reads the first file's plain content as a response CMAC and loses it.
+      if ! CheckExecute "dump keeps the session"   "$PM3BIN -c 'hf mfdes dump --aid 123456 -n 0 -t aes -k 00000000000000000000000000000000'" "A0 A1 A2 A3 A4 A5 A6 00"; then break; fi
+
+      echo "  Running value operation tests..."
+      for F in 10 11 12; do
+        if ! CheckExecute "value file $F get"       "$PM3BIN -c 'hf mfdes value --aid 123456 -n 0 -t aes -k 00000000000000000000000000000000 --fid $F --op get'" "Value: 100 \\(0x00000064\\)"; then break 2; fi
+        if ! CheckExecute "value file $F credit"    "$PM3BIN -c 'hf mfdes value --aid 123456 -n 0 -t aes -k 00000000000000000000000000000000 --fid $F --op credit -d 00000032'" "Value changed"; then break 2; fi
+        if ! CheckExecute "value file $F debit"     "$PM3BIN -c 'hf mfdes value --aid 123456 -n 0 -t aes -k 00000000000000000000000000000000 --fid $F --op debit -d 00000014'" "Value changed"; then break 2; fi
+        if ! CheckExecute "value file $F final"     "$PM3BIN -c 'hf mfdes value --aid 123456 -n 0 -t aes -k 00000000000000000000000000000000 --fid $F --op get'" "Value: 130 \\(0x00000082\\)"; then break 2; fi
+      done
+
+      if ! CheckExecute "value file 13 FreeValue get" "$PM3BIN -c 'hf mfdes value --aid 123456 -n 0 -t aes -k 00000000000000000000000000000000 --fid 13 --op get'" "Value: 100 \\(0x00000064\\)"; then break; fi
+      if ! CheckExecute "value file 13 credit"        "$PM3BIN -c 'hf mfdes value --aid 123456 -n 0 -t aes -k 00000000000000000000000000000000 --fid 13 --op credit -d 00000032'" "Value changed"; then break; fi
+      if ! CheckExecute "value file 13 final"         "$PM3BIN -c 'hf mfdes value --aid 123456 -n 0 -t aes -k 00000000000000000000000000000000 --fid 13 --op get'" "Value: 150 \\(0x00000096\\)"; then break; fi
+
       if ! CheckExecute "card cleanup"            "$PM3BIN -c 'hf mfdes selectapp --aid 000000; hf mfdes auth -n 0 -t 2tdea -k 00000000000000000000000000000000 --kdf none; hf mfdes deleteapp --aid 123456'" "application.*deleted"; then break; fi
       echo "  card value operation tests completed successfully!"
     fi
@@ -447,6 +521,50 @@ while true; do
       if ! CheckExecute "hf 15 uid sim resets emu state" "timeout 15 $PM3CMD -c 'hf 15 sim -u E011223344556677 -t 100; hf 15 eview' 2>&1 | LC_ALL=C tr -cd '\11\12\15\40-\176' | tr '\n' ' '" "UID.*E0 11 22 33 44 55 66 77.*4 bytes / blocks x 64 blocks"; then break; fi
     fi
 
+    # Hitag 2, against a genuine card and a genuine reader.
+    #
+    # The card is a password mode Hitag 2 (configuration byte 0x06).  Its UID and
+    # password are read from the card itself rather than hardcoded, so the tests
+    # work with whatever fob is on the bench; only the ones that need a known
+    # password use HITAG2_KEY, which defaults to the Paxton fob this was developed
+    # against and can be overridden from the environment.
+    if $TESTHITAG2; then
+      echo -e "\n${C_BLUE}Testing Hitag 2 with a genuine card and reader${C_NC} ${PM3BIN:=./pm3}"
+      if ! CheckFileExist "pm3 exists"                "$PM3BIN"; then break; fi
+      PM3CMD="$PM3BIN"
+      if [ -n "${PM3PORT:-}" ]; then
+        echo "Using PM3 port: $PM3PORT"
+        PM3CMD="$PM3CMD -p $PM3PORT"
+      fi
+      HITAG2_KEY="${HITAG2_KEY:-BDF5E846}"
+
+      WaitForEnter "PLACE THE GENUINE HITAG 2 CARD ON THE PM3 LF ANTENNA"
+
+      # Reading the card: identification, then a full password mode dump.  The
+      # config byte has to come back as a Hitag 2 in password mode, and every one
+      # of the eight pages has to be present - a partial dump is the failure this
+      # is here to catch, since one lost frame used to end the read early.
+      if ! CheckExecute "lf hitag info genuine card" "$PM3CMD -c 'lf hitag info' 2>&1 | LC_ALL=C tr -cd '\11\12\15\40-\176' | tr '\n' ' '" "UID.*Password mode.*Hitag 2"; then break; fi
+      if ! CheckExecute "lf hitag read genuine card" "$PM3CMD -c 'lf hitag read -2 --pwd -k $HITAG2_KEY' 2>&1 | LC_ALL=C tr -cd '\11\12\15\40-\176' | tr '\n' ' '" "0/0x00.*1/0x01.*2/0x02.*3/0x03.*4/0x04.*5/0x05.*6/0x06.*7/0x07"; then break; fi
+
+      # Writing: put a known value in page 4 and read it back.  Page 4 is the
+      # first user page, so this does not touch the UID, the key or the config.
+      if ! CheckExecute "lf hitag wrbl genuine card"  "$PM3CMD -c 'lf hitag wrbl -2 -k $HITAG2_KEY -p 4 -d 11223344' 2>&1" "Write \( ok \)"; then break; fi
+      if ! CheckExecute "lf hitag write readback"     "$PM3CMD -c 'lf hitag read -2 --pwd -k $HITAG2_KEY' 2>&1 | LC_ALL=C tr -cd '\11\12\15\40-\176' | tr '\n' ' '" "4/0x04 \| 11 22 33 44"; then break; fi
+
+      # Sniffing a genuine exchange.  Both directions have to appear: the reader's
+      # START_AUTH and password, and the tag's answers.  A capture with reader
+      # frames but no tag frames is the defect this catches - the tag side decoder
+      # used to fabricate rows with no card present and miss real ones.
+      WaitForEnter "PUT THE PM3 BETWEEN THE GENUINE CARD AND THE GENUINE READER, THEN PRESS ENTER. PRESS ENTER AGAIN IN THE CLIENT TO STOP THE SNIFF"
+      if ! CheckExecute "lf hitag sniff genuine pair" "$PM3CMD -c 'lf hitag sniff; lf hitag list' 2>&1 | LC_ALL=C tr -cd '\11\12\15\40-\176' | tr '\n' ' '" "Rdr.*START AUTH.*Tag.*32:"; then break; fi
+
+      # Simulating to a genuine reader.  Only the operator can confirm the reader
+      # actually accepted it, so this asks - the client cannot see the beep.
+      WaitForEnter "REMOVE THE CARD, PRESENT THE PM3 TO THE GENUINE READER. THE SIM RUNS FOR 20s - LISTEN FOR THE READER TO BEEP, THEN PRESS ENTER"
+      if ! CheckExecute "lf hitag sim to reader"      "timeout 30 $PM3CMD -c 'lf hitag eload -f $HITAG2_DUMP -2; lf hitag sim -2' 2>&1 | LC_ALL=C tr -cd '\11\12\15\40-\176' | tr '\n' ' '" "Starting Hitag 2 simulation"; then break; fi
+      WaitForEnter "DID THE READER BEEP / ACCEPT THE SIMULATED CARD? PRESS ENTER IF YES, CTRL-C IF NO"
+    fi
     if $TESTICLASSREADER; then
       echo -e "\n${C_BLUE}Testing iCLASS reader verification${C_NC} ${PM3BIN:=./pm3}"
       if ! CheckFileExist "pm3 exists"               "$PM3BIN"; then break; fi
@@ -463,6 +581,27 @@ while true; do
       WaitForEnter "PRESS ENTER TO START ICLASS 2K3DES SIM, PRESENT THE PM3 TO ANOTHER READER, CONFIRM: iCLASS H10301 FC 31 CN 337, THEN PRESS THE PM3 BUTTON TO STOP SIM"
       if ! CheckExecute "hf iclass emu reader 2k3des" "$PM3CMD -c 'hf iclass tagsim -w H10301 --fc 31 --cn 337 --enc 2k3des' 2>&1" "Uploaded .* bytes to emulator memory"; then break; fi
       if ! CheckExecute "hf iclass sim preserves emu" "$PM3CMD -c 'hf iclass eview -s 80' 2>&1 | LC_ALL=C tr -cd '\11\12\15\40-\176' | tr '\n' ' '" "0/0x00.*BD 0C 60 10 F7 FF 12 E0.*6/0x06.*03 03 03 03 00 03 E0 17.*7/0x07.*10 A1 45 91 9E D1 6F 50"; then break; fi
+    fi
+
+    if $TESTDESFIREREADER; then
+      echo -e "\n${C_BLUE}Testing DESFire reader verification${C_NC} ${PM3BIN:=./pm3}"
+      if ! CheckFileExist "pm3 exists"               "$PM3BIN"; then break; fi
+      PM3CMD="$PM3BIN"
+      if [ -n "${PM3PORT:-}" ]; then
+        echo "Using PM3 port: $PM3PORT"
+        PM3CMD="$PM3CMD -p $PM3PORT"
+      fi
+
+      DFC_FACTORY_JSON="/tmp/pm3-dfc-factory-$$.json"
+      DFC_FIELD_JSON="/tmp/pm3-dfc-field-$$.json"
+      if ! CheckExecute "convert factory DFC" "python3 tools/dfc_converter.py traces/desfire/H10301-FC69-CN420-factory.dfc $DFC_FACTORY_JSON && echo converted" "converted"; then break; fi
+      if ! CheckExecute "convert field DFC" "python3 tools/dfc_converter.py traces/desfire/H10301-FC69-CN420-field.dfc $DFC_FIELD_JSON && echo converted" "converted"; then break; fi
+
+      WaitForEnter "PRESS ENTER TO START DESFIRE FACTORY SIM, PRESENT THE PM3 TO THE HID READER, CONFIRM: H10301 FC 69 CN 420, THEN PRESS THE PM3 BUTTON TO STOP SIM"
+      if ! CheckExecute "hf mfdes factory to reader" "$PM3CMD -c 'hf mfdes eload -f $DFC_FACTORY_JSON; hf mfdes sim' 2>&1" "Done!"; then break; fi
+      WaitForEnter "PRESS ENTER TO START DESFIRE FIELD SIM, PRESENT THE PM3 TO THE HID READER, CONFIRM: H10301 FC 69 CN 420, THEN PRESS THE PM3 BUTTON TO STOP SIM"
+      if ! CheckExecute "hf mfdes field to reader" "$PM3CMD -c 'hf mfdes eload -f $DFC_FIELD_JSON; hf mfdes sim' 2>&1" "Done!"; then break; fi
+      rm -f "$DFC_FACTORY_JSON" "$DFC_FIELD_JSON"
     fi
 
     # SIM module / ISO 7816 contact card tests.
@@ -491,8 +630,8 @@ while true; do
       if ! CheckExecute "ATR stable over 5 reads"     "for i in 1 2 3 4 5; do $PM3CMD -c 'smart info' 2>&1 | grep -oE 'ISO7816-3 ATR\.+ [0-9A-F ]+'; done | sort -u | wc -l" "^ *1$"; then break; fi
 
       # any status word will do - the point is that the exchange completed
-      if ! CheckExecute "T=0 apdu gets a status word" "$PM3CMD -c 'smart raw -a -s -0 -d 00a4040007a0000000041010' 2>&1" "\[[+-]\] [0-9A-Fa-f]{4} \|"; then break; fi
-      if ! CheckExecute "T=0 answer stable over 3"    "for i in 1 2 3; do $PM3CMD -c 'smart raw -a -s -0 -d 00a4040007a0000000041010' 2>&1 | grep -oE '^\[[+-]\] [0-9A-Fa-f]{4}'; done | sort -u | wc -l" "^ *1$"; then break; fi
+      if ! CheckExecute "T=0 apdu gets a status word" "$PM3CMD -c 'smart raw --t0 -a -s -d 00a4040007a0000000041010' 2>&1" "\[[+-]\] [0-9A-Fa-f]{4} \|"; then break; fi
+      if ! CheckExecute "T=0 answer stable over 3"    "for i in 1 2 3; do $PM3CMD -c 'smart raw --t0 -a -s -d 00a4040007a0000000041010' 2>&1 | grep -oE '^\[[+-]\] [0-9A-Fa-f]{4}'; done | sort -u | wc -l" "^ *1$"; then break; fi
 
       # loose guard against the 1200 ms per-read wait coming back
       echo -n "  timing three exchanges... "
@@ -506,8 +645,8 @@ while true; do
       if $PM3CMD -c 'smart info' 2>&1 | grep -q "Protocol T1"; then
         echo "  card offers T=1"
         if ! CheckExecute "module reports T=1 support" "$PM3CMD -c 'hw status' 2>&1" "T=1, PPS\.+ \( .*supported"; then break; fi
-        if ! CheckExecute "T=1 apdu gets a status word" "$PM3CMD -c 'smart raw --t1 -s -d 00a4040007a000000004101000' 2>&1" "\[[+-]\] [0-9A-Fa-f]{4} \|"; then break; fi
-        if ! CheckExecute "T=1 answer stable over 3"   "for i in 1 2 3; do $PM3CMD -c 'smart raw --t1 -s -d 00a4040007a000000004101000' 2>&1 | grep -oE '^\[[+-]\] [0-9A-Fa-f]{4}'; done | sort -u | wc -l" "^ *1$"; then break; fi
+        if ! CheckExecute "T=1 apdu gets a status word" "$PM3CMD -c 'smart raw --t1 -d 00a4040007a000000004101000' 2>&1" "\[[+-]\] [0-9A-Fa-f]{4} \|"; then break; fi
+        if ! CheckExecute "T=1 answer stable over 3"   "for i in 1 2 3; do $PM3CMD -c 'smart raw --t1 -d 00a4040007a000000004101000' 2>&1 | grep -oE '^\[[+-]\] [0-9A-Fa-f]{4}'; done | sort -u | wc -l" "^ *1$"; then break; fi
       else
         echo "  card is T=0 only, skipping the T=1 checks"
       fi

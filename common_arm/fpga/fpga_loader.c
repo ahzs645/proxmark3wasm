@@ -357,12 +357,25 @@ static void FpgaDownloadAndGoEx(int bitstream_target, bool keep_em) {
     LZ4_streamDecode_t lz4StreamDecode_body = {{ 0 }};
     compressed_fpga_stream.lz4StreamDecode = &lz4StreamDecode_body;
     uint8_t *output_buffer = BigBuf_calloc(FPGA_RING_BUFFER_BYTES);
-
-    if (reset_fpga_stream(bitstream_target, &compressed_fpga_stream, output_buffer) == false) {
+    if (output_buffer == NULL) {
+        Dbprintf(_RED_("Not enough memory to decompress FPGA image (%d bytes)"), FPGA_RING_BUFFER_BYTES);
         return;
     }
 
-    uint32_t bitstream_length;
+    if (reset_fpga_stream(bitstream_target, &compressed_fpga_stream, output_buffer) == false) {
+        Dbprintf(_RED_("reset_fpga_stream failed"));
+        // hand the ring buffer back.  Bailing out with it still allocated leaves BigBuf
+        // short by FPGA_RING_BUFFER_BYTES for the rest of the session, which shows up in
+        // "hw status" as available memory lower than BigBuf_size for no visible reason.
+        if (keep_em) {
+            BigBuf_free_keep_EM();
+        } else {
+            BigBuf_free();
+        }
+        return;
+    }
+
+    uint32_t bitstream_length = 0;
     if (bitparse_find_section(bitstream_target, 'e', &bitstream_length, &compressed_fpga_stream, output_buffer)) {
         DownloadFPGA(bitstream_target, bitstream_length, &compressed_fpga_stream, output_buffer);
         downloaded_bitstream = bitstream_target;

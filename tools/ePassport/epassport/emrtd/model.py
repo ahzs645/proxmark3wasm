@@ -10,7 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .mrz import Mrz
+from .mrz import FILLER, Mrz
 
 
 class FileState:
@@ -81,11 +81,49 @@ class DocumentDetails:
         return not any(v for k, v in vars(self).items() if not k.startswith("image_"))
 
 
+def _mrz_personal_number(field: str) -> str:
+    """The MRZ optional-data field read as a personal number.
+
+    9303 replaces every space and special character in the number with ``<``
+    and then pads the field with the same character, so the trailing run is
+    padding while a filler inside the number stood for something we cannot
+    recover.  A space is the closest we can put back.
+    """
+    return field.rstrip(FILLER).replace(FILLER, " ").strip()
+
+
+#: Poland carries the PESEL, its national identity number, in this DG13 tag.
+PESEL_TAG = "5F70"
+
+_PESEL_WEIGHTS = (1, 3, 7, 9, 1, 3, 7, 9, 1, 3)
+
+
+def is_pesel(value: str) -> bool:
+    """11 digits whose PESEL check digit holds.
+
+    DG13 is issuer-defined, so the checksum is what separates a PESEL from
+    eleven digits that happen to sit under the same tag.
+    """
+    if len(value) != 11 or not value.isdigit():
+        return False
+    total = sum(int(digit) * weight for digit, weight in zip(value, _PESEL_WEIGHTS))
+    return (10 - total % 10) % 10 == int(value[10])
+
+
+@dataclass
+class OptionalDetails:
+    """EF_DG13 - optional details.  ICAO leaves the content to the issuer."""
+
+    #: ``(tag, text)`` in the order they appear, with no meaning attached.
+    fields: list[tuple[str, str]] = field(default_factory=list)
+
+
 @dataclass
 class SecurityInfo:
     """EF_DG14 / EF_DG15 - chip security options and AA public key."""
 
     protocols: list[str] = field(default_factory=list)
+    pace: list[str] = field(default_factory=list)
     aa_algorithm: str = ""
     aa_key_size: str = ""
     aa_public_key_hex: str = ""
@@ -143,6 +181,7 @@ class PassportRecord:
     com: ComInfo = field(default_factory=ComInfo)
     personal: PersonalDetails = field(default_factory=PersonalDetails)
     document: DocumentDetails = field(default_factory=DocumentDetails)
+    optional: OptionalDetails = field(default_factory=OptionalDetails)
     security: SecurityInfo = field(default_factory=SecurityInfo)
     sod: SodInfo = field(default_factory=SodInfo)
     files: list[DumpFile] = field(default_factory=list)
@@ -204,18 +243,36 @@ class PassportRecord:
         if self.personal.personal_number:
             return self.personal.personal_number
         if self.mrz is not None:
-            optional = self.mrz.optional_data.value.strip()
+            optional = _mrz_personal_number(self.mrz.optional_data.value)
             if optional:
                 return optional
+        if self.dg13_personal_number:
+            return self.dg13_personal_number
         return self._optional("", 11)
+
+    @property
+    def dg13_personal_number(self) -> str:
+        """The PESEL, for the Polish documents that carry it and no DG11.
+
+        Only for POL: DG13 means whatever the issuing state decided, so the
+        same tag elsewhere is not a personal number and is left unnamed.
+        """
+        if self.mrz is None or self.mrz.nationality.strip() != "POL":
+            return ""
+        for tag, value in self.optional.fields:
+            if tag == PESEL_TAG and is_pesel(value):
+                return value
+        return ""
 
     @property
     def personal_number_source(self) -> str:
         """Where :attr:`personal_number` came from, for an honest caption."""
         if self.personal.personal_number:
             return "DG11"
-        if self.mrz is not None and self.mrz.optional_data.value.strip():
+        if self.mrz is not None and _mrz_personal_number(self.mrz.optional_data.value):
             return "MRZ"
+        if self.dg13_personal_number:
+            return "DG13"
         return ""
 
     def is_missing(self, value: str) -> bool:
@@ -234,6 +291,51 @@ class PassportRecord:
             if f.name.upper() == name.upper():
                 return f
         return None
+
+    @property
+    def is_empty(self) -> bool:
+        """True when the dump held no files at all - the read got nothing."""
+        return not any(f.state == FileState.PRESENT for f in self.files)
+
+    def image_for(self, name: str) -> bytes:
+        """The decoded PNG for a file that carries a picture, else empty."""
+        return {
+            "EF_DG2": self.portrait_png,
+            "EF_DG5": self.displayed_portrait_png,
+            "EF_DG7": self.signature_png,
+        }.get(name.upper(), b"")
+
+    def has_file(self, name: str) -> bool:
+        entry = self.file(name)
+        return entry is not None and entry.state == FileState.PRESENT
+
+    @property
+    def personal_files(self) -> list[str]:
+        """The files the PERSONAL tab drew from, in file order.
+
+        Naming them beats a fixed caption: plenty of documents carry no DG11,
+        and the personal number can arrive from the MRZ or from DG13 instead.
+        """
+        out = []
+        if self.personal_number_source == "MRZ":
+            out.append("EF_DG1")
+        if self.has_dg(11):
+            out.append("EF_DG11")
+        if self.personal_number_source == "DG13":
+            out.append("EF_DG13")
+        return out
+
+    @property
+    def document_files(self) -> list[str]:
+        """The files the ISSUER tab drew from."""
+        return ["EF_DG12"] if self.has_dg(12) else []
+
+    @property
+    def security_files(self) -> list[str]:
+        """The files the SECURITY tab drew from."""
+        return [
+            name for name in ("EF_SOD", "EF_DG14", "EF_DG15") if self.has_file(name)
+        ]
 
     def has_dg(self, number: int) -> bool:
         f = self.file(f"EF_DG{number}")

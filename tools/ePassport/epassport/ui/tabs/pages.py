@@ -50,6 +50,30 @@ class DetailPage(TabPage):
             box.add_widget(KeyValueRow(key=key, value=value, palette=self.palette))
 
 
+def _titled(base: str, record, files: list[str]) -> str:
+    """The tab header: what the tab shows, then the files it came from.
+
+    With nothing read there is no document to describe, so the header stays
+    the bare description rather than reporting an absence.
+    """
+    if record.is_empty:
+        return base
+    return f"{base}  ·  {', '.join(files)}" if files else f"{base}  ·  none present"
+
+
+def _personal_number_label(record) -> str:
+    """Name the source when it is not DG11, so the row is not misread.
+
+    Without the "from" it fits the caption column: dp(190) holds 167px of
+    "Personal number (DG13)" but not the 203px the longer wording needs, and
+    a caption that wraps drops the source onto a line of its own.
+    """
+    source = record.personal_number_source
+    if source in ("MRZ", "DG13"):
+        return f"Personal number ({source})"
+    return "Personal number"
+
+
 class PersonalPage(DetailPage):
     """EF_DG11 - additional personal details."""
 
@@ -58,12 +82,24 @@ class PersonalPage(DetailPage):
         if record is None:
             self.set_rows([])
             return
+        self.title = _titled(
+            "Additional personal details", record, record.personal_files
+        )
         p = record.personal
         self.set_rows(
             [
                 ("Full name", p.full_name),
                 ("Other names", ", ".join(p.other_names)),
-                ("Personal number", p.personal_number),
+                (
+                    _personal_number_label(record),
+                    # The rest of this tab drops absent fields rather than
+                    # labelling them, and the placeholder would stand out.
+                    (
+                        ""
+                        if record.is_missing(record.personal_number)
+                        else record.personal_number
+                    ),
+                ),
                 (
                     "Full date of birth",
                     record.full_date_of_birth if p.full_date_of_birth else "",
@@ -92,6 +128,9 @@ class IssuerPage(DetailPage):
         if record is None:
             self.set_rows([])
             return
+        self.title = _titled(
+            "Additional document details", record, record.document_files
+        )
         d = record.document
         self.set_rows(
             [
@@ -170,6 +209,7 @@ class SecurityPage(TabPage):
             self.rows, self.hashes = [], []
             self.headline = "No document loaded."
             return
+        self.title = _titled("Document security", record, record.security_files)
         sod = record.sod
         if not sod.available:
             self.headline = sod.message or "EF_SOD could not be inspected."
@@ -204,6 +244,7 @@ class SecurityPage(TabPage):
                 ("Signer serial", sod.signer_serial),
                 ("Certificate valid from", sod.valid_from),
                 ("Certificate valid to", sod.valid_to),
+                ("PACE  ·  EF_CardAccess", "\n".join(sec.pace)),
                 ("DG14 protocols", "\n".join(sec.protocols)),
                 ("DG15 AA public key", f"{sec.aa_algorithm} {sec.aa_key_size}".strip()),
             )
@@ -246,6 +287,7 @@ class FilesPage(TabPage):
     files = ListProperty([])
     selected_name = StringProperty("")
     selected_data = ObjectProperty(b"")
+    selected_image = ObjectProperty(b"")
     status = StringProperty("")
     dump_dir = StringProperty("")
 
@@ -254,6 +296,7 @@ class FilesPage(TabPage):
         if record is None:
             self.files = []
             self.selected_data = b""
+            self.selected_image = b""
             return
         self.dump_dir = str(record.source_dir or "")
         self.files = [
@@ -267,6 +310,7 @@ class FilesPage(TabPage):
         else:
             self.selected_name = ""
             self.selected_data = b""
+            self.selected_image = b""
 
     def on_files(self, *_args) -> None:
         Clock.schedule_once(self._rebuild, 0)
@@ -300,6 +344,7 @@ class FilesPage(TabPage):
         entry = record.file(name)
         self.selected_name = name
         self.selected_data = entry.data if entry else b""
+        self.selected_image = record.image_for(name)
 
     def export_selected(self, destination: str) -> str:
         """Copy the selected file elsewhere.  Returns a status message."""

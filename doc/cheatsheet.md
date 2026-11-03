@@ -627,7 +627,7 @@ pm3 --> lf t55xx wipe
 ## Data
 ^[Top](#top)
 
-Get raw samples [512-40000]
+Get raw samples, between 512 and Bigbuf_size
 ```
 pm3 --> data samples -n <size>
 ```
@@ -713,7 +713,7 @@ pm3 --> mem load -f iclass_default_keys --iclass
 
 Upgrade Sim Module firmware
 ```
-pm3 --> smart upgrade -f sim014.bin
+pm3 --> smart upgrade -f sim024.bin
 ```
 
 ## Smart Card

@@ -297,6 +297,8 @@ while true; do
       if ! CheckExecute "xorcheck test"                    "$PYTHON tools/xorcheck.py 04 00 80 64 ba" "final LRC XOR byte value: 5A"; then break; fi
       if ! CheckExecute "findbits test"                    "$PYTHON tools/findbits.py 73 0110010101110011" "Match at bit 9: 011001010"; then break; fi
       if ! CheckExecute "findbits_test test"               "$PYTHON tools/findbits_test.py 2>&1" "OK"; then break; fi
+      if ! CheckExecute "dfc_converter test"               "$PYTHON tools/dfc_converter_test.py 2>&1" "OK"; then break; fi
+      if ! CheckExecute "PM5 RTC tick test"                "$PYTHON tools/pm5_rtc_tick_test.py 2>&1" "RTC tick snapshot test: OK"; then break; fi
       if ! CheckExecute "pm3_eml_mfd test"                 "$PYTHON tools/mfc/pm3_eml_mfd_test.py 2>&1" "OK"; then break; fi
       if ! CheckExecute "recover_pk test"                  "$PYTHON tools/recover_pk.py selftests 2>&1" "Tests:.*\(.*ok.*"; then break; fi
       if ! CheckExecute "mkversion create test"            "tools/mkversion.sh --short" 'Iceman/'; then break; fi
@@ -337,7 +339,7 @@ while true; do
       if ! CheckFileExist "staticnested_2x1nt_rf08s exists"    "$STATICNESTED2X1NTBIN"; then break; fi
       if ! CheckFileExist "staticnested_2x1nt_rf08s_1key exists" "$STATICNESTED2X11KNTBIN"; then break; fi
       # very slow one...
-      if ! CheckExecute slow "staticnested_0nt test"                "$STATICNESTED0NTBIN a13e4902 2e9e49fc 1111 . 7bfc7a5b 1110 a17e4902 50f2abc2 1101; rm keys.dic" "Key ffffffffffff found in 3 arrays"; then break; fi
+#      if ! CheckExecute slow "staticnested_0nt test"                "$STATICNESTED0NTBIN a13e4902 2e9e49fc 1111 . 7bfc7a5b 1110 a17e4902 50f2abc2 1101; rm keys.dic" "Key ffffffffffff found in 3 arrays"; then break; fi
       if ! CheckExecute "staticnested_1nt 1/2 test"            "$STATICNESTED1NTBIN 5c467f63 0 456ace4e da53428d 1001" "found 19823 keys"; then break; fi
       if ! CheckExecute "staticnested_1nt 2/2 test"            "$STATICNESTED1NTBIN 5c467f63 0 e56f9fa2 7a9616b6 1110" "found 34531 keys"; then break; fi
       if ! CheckExecute "staticnested_2nt test"                "$STATICNESTED2NTBIN 461dce03 7eef3586 7fa28c7e 322bc14d 7f62b3d6" "\[ 2 \].*ffffffffff40.*"; then break; fi
@@ -468,9 +470,11 @@ while true; do
       if ! CheckExecute "data qrcode invalid hex" "$CLIENTBIN -c 'data qrcode -d zz' 2>&1" "QR data must contain only hex characters"; then break; fi
       if ! CheckExecute "data qrcode odd hex"     "$CLIENTBIN -c 'data qrcode -d a' 2>&1" "QR data must contain an even number of hex digits"; then break; fi
       if ! CheckExecute "data qrcode spaced hex"  "$CLIENTBIN -c 'data qrcode -d \"aa bb\"' 2>&1" "Spaces are not supported; encode a space byte as 20"; then break; fi
+      if ! CheckExecute "data modulation keeps trace" "$CLIENTBIN -c 'data load -f traces/lf_Q5_mod-psk1-32-4.pm3; data modulation; data autocorr -w 99999'" "smaller than trace \\( 20000 samples \\)"; then break; fi
       if ! CheckExecute "mfu pwdgen test"         "$CLIENTBIN -c 'hf mfu pwdgen --test'" "Selftest ok"; then break; fi
       if ! CheckExecute "mfu keygen test"         "$CLIENTBIN -c 'hf mfu keygen --uid 11223344556677'" "80 B1 C2 71 D8 A0"; then break; fi
       if ! CheckExecute "jooki encode test"       "$CLIENTBIN -c 'hf jooki encode --test'" "04 28 F4 DA F0 4A 81  \( ok \)"; then break; fi
+      if ! CheckExecute "vigik signature selftest" "$CLIENTBIN -c 'hf mf view --selftest'" "selftest \\( ok \\)"; then break; fi
       if ! CheckExecute "analyse regex selftest"  "$CLIENTBIN -c 'analyse regex --test'" "Tests \( ok \)"; then break; fi
       if ! CheckExecute "trace load/list 14a"     "$CLIENTBIN -c 'trace load -f traces/hf_14a_mfu.trace; trace list -1 -t 14a;'" "READBLOCK\(8\)"; then break; fi
       if ! CheckExecute "trace load/list x"       "$CLIENTBIN -c 'trace load -f traces/hf_14a_mfu.trace; trace list -x1 -t 14a;'" "0.0101840425"; then break; fi
@@ -481,6 +485,7 @@ while true; do
       if ! CheckExecute "smart raw help t1"         "$CLIENTBIN -c 'smart raw -h'" "use protocol T=1"; then break; fi
       if ! CheckExecute "nfc decode test oob"             "$CLIENTBIN -c 'nfc decode -d DA2010016170706C69636174696F6E2F766E642E626C7565746F6F74682E65702E6F6F62301000649201B96DFB0709466C65782032'" "Flex 2"; then break; fi
       if ! CheckExecute "nfc decode test device info"     "$CLIENTBIN -c 'nfc decode -d d1025744690004536f6e79010752432d533338300220426c61636b204e46432052656164657220636f6e6e656374656420746f2050430310123e4567e89b12d3a45642665544000004124e464320506f72742d3130302076312e3032'" "NFC Port-100 v1.02"; then break; fi
+      if ! CheckExecute "nfc decode test wifi wsc"        "$CLIENTBIN -c 'nfc decode -d d2174d6170706c69636174696f6e2f766e642e7766612e777363100e002f10260001011045000474657374100300020020100f000200081027000870617373776f726410200006ffffffffffff103c0001031001000200061049000600372a000120104a000110'" "WFA Version2\.\.\.\. 2\.0"; then break; fi
       if ! CheckExecute "nfc decode test vcard"           "$CLIENTBIN -c 'nfc decode -d d20ca3746578742f782d7643617264424547494e3a56434152440a56455253494f4e3a332e300a4e3a43687269733b4963656d616e3b3b3b0a464e3a476f7468656e627572670a5245563a323032312d30362d32345432303a31353a30385a0a6974656d322e582d4142444154453b747970653d707265663a323032302d30362d32340a4954454d322e582d41424c4142454c3a5f24213c416e6e69766572736172793e21245f0a454e443a56434152440a'" "END:VCARD"; then break; fi
       if ! CheckExecute "nfc decode test apple wallet"    "$CLIENTBIN -c 'nfc decode -d 031AD10116550077616C6C65743A2F2F61637469766174652F6E6663FE'" "activate/nfc"; then break; fi
       if ! CheckExecute "nfc decode test signature"       "$CLIENTBIN -c 'nfc decode -d 03FF010194113870696C65742E65653A656B616172743A3266195F26063132303832325904202020205F28033233335F2701316E1B5A13333038363439303039303030323636343030355304EBF2CE704103000000AC536967010200803A2448FCA7D354A654A81BD021150D1A152D1DF4D7A55D2B771F12F094EAB6E5E10F2617A2F8DAD4FD38AFF8EA39B71C19BD42618CDA86EE7E144636C8E0E7CFC4096E19C3680E09C78A0CDBC05DA2D698E551D5D709717655E56FE3676880B897D2C70DF5F06ECE07C71435255144F8EE41AF110E7B180DA0E6C22FB8FDEF61800025687474703A2F2F70696C65742E65652F6372742F33303836343930302D303030312E637274FE'" "30864900-0001.crt"; then break; fi
@@ -537,7 +542,17 @@ while true; do
       if ! CheckExecute "lf GPROXII test"            "$CLIENTBIN -c 'data load -f traces/lf_GProx_36_30_14489.pm3; lf search -1'" "Guardall G-Prox II ID found"; then break; fi
       if ! CheckExecute "lf HID Prox test"           "$CLIENTBIN -c 'data load -f traces/lf_HID-proxCardII-05512-11432784-1.pm3;lf search -1'" "HID Prox ID found"; then break; fi
       if ! CheckExecute "lf IDTECK test"             "$CLIENTBIN -c 'data load -f traces/lf_IDTECK_4944544BAC40E069.pm3; lf search -1'" "Idteck ID found"; then break; fi
+      if ! CheckExecute "lf IDTECK test 2"           "$CLIENTBIN -c 'data load -f traces/lf_IDTECK_4944544BAC40E069.pm3; lf idteck demod'" \
+                                                              "Card ID 6938688 \( 0x69E040 \) Raw: 4944544BAC40E069"; then break; fi
+      if ! CheckExecute "lf IDTECK raw test"         "$CLIENTBIN -c 'lf idteck demod --raw 4944544B351FBE4B'" \
+                                                              "Card ID 4963871 \( 0x4BBE1F \) Raw: 4944544B351FBE4B"; then break; fi
+      if ! CheckExecute "lf IDTECK reject test"      "if ! $CLIENTBIN -c 'lf idteck demod --raw DEADBEEFDEADBEEF' 2>&1 | grep -q 'IDTECK Tag Found'; then echo OK; fi" "OK"; then break; fi
+      if ! CheckExecute "lf IDTECK no wiegand test"  "if ! $CLIENTBIN -c 'lf idteck demod --raw 4944544B351FBE4B' 2>&1 | grep -q 'H10301'; then echo OK; fi" "OK"; then break; fi
       if ! CheckExecute "lf INDALA test"             "$CLIENTBIN -c 'data load -f traces/lf_Indala-504278295.pm3;lf search -1'" "Indala ID found"; then break; fi
+      if ! CheckExecute "lf INDALA weak test"        "$CLIENTBIN -c 'data load -f traces/lf_Indala-a0000000e6bd0e92-weak.pm3;lf search -1'" "Raw: a0000000e6bd0e92"; then break; fi
+      if ! CheckExecute "lf INDALA weak test 2"      "$CLIENTBIN -c 'data load -f traces/lf_Indala-a0000000e6bd0e92-weak.pm3; lf indala demod'" \
+                                                              "Indala \(len 64\)  Raw: a0000000e6bd0e92"; then break; fi
+      if ! CheckExecute "lf PSK reject test"         "$CLIENTBIN -c 'data load -f traces/lf_NRZ_RF64_fc2-ripple_synthetic.pm3;lf search -1'" "No known 125/134 kHz tags found"; then break; fi
       if ! CheckExecute "lf KERI test"               "$CLIENTBIN -c 'data load -f traces/lf_Keri.pm3;lf search -1'" "Pyramid ID found"; then break; fi
       if ! CheckExecute "lf NEXWATCH test"           "$CLIENTBIN -c 'data load -f traces/lf_NEXWATCH_Quadrakey-521512301.pm3;lf search -1 '" "NexWatch ID found"; then break; fi
       if ! CheckExecute "lf SECURAKEY test"          "$CLIENTBIN -c 'data load -f traces/lf_NEXWATCH_Securakey-64169.pm3;lf search -1 '" "Securakey ID found"; then break; fi

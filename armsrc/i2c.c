@@ -41,9 +41,17 @@
 // cannot drift apart.
 #define I2C_DELAY_1CLK    SpinDelayUsPrecision(I2C_DELAY_1CLK_US)
 #define I2C_DELAY_2CLK    SpinDelayUsPrecision(I2C_DELAY_2CLK_US)
-#define I2C_DELAY_SDA     SpinDelayUsPrecision(I2C_DELAY_SDA_US)
+#define I2C_DELAY_SDA     SpinDelayUsPrecision(s_app_i2c_timing ? I2C_DELAY_SDA_APP_US : I2C_DELAY_SDA_US)
 #define I2C_DELAY_HOLD    SpinDelayUsPrecision(I2C_DELAY_HOLD_US)
 #define I2C_DELAY_HIGH    SpinDelayUsPrecision(I2C_DELAY_HIGH_US)
+
+static bool s_app_i2c_timing = false;
+
+bool sc_set_app_i2c_timing(bool enabled) {
+    bool previous = s_app_i2c_timing;
+    s_app_i2c_timing = enabled && I2C_APP_FAST_TIMING;
+    return previous;
+}
 
 #define SC_PROTO_T0     (1 << 0)
 #define SC_PROTO_T1     (1 << 1)
@@ -64,6 +72,13 @@ static bool s_proto_announced = false;
 // understand T=1 too. An older module never answers, this stays 0, and callers
 // keep the T=0 they had before.
 static uint8_t s_pps_proto_cmd = 0;
+
+#if SAM_SC_FORCE_T1_PROFILE
+// One-shot request used by the SAM secure-channel path.  Keep it separate
+// from generic SmartCardRaw PPS selection so the performance policy does not
+// alter unrelated contact-card commands.
+static bool s_sam_t1_profile_requested = false;
+#endif
 
 // A negotiated rate lives in two places that reset independently: the module's
 // UART divisor, which any I2C_Reset_EnterMainProgram() wipes, and the card,
@@ -161,6 +176,7 @@ void I2C_Reset_EnterMainProgram(void) {
     s_proto_announced = false;
     s_pps_proto_cmd = 0;
     StartTicks();
+    sc_log_trace_reset();
     I2C_init(true);
     I2C_SetResetStatus(0, 0, 0);
     WaitMS(30);
@@ -857,17 +873,27 @@ int I2C_get_version(uint8_t *major, uint8_t *minor) {
     return PM3_EDEVNOTSUPP;
 }
 
-// Will read response from smart card module,  retries 3 times to get the data.
 static uint32_t s_trace_tick = 0;
+static bool s_trace_tick_valid = false;
 
 void sc_log_trace_reset(void) {
-    s_trace_tick = GetTicks();
+    s_trace_tick_valid = false;
 }
 
+void sc_log_trace_span(const uint8_t *d, uint16_t len, bool reader2tag, uint32_t start) {
+    uint32_t now = GetTicks();
+    LogTrace(d, len, start, now, NULL, reader2tag);
+    s_trace_tick = now;
+    s_trace_tick_valid = true;
+}
+
+// A frame that can only be timed from the end of the one before - the card's
+// answer, which is not known to have arrived until it has been read.
 void sc_log_trace(const uint8_t *d, uint16_t len, bool reader2tag) {
     uint32_t now = GetTicks();
-    if (s_trace_tick == 0) {
+    if (s_trace_tick_valid == false) {
         s_trace_tick = now;
+        s_trace_tick_valid = true;
     }
     LogTrace(d, len, s_trace_tick, now, NULL, reader2tag);
     s_trace_tick = now;
@@ -1120,7 +1146,7 @@ static bool sc_pps(uint8_t proto, uint8_t ta1) {
         return false;
     }
     // resp is [ok][active protocol][ta1 in force]
-    if ((resp[0] != 1) || (resp[2] != ta1)) {
+    if ((resp[0] != 1) || (resp[1] != (proto & 0x0F)) || (resp[2] != ta1)) {
         return false;
     }
 
@@ -1141,6 +1167,12 @@ static bool sc_pps(uint8_t proto, uint8_t ta1) {
 // actually negotiated and default to T=0 when nothing has been.
 uint8_t sc_active_device_cmd(void) {
     return (s_pps_proto_cmd != 0) ? s_pps_proto_cmd : I2C_DEVICE_CMD_SEND_T0;
+}
+
+void sc_request_sam_t1_profile(void) {
+#if SAM_SC_FORCE_T1_PROFILE
+    s_sam_t1_profile_requested = true;
+#endif
 }
 
 void sc_pps_remember(const uint8_t *atr, uint8_t atr_len, uint8_t proto, uint8_t ta1) {
@@ -1217,6 +1249,15 @@ bool GetATR(smart_card_atr_t *card_ptr, bool verbose) {
 
     s_card_protocols = atr_protocols(card_ptr->atr, card_ptr->atr_len);
     s_proto_announced = false;
+#if SAM_SC_FORCE_T1_PROFILE
+    const bool request_sam_t1 = s_sam_t1_profile_requested;
+    s_sam_t1_profile_requested = false;
+    if (request_sam_t1) {
+        // This reset starts a fresh SAM session.  Do not restore an older
+        // cached T=0 PPS entry before the one PPS below selects T=1.
+        sc_pps_forget();
+    }
+#endif
     if (g_dbglevel >= DBG_INFO) {
         // What the ATR advertises, and which of them the card actually runs
         // until something negotiates otherwise. Saying only "offers T=0 T=1"
@@ -1264,17 +1305,25 @@ bool GetATR(smart_card_atr_t *card_ptr, bool verbose) {
         // once - a refusal is remembered so every later ATR does not retry it.
         if (s_pps.reapply && (s_pps.tried == false)) {
 
+            uint8_t want_proto = atr_first_proto(card_ptr->atr, card_ptr->atr_len);
             uint8_t want = sc_pps_best_ta1(card_ptr->atr, card_ptr->atr_len);
+
+#if SAM_SC_FORCE_T1_PROFILE
+            if (request_sam_t1 && (s_card_protocols & SC_PROTO_T1)) {
+                want_proto = 1;
+                want = SAM_SC_T1_TA1;
+            }
+#endif
 
             memcpy(s_pps.atr, card_ptr->atr, card_ptr->atr_len);
             s_pps.atr_len = card_ptr->atr_len;
             s_pps.tried = true;
 
-            if (want && sc_pps(atr_first_proto(card_ptr->atr, card_ptr->atr_len), want)) {
+            if (want && sc_pps(want_proto, want)) {
                 s_pps.ta1 = want;
-                s_pps.proto = atr_first_proto(card_ptr->atr, card_ptr->atr_len);
+                s_pps.proto = want_proto;
                 if (g_dbglevel >= DBG_INFO) {
-                    Dbprintf("SC: negotiated TA1 %02X", want);
+                    Dbprintf("SC: negotiated T=%u TA1 %02X", want_proto, want);
                 }
             }
         }
@@ -1335,6 +1384,25 @@ void SmartCardRaw(const smart_card_raw_t *p) {
             if (gotATR == false) {
                 reply_ng(CMD_SMART_RAW, PM3_ESOFT, NULL, 0);
                 goto OUT;
+            }
+        }
+    }
+
+    // A card runs the protocol its TD1 names until a PPS changes it, so an APDU
+    // framed as T=1 against a card that came up in T=0 gets no answer at all.
+    // Do the switch here rather than making every caller run `smart pps --t1`
+    // first. PPS is only legal straight after an ATR, so take one; the exchange
+    // could not have worked without the switch anyway, so nothing is lost.
+    if (((flags & SC_RAW_T1) == SC_RAW_T1) && (s_pps_proto_cmd != I2C_DEVICE_CMD_SEND_T1)) {
+
+        smart_card_atr_t card;
+        s_pps.reapply = false;              // this is the negotiation
+        bool got_atr = GetATR(&card, false);
+        s_pps.reapply = true;
+
+        if (got_atr && ((s_card_protocols & SC_PROTO_T1) == SC_PROTO_T1)) {
+            if ((sc_pps(1, 0x11) == false) && (g_dbglevel >= DBG_ERROR)) {
+                DbpString("SC: " _YELLOW_("PPS to T=1 refused") ", sending it anyway");
             }
         }
     }

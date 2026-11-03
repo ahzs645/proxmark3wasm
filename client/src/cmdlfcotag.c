@@ -31,18 +31,21 @@
 #include "ui.h"         // PrintAndLog
 #include "ctype.h"      // tolower
 #include "cliparser.h"
-#include "commonutil.h" // reflect32
+#include "commonutil.h" // reflect32, ARRAYLEN
 #include "cmdlf.h"      // lf_getconfig, lf_setconfig, lf_read_cotag
 #include "graph.h"      // g_GraphTraceLen
 
 #define XSTR(x) #x
 #define STR(x)  XSTR(x)
 
-#define LF_COTAG_DIVISOR          90   // 132 kHz
 #define LF_COTAG_CLOCK            768
 #define LF_COTAG_DATA_LEN         128
 
 #define LF_COTAG_DEF_SAMPLES_READ 500000
+
+#define LF_COTAG_SIM_FLOOR        128
+#define LF_COTAG_SIM_MIN_BYTES    8
+#define LF_COTAG_SIM_MAX_REPEATS  16
 
 static int CmdHelp(const char *Cmd);
 
@@ -273,9 +276,9 @@ static int demod_cotag(int32_t *samples, int num_samples, int clock, int clock_s
         int len;
         const char *name;
     } preamble_patterns[] = {
-        { preamble_a, (int)(sizeof(preamble_a)   / sizeof(preamble_a[0])), "A"   },
-        { preamble_p, (int)(sizeof(preamble_p)  / sizeof(preamble_p[0])),  "P"   },
-        { preamble_p0, (int)(sizeof(preamble_p0) / sizeof(preamble_p0[0])), "P-0" },
+        { preamble_a, ARRAYLEN(preamble_a), "A"   },
+        { preamble_p, ARRAYLEN(preamble_p),  "P"   },
+        { preamble_p0, ARRAYLEN(preamble_p0), "P-0" },
         { NULL, 0, "" },
     };
 
@@ -452,7 +455,7 @@ static int CmdCOTAGReader(const char *Cmd) {
                                                            "(which is assumed " STR(LF_COTAG_DIVISOR) " for cotag. Use --divisor to override).\n")
                   _CYAN_(" - use ") _YELLOW_("`data plot`") _CYAN_(" to look at it.\n")
                   _CYAN_(" - use ") _YELLOW_("`lf cotag demod`") _CYAN_(" to try to demodulate it.\n")
-                  _CYAN_("If the number of samples is more than the device memory limit (40000 now), ")
+                  _CYAN_("If the number of samples is more than the device memory limit, ")
                   _CYAN_("it will try to use the real-time sampling mode.\n\n")
                   _CYAN_("Note: Cotag has an extremely slow data rate - RF/" STR(LF_COTAG_CLOCK) " ")
                   _CYAN_("-- capturing a full " STR(LF_COTAG_DATA_LEN) " bit card read requires a minimum of ")
@@ -477,7 +480,7 @@ static int CmdCOTAGReader(const char *Cmd) {
     int16_t divisor = arg_get_int_def(ctx, 4, -1);
     CLIParserFree(ctx);
 
-    bool realtime = (samples > 40000);
+    bool realtime = (samples >= g_pm3_capabilities.bigbuf_size);
 
     if (divisor > -1 && (divisor < 19 || divisor > 255)) {
         PrintAndLogEx(ERR, "divisor must be between 19 and 255");
@@ -512,6 +515,9 @@ static int CmdCOTAGReader(const char *Cmd) {
     }
 
     if (cm || realtime) {
+        // close any inline line the caller left open, ie: `lf search` printing
+        // "Searching for COTAG tag..." right before this
+        PrintAndLogEx(NORMAL, "");
         PrintAndLogEx(INFO, "Press " _GREEN_("<Enter>") " to exit");
     }
 
@@ -537,10 +543,85 @@ static int CmdCOTAGReader(const char *Cmd) {
     return ret;
 }
 
+static int CmdCOTAGSim(const char *Cmd) {
+    CLIParserContext *ctx;
+    CLIParserInit(&ctx, "lf cotag sim",
+                  "Enables simulation of a COTAG tag.\n"
+                  "Simulation runs until the button is pressed or another USB command is issued.\n"
+                  "Without " _YELLOW_("`-r`") _CYAN_(" it only reports detected reader activation sequence.\n")
+                  _CYAN_("Note: COTAG tag full repeating sequence is 128 bits, but readers seem to care about LSB 64 bits only."),
+                  "lf cotag sim                                        --> only detect the reader\n"
+                  "lf cotag sim -r A37E0D37000C1337                    --> send 64 bits\n"
+                  "lf cotag sim -r 0000000000000002A37E0D37000C1337\n"
+                  "lf cotag sim --floor 32                             --> more sensitive, for a reader further away\n"
+                  "lf cotag sim -r A37E0D37000C1337 --hb_delay_us 2909 --> time the half bit instead of counting cycles\n"
+                 );
+
+    void *argtable[] = {
+        arg_param_begin,
+        arg_str0("r", "raw", "<hex>", "raw data to answer with, " STR(LF_COTAG_SIM_MIN_BYTES) " to " STR(LF_COTAG_SIM_DATA_LEN) " bytes (64-128 bits)"),
+        arg_int0("n", "repeat", "<1-" STR(LF_COTAG_SIM_MAX_REPEATS) ">", "repeat data frame this many times per answer (def 1)"),
+        arg_int0(NULL, "floor", "<16-65535>", "minimum rise threshold (def " STR(LF_COTAG_SIM_FLOOR) ")"),
+        arg_int0(NULL, "hb_delay_us", "<2900-2918>", "custom half bit delay [us] (should be around 2909)"),
+        arg_lit0("v", "verbose", "report detected reader activation sequence while answering"),
+        arg_param_end
+    };
+    CLIExecWithReturn(ctx, Cmd, argtable, true);
+
+    uint8_t data[LF_COTAG_SIM_DATA_LEN] = {0};
+    int dlen = 0;
+    CLIGetHexWithReturn(ctx, 1, data, &dlen);
+    int repeats = arg_get_int_def(ctx, 2, 1);
+    int thr_floor = arg_get_int_def(ctx, 3, LF_COTAG_SIM_FLOOR);
+    int hb_delay = arg_get_int_def(ctx, 4, 0);
+    bool verbose = arg_get_lit(ctx, 5);
+    CLIParserFree(ctx);
+
+    if (dlen && (dlen < LF_COTAG_SIM_MIN_BYTES || dlen > LF_COTAG_SIM_DATA_LEN)) {
+        PrintAndLogEx(ERR, "data must be %d to %d bytes (64 to 128 bits), got %d"
+                      , LF_COTAG_SIM_MIN_BYTES, LF_COTAG_SIM_DATA_LEN, dlen);
+        return PM3_EINVARG;
+    }
+
+    if (repeats < 1 || repeats > LF_COTAG_SIM_MAX_REPEATS) {
+        PrintAndLogEx(ERR, "repeat must be between 1 and %d", LF_COTAG_SIM_MAX_REPEATS);
+        return PM3_EINVARG;
+    }
+
+    if (thr_floor < 16 || thr_floor > 0xFFFF) {
+        PrintAndLogEx(ERR, "floor must be between 16 and 65535");
+        return PM3_EINVARG;
+    }
+
+    if (hb_delay && (hb_delay < 2900 || hb_delay > 2918)) {
+        PrintAndLogEx(ERR, "hb_delay_us must be between 2900 and 2918 us");
+        return PM3_EINVARG;
+    }
+
+    lf_cotagsim_t payload = {
+        .thr_floor = (uint16_t)thr_floor,
+        .hb_delay_us = (uint16_t)hb_delay,
+        .nbits = (uint8_t)(dlen * 8),
+        .repeats = (uint8_t)repeats,
+        .verbose = verbose,
+    };
+    memcpy(payload.data, data, dlen);
+
+    PrintAndLogEx(INFO, "Simulating COTAG tag");
+    if (dlen == 0) {
+        PrintAndLogEx(INFO, "No " _YELLOW_("`-r`") " given, detecting reader activation sequence only");
+    }
+
+    clearCommandBuffer();
+    SendCommandNG(CMD_LF_COTAG_SIMULATE, (uint8_t *)&payload, sizeof(payload));
+    return lfsim_wait_check(CMD_LF_COTAG_SIMULATE);
+}
+
 static command_t CommandTable[] = {
     {"help",    CmdHelp,         AlwaysAvailable, "This help"},
     {"demod",   CmdCOTAGDemod,   AlwaysAvailable, "demodulate a COTAG tag"},
     {"reader",  CmdCOTAGReader,  IfPm3Lf,         "attempt to read and extract tag data"},
+    {"sim",     CmdCOTAGSim,     IfPm3Lf,         "simulate a COTAG tag"},
     {NULL, NULL, NULL, NULL}
 };
 

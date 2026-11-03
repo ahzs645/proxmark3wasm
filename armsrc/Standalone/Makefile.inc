@@ -89,6 +89,10 @@ endif
 ifneq (,$(findstring WITH_STANDALONE_HF_15SNIFF,$(APP_CFLAGS)))
     SRC_STANDALONE = hf_15sniff.c
 endif
+# WITH_STANDALONE_GDB_GATEWAY
+ifneq (,$(findstring WITH_STANDALONE_GDB_GATEWAY,$(APP_CFLAGS)))
+    SRC_STANDALONE = gdb_gateway.c
+endif
 # WITH_STANDALONE_HF_15SIM
 ifneq (,$(findstring WITH_STANDALONE_HF_15SIM,$(APP_CFLAGS)))
     SRC_STANDALONE = hf_15sim.c
@@ -128,6 +132,10 @@ endif
 # WITH_STANDALONE_HF_LEGIC
 ifneq (,$(findstring WITH_STANDALONE_HF_LEGIC,$(APP_CFLAGS)))
    SRC_STANDALONE = hf_legic.c
+endif
+# WITH_STANDALONE_HF_LEGIC_RDV4
+ifneq (,$(findstring WITH_STANDALONE_HF_LEGIC_RDV4,$(APP_CFLAGS)))
+   SRC_STANDALONE = hf_legic_rdv4.c
 endif
 # WITH_STANDALONE_HF_LEGICSIM
 ifneq (,$(findstring WITH_STANDALONE_HF_LEGICSIM,$(APP_CFLAGS)))

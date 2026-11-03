@@ -307,7 +307,7 @@ static void iclass_upload_emul(uint8_t *d, uint16_t n, uint16_t offset, uint16_t
     PrintAndLogEx(INFO, "." NOLF);
 
     while (bytes_remaining > 0) {
-        uint32_t bytes_in_packet = MIN(PM3_CMD_DATA_SIZE - 4, bytes_remaining);
+        uint32_t bytes_in_packet = MIN((uint32_t)(g_conn.max_cmd_data_size - 4), bytes_remaining);
         if (bytes_in_packet == bytes_remaining) {
             // Disable fast mode on last packet
             g_conn.block_after_ACK = false;
@@ -1338,7 +1338,7 @@ static int CmdHFiClassTagSim(const char *Cmd) {
     wiegand_card_t card;
     memset(&card, 0, sizeof(wiegand_card_t));
     card.FacilityCode = arg_get_u32_def(ctx, 2, 0);
-    card.CardNumber    = arg_get_u32_def(ctx, 3, 0);
+    card.CardNumber    = arg_get_u64_def(ctx, 3, 0);
     card.IssueLevel    = arg_get_u32_def(ctx, 4, 0);
 
     // --- binary string
@@ -2017,9 +2017,9 @@ static int CmdHFiClassESave(const char *Cmd) {
     CLIParamStrToBuf(arg_get_str(ctx, 1), (uint8_t *)filename, FILE_PATH_SIZE, &fnlen);
     uint16_t bytes = arg_get_int_def(ctx, 2, 256);
 
-    if (bytes > 4096) {
-        PrintAndLogEx(WARNING, "Emulator memory is max 4096bytes. Truncating %u to 4096", bytes);
-        bytes = 4096;
+    if (bytes > g_conn.em_size) {
+        PrintAndLogEx(WARNING, "Emulator memory is max %u bytes. Truncating %u to %u", g_conn.em_size, bytes, g_conn.em_size);
+        bytes = g_conn.em_size;
     }
 
     CLIParserFree(ctx);
@@ -2077,9 +2077,9 @@ static int CmdHFiClassEView(const char *Cmd) {
 
     CLIParserFree(ctx);
 
-    if (bytes > 4096) {
-        PrintAndLogEx(WARNING, "Emulator memory is max 4096bytes. Truncating %u to 4096", bytes);
-        bytes = 4096;
+    if (bytes > g_conn.em_size) {
+        PrintAndLogEx(WARNING, "Emulator memory is max %u bytes. Truncating %u to %u", g_conn.em_size, bytes, g_conn.em_size);
+        bytes = g_conn.em_size;
     }
 
     if (bytes % 8 != 0) {
@@ -3565,8 +3565,8 @@ static int CmdHFiClassRestore(const char *Cmd) {
 
     uint32_t payload_size = sizeof(iclass_restore_req_t) + (sizeof(iclass_restore_item_t) * (endblock - startblock + 1));
 
-    if (payload_size > PM3_CMD_DATA_SIZE) {
-        PrintAndLogEx(NORMAL, "Trying to write too many blocks at once.  Max: %d", PM3_CMD_DATA_SIZE / 8);
+    if (payload_size > g_conn.max_cmd_data_size) {
+        PrintAndLogEx(NORMAL, "Trying to write too many blocks at once.  Max: %d", g_conn.max_cmd_data_size / 8);
         return PM3_EINVARG;
     }
 
@@ -4315,9 +4315,9 @@ static int CmdHFiClass_TearBlock(const char *Cmd) {
             }
 
             if (tearoff_loop > 1) {
-                PrintAndLogEx(INPLACE, " Tear off delay "_YELLOW_("%u")" / "_YELLOW_("%d")" us - "_YELLOW_("%3u")" iter", params.delay_us, (tearoff_end & 0xFFFF), loop_count + 1);
+                PrintAndLogEx(INPLACE, "Tear off delay "_YELLOW_("%u")" / "_YELLOW_("%d")" us - "_YELLOW_("%3u")" iter", params.delay_us, (tearoff_end & 0xFFFF), loop_count + 1);
             } else {
-                PrintAndLogEx(INPLACE, " Tear off delay "_YELLOW_("%u")" / "_YELLOW_("%d")" us", params.delay_us, (tearoff_end & 0xFFFF));
+                PrintAndLogEx(INPLACE, "Tear off delay "_YELLOW_("%u")" / "_YELLOW_("%d")" us", params.delay_us, (tearoff_end & 0xFFFF));
             }
 
             // write block - don't check the return value. As a tear-off occurred, the write failed.
@@ -4814,9 +4814,9 @@ static int CmdHFiClass_BlackTears(const char *Cmd) {
         }
 
         if (tearoff_loop > 1) {
-            PrintAndLogEx(INPLACE, " Tear off delay "_YELLOW_("%u")" / "_YELLOW_("%d")" us - "_YELLOW_("%3u")" iter", params.delay_us, (tearoff_end & 0xFFFF), loop_count + 1);
+            PrintAndLogEx(INPLACE, "Tear off delay "_YELLOW_("%u")" / "_YELLOW_("%d")" us - "_YELLOW_("%3u")" iter", params.delay_us, (tearoff_end & 0xFFFF), loop_count + 1);
         } else {
-            PrintAndLogEx(INPLACE, " Tear off delay "_YELLOW_("%u")" / "_YELLOW_("%d")" us", params.delay_us, (tearoff_end & 0xFFFF));
+            PrintAndLogEx(INPLACE, "Tear off delay "_YELLOW_("%u")" / "_YELLOW_("%d")" us", params.delay_us, (tearoff_end & 0xFFFF));
         }
 
         // write block - don't check the return value. As a tear-off occurred, the write failed.
@@ -5293,6 +5293,10 @@ static void print_iclass_sio_decoded(uint8_t *sio, size_t sio_len) {
                 break;
             }
             default:
+                // Surface tags we don't decode yet instead of dropping them silently.
+                // Real credentials (e.g. SR) carry context tags such as [5]/[9] that
+                // would otherwise be invisible here; `--verbose` shows the full ASN1 TLV.
+                PrintAndLogEx(INFO, "  Unknown tag 0x%02X   : " _YELLOW_("%s"), tag, sprint_hex_inrow(val, len));
                 break;
         }
     }
@@ -6065,8 +6069,8 @@ static int CmdHFiClassCheckKeys(const char *Cmd) {
 
     // USB_COMMAND.  512/4 = 103 mac
     uint32_t max_chunk_size = 0;
-    if (keycount > ((PM3_CMD_DATA_SIZE - sizeof(iclass_chk_t)) / 4))
-        max_chunk_size = (PM3_CMD_DATA_SIZE - sizeof(iclass_chk_t)) / 4;
+    if (keycount > ((g_conn.max_cmd_data_size - sizeof(iclass_chk_t)) / 4))
+        max_chunk_size = (g_conn.max_cmd_data_size - sizeof(iclass_chk_t)) / 4;
     else
         max_chunk_size = keycount;
 
@@ -7675,7 +7679,7 @@ static int CmdHFiClassEncode(const char *Cmd) {
     memset(&card, 0, sizeof(wiegand_card_t));
 
     card.FacilityCode = arg_get_u32_def(ctx, 8, 0);
-    card.CardNumber = arg_get_u32_def(ctx, 9, 0);
+    card.CardNumber = arg_get_u64_def(ctx, 9, 0);
     card.IssueLevel = arg_get_u32_def(ctx, 10, 0);
 
     char format[16] = {0};
@@ -8070,7 +8074,7 @@ static int CmdHFiClassSAMExtract(const char *Cmd) {
     data[0] = flags;
 
     int cmdlen = 0;
-    if (CLIParamHexToBuf(arg_get_str(ctx, 8), data + 1, PM3_CMD_DATA_SIZE - 1, &cmdlen) != PM3_SUCCESS) {
+    if (CLIParamHexToBuf(arg_get_str(ctx, 8), data + 1, g_conn.max_cmd_data_size - 1, &cmdlen) != PM3_SUCCESS) {
         CLIParserFree(ctx);
         return PM3_ESOFT;
     }

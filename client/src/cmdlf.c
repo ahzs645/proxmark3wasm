@@ -359,8 +359,8 @@ int CmdLFCommandRead(const char *Cmd) {
     memset(payload.symbol_extra, 0, sizeof(payload.symbol_extra));
     memset(payload.period_extra, 0, sizeof(payload.period_extra));
 
-    if (cmd_len > sizeof(payload.data) - 8 * add_crc_ht - 1) {
-        PrintAndLogEx(ERR, "cmd too long, max length is %zu", sizeof(cmd) - 1);
+    if (cmd_len > (size_t)(g_conn.max_cmd_data_size - PAYLOAD_HEADER_SIZE) - 8 * add_crc_ht - 1) {
+        PrintAndLogEx(ERR, "cmd too long, max length is %zu", (size_t)(g_conn.max_cmd_data_size - PAYLOAD_HEADER_SIZE) - 8 * add_crc_ht - 1);
         return PM3_EINVARG;
     }
 
@@ -808,6 +808,7 @@ static int lf_read_internal(bool realtime, bool verbose, uint64_t samples, bool 
 
         size_t sample_bytes = samples * bits_per_sample;
         sample_bytes = (sample_bytes / 8) + (sample_bytes % 8 != 0);
+        const size_t expected_bytes = sample_bytes;
 
         // In real-time mode, the LF bitstream should be loaded before receiving raw data.
         // Otherwise, the first batch of raw data might contain the response of CMD_WTX.
@@ -831,12 +832,25 @@ static int lf_read_internal(bool realtime, bool verbose, uint64_t samples, bool 
             sample_bytes = WaitForRawDataTimeout(realtimeBuf, sample_bytes, 1000, true, false);
         }
         samples = sample_bytes * 8 / bits_per_sample;
-        PrintAndLogEx(INFO, "Done: %" PRIu64 " samples (%zu bytes)", samples, sample_bytes);
+        // the inline "Received x / y bytes" counter already says the transfer is
+        // done, so only repeat it in samples when asked
+        if (verbose) {
+            PrintAndLogEx(INFO, "Done: %" PRIu64 " samples (%zu bytes)", samples, sample_bytes);
+        }
         if (samples != 0) {
             getSamplesFromBufEx(realtimeBuf, samples, bits_per_sample, verbose);
         }
 
         free(realtimeBuf);
+
+        if (sample_bytes < expected_bytes) {
+            // keep what did arrive, but don't let it look like a complete read
+            PrintAndLogEx(WARNING, "transfer stopped early, got " _YELLOW_("%zu") " of " _YELLOW_("%zu") " bytes"
+                          , sample_bytes
+                          , expected_bytes
+                         );
+            return PM3_ETIMEOUT;
+        }
     } else {
         SendCommandNG(CMD_LF_ACQ_RAW_ADC, (uint8_t *)&payload, sizeof(payload));
         PacketResponseNG resp;
@@ -872,7 +886,7 @@ int CmdLFRead(const char *Cmd) {
                   "Sniff low frequency signal.\n"
                   " - use " _YELLOW_("`lf config`") _CYAN_(" to set parameters.\n")
                   _CYAN_(" - use ") _YELLOW_("`data plot`") _CYAN_(" to look at it.\n")
-                  _CYAN_("If the number of samples is more than the device memory limit (40000 now), ")
+                  _CYAN_("If the number of samples is more than the device memory limit, ")
                   _CYAN_("it will try to use the real-time sampling mode."),
                   "lf read -v -s 12000   --> collect 12000 samples\n"
                   "lf read -s 3000 -@    --> oscilloscope style \n"
@@ -891,9 +905,16 @@ int CmdLFRead(const char *Cmd) {
     bool cm = arg_get_lit(ctx, 3);
     CLIParserFree(ctx);
 
-    // the 40000 there should be the result of BigBuf_max_traceLen(),
+    // anything past the graph buffer is streamed and then thrown away by
+    // getSamplesFromBufEx(), so don't spend the transfer time on it
+    if (samples > MAX_GRAPH_TRACE_LEN) {
+        PrintAndLogEx(INFO, "Capping to " _YELLOW_("%d") " samples, the graph buffer size", MAX_GRAPH_TRACE_LEN);
+        samples = MAX_GRAPH_TRACE_LEN;
+    }
+
+    // it should be the result of BigBuf_max_traceLen(),
     // but IDK how to get it.
-    bool realtime = samples > 40000;
+    bool realtime = samples >= g_pm3_capabilities.bigbuf_size;
 
     if (g_session.pm3_present == false)
         return PM3_ENOTTY;
@@ -906,7 +927,9 @@ int CmdLFRead(const char *Cmd) {
         ret = lf_read_internal(realtime, verbose, samples, false);
     } while (cm && (kbd_enter_pressed() == false));
 
-    if (ret == PM3_SUCCESS) {
+    // a truncated transfer still leaves usable samples in the graph buffer,
+    // so report them. lf_read_internal() has already said it was short.
+    if (ret == PM3_SUCCESS || ret == PM3_ETIMEOUT) {
         PrintAndLogEx(SUCCESS, "Got " _YELLOW_("%zu") " samples", g_GraphTraceLen);
 
         if (getSignalProperties()->isnoise) {
@@ -943,6 +966,7 @@ int lf_sniff(bool realtime, bool verbose, uint64_t samples) {
 
         size_t sample_bytes = samples * bits_per_sample;
         sample_bytes = (sample_bytes / 8) + (sample_bytes % 8 != 0);
+        const size_t expected_bytes = sample_bytes;
 
         // In real-time mode, the LF bitstream should be loaded before receiving raw data.
         // Otherwise, the first batch of raw data might contain the response of CMD_WTX.
@@ -966,12 +990,25 @@ int lf_sniff(bool realtime, bool verbose, uint64_t samples) {
             sample_bytes = WaitForRawDataTimeout(realtimeBuf, sample_bytes, 1000, true, false);
         }
         samples = sample_bytes * 8 / bits_per_sample;
-        PrintAndLogEx(INFO, "Done: %" PRIu64 " samples (%zu bytes)", samples, sample_bytes);
+        // the inline "Received x / y bytes" counter already says the transfer is
+        // done, so only repeat it in samples when asked
+        if (verbose) {
+            PrintAndLogEx(INFO, "Done: %" PRIu64 " samples (%zu bytes)", samples, sample_bytes);
+        }
         if (samples != 0) {
             getSamplesFromBufEx(realtimeBuf, samples, bits_per_sample, verbose);
         }
 
         free(realtimeBuf);
+
+        if (sample_bytes < expected_bytes) {
+            // keep what did arrive, but don't let it look like a complete read
+            PrintAndLogEx(WARNING, "transfer stopped early, got " _YELLOW_("%zu") " of " _YELLOW_("%zu") " bytes"
+                          , sample_bytes
+                          , expected_bytes
+                         );
+            return PM3_ETIMEOUT;
+        }
     } else {
         SendCommandNG(CMD_LF_SNIFF_RAW_ADC, (uint8_t *)&payload, sizeof(payload));
         PacketResponseNG resp;
@@ -1000,7 +1037,7 @@ int CmdLFSniff(const char *Cmd) {
                   " - use " _YELLOW_("`lf config`") _CYAN_(" to set parameters.\n")
                   _CYAN_(" - use ") _YELLOW_("`data plot`") _CYAN_(" to look at sniff signal.\n")
                   _CYAN_(" - use ") _YELLOW_("`lf search -1`") _CYAN_(" to see if signal can be automatic decoded.\n")
-                  _CYAN_("If the number of samples is more than the device memory limit (40000 now), ")
+                  _CYAN_("If the number of samples is more than the device memory limit, ")
                   _CYAN_("it will try to use the real-time sampling mode."),
                   "lf sniff -v\n"
                   "lf sniff -s 3000 -@    --> oscilloscope style \n"
@@ -1019,9 +1056,16 @@ int CmdLFSniff(const char *Cmd) {
     bool cm = arg_get_lit(ctx, 3);
     CLIParserFree(ctx);
 
-    // the 40000 there should be the result of BigBuf_max_traceLen(),
+    // anything past the graph buffer is streamed and then thrown away by
+    // getSamplesFromBufEx(), so don't spend the transfer time on it
+    if (samples > MAX_GRAPH_TRACE_LEN) {
+        PrintAndLogEx(INFO, "Capping to " _YELLOW_("%d") " samples, the graph buffer size", MAX_GRAPH_TRACE_LEN);
+        samples = MAX_GRAPH_TRACE_LEN;
+    }
+
+    // it should be the result of BigBuf_max_traceLen(),
     // but IDK how to get it.
-    bool realtime = samples > 40000;
+    bool realtime = samples >= g_pm3_capabilities.bigbuf_size;
 
     if (g_session.pm3_present == false)
         return PM3_ENOTTY;
@@ -1062,23 +1106,26 @@ int lfsim_upload_gb(void) {
     //        1 clear bigbuff
     payload_up.flag = 0x1;
 
-    // fast push mode
-    g_conn.block_after_ACK = true;
+    // No fast-push here: this upload is NG + synchronous WaitForResponse per chunk,
+    // and the block_after_ACK handshake (comms.c) desyncs over the higher-latency
+    // FPC/BWM link, killing the transfer after a few chunks. Also clears any state
+    // leaked by a previous run.
+    g_conn.block_after_ACK = false;
 
     PacketResponseNG resp;
 
     //can send only 512 bits at a time (1 byte sent per bit...)
     PrintAndLogEx(INFO, "." NOLF);
-    for (size_t i = 0; i < g_GraphTraceLen; i += PM3_CMD_DATA_SIZE - 3) {
+    for (size_t i = 0; i < g_GraphTraceLen; i += g_conn.max_cmd_data_size - 3) {
 
-        size_t len = MIN((g_GraphTraceLen - i), PM3_CMD_DATA_SIZE - 3);
+        size_t len = MIN((g_GraphTraceLen - i), (size_t)(g_conn.max_cmd_data_size - 3));
         clearCommandBuffer();
         payload_up.offset = i;
 
         for (size_t j = 0; j < len; j++)
             payload_up.data[j] = g_GraphBuffer[i + j];
 
-        SendCommandNG(CMD_LF_UPLOAD_SIM_SAMPLES, (uint8_t *)&payload_up, sizeof(struct pupload));
+        SendCommandNG(CMD_LF_UPLOAD_SIM_SAMPLES, (uint8_t *)&payload_up, 3 + len);  // header (flag+offset) + actual samples, not the padded struct
         WaitForResponse(CMD_LF_UPLOAD_SIM_SAMPLES, &resp);
         if (resp.status != PM3_SUCCESS) {
             PrintAndLogEx(INFO, "Bigbuf is full");
@@ -1236,10 +1283,10 @@ int CmdLFfskSim(const char *Cmd) {
     }
 
     size_t size = g_DemodBufferLen;
-    if (size > (PM3_CMD_DATA_SIZE - sizeof(lf_fsksim_t))) {
-        PrintAndLogEx(WARNING, "DemodBuffer too long for current implementation - length: %zu - max: %zu", size, PM3_CMD_DATA_SIZE - sizeof(lf_fsksim_t));
+    if (size > (g_conn.max_cmd_data_size - sizeof(lf_fsksim_t))) {
+        PrintAndLogEx(WARNING, "DemodBuffer too long for current implementation - length: %zu - max: %zu", size, (size_t)(g_conn.max_cmd_data_size - sizeof(lf_fsksim_t)));
         PrintAndLogEx(INFO, "Continuing with trimmed down data");
-        size = PM3_CMD_DATA_SIZE - sizeof(lf_fsksim_t);
+        size = g_conn.max_cmd_data_size - sizeof(lf_fsksim_t);
     }
 
     lf_fsksim_t *payload = calloc(1, sizeof(lf_fsksim_t) + size);
@@ -1353,10 +1400,10 @@ int CmdLFaskSim(const char *Cmd) {
     }
 
     size_t size = g_DemodBufferLen;
-    if (size > (PM3_CMD_DATA_SIZE - sizeof(lf_asksim_t))) {
-        PrintAndLogEx(WARNING, "DemodBuffer too long for current implementation - length: %zu - max: %zu", size, PM3_CMD_DATA_SIZE - sizeof(lf_asksim_t));
+    if (size > (g_conn.max_cmd_data_size - sizeof(lf_asksim_t))) {
+        PrintAndLogEx(WARNING, "DemodBuffer too long for current implementation - length: %zu - max: %zu", size, (size_t)(g_conn.max_cmd_data_size - sizeof(lf_asksim_t)));
         PrintAndLogEx(INFO, "Continuing with trimmed down data");
-        size = PM3_CMD_DATA_SIZE - sizeof(lf_asksim_t);
+        size = g_conn.max_cmd_data_size - sizeof(lf_asksim_t);
     }
 
     lf_asksim_t *payload = calloc(1, sizeof(lf_asksim_t) + size);
@@ -1489,10 +1536,10 @@ int CmdLFpskSim(const char *Cmd) {
     }
 
     size_t size = g_DemodBufferLen;
-    if (size > (PM3_CMD_DATA_SIZE - sizeof(lf_psksim_t))) {
-        PrintAndLogEx(WARNING, "DemodBuffer too long for current implementation - length: %zu - max: %zu", size, PM3_CMD_DATA_SIZE - sizeof(lf_psksim_t));
+    if (size > (g_conn.max_cmd_data_size - sizeof(lf_psksim_t))) {
+        PrintAndLogEx(WARNING, "DemodBuffer too long for current implementation - length: %zu - max: %zu", size, (size_t)(g_conn.max_cmd_data_size - sizeof(lf_psksim_t)));
         PrintAndLogEx(INFO, "Continuing with trimmed down data");
-        size = PM3_CMD_DATA_SIZE - sizeof(lf_psksim_t);
+        size = g_conn.max_cmd_data_size - sizeof(lf_psksim_t);
     }
 
     lf_psksim_t *payload = calloc(1, sizeof(lf_psksim_t) + size);
@@ -1606,8 +1653,7 @@ static bool check_chiptype(bool getDeviceData) {
     }
 
     //Save the state of the Graph and Demod Buffers
-    buffer_savestate_t saveState_gb = save_bufferS32(g_GraphBuffer, g_GraphTraceLen);
-    saveState_gb.offset = g_GridOffset;
+    buffer_savestate_t saveState_gb = save_graphbuffer();
     buffer_savestate_t saveState_db = save_buffer8(g_DemodBuffer, g_DemodBufferLen);
     saveState_db.clock = g_DemodClock;
     saveState_db.offset = g_DemodStartIdx;
@@ -1680,13 +1726,15 @@ static bool check_chiptype(bool getDeviceData) {
 
     PrintAndLogEx(INFO, "Couldn't identify a chipset");
 out:
-    restore_buffer8(saveState_db, g_DemodBuffer);
+    // the detections above demodulate, so the length comes back with the contents
+    g_DemodBufferLen = restore_buffer8(saveState_db, g_DemodBuffer);
     g_DemodClock = saveState_db.clock;
     g_DemodStartIdx = saveState_db.offset;
 
-    restore_bufferS32(saveState_gb, g_GraphBuffer);
-    g_GridOffset = saveState_gb.offset;
+    restore_graphbuffer(saveState_gb);
 
+    free_buffer_savestate(saveState_db);
+    free_buffer_savestate(saveState_gb);
     return retval;
 }
 
@@ -1844,14 +1892,14 @@ int CmdLFRelay(const char *Cmd) {
     CLIParserContext *ctx;
     CLIParserInit(&ctx, "lf relay",
                   "Relay LF signal between two Proxmark3 devices over TCP.\n"
-                  "By default it uses PORT 8000 and uses 40000 samples from Graphbuffer\n"
+                  "By default it uses PORT 8000 and uses 30000 samples from Graphbuffer\n"
                   "  --rdr  : Reading device, act as IP client and reads LF tag and sends data\n"
                   "  --tag  : Simulation device, act as IP server and simulates relayed data\n",
                   _WHITE_("Device A, reading LF tag, client") "\n"
                   "lf relay --rdr --ip 192.168.1.141           -> Client, connect to IP 192.168.1.141:8000\n"
                   "lf relay --rdr --ip 192.168.1.141 -p 18111  -> Client, connect to IP 192.168.1.141:18111 \n\n"
                   _WHITE_("Device B, simulate LF tag, server") "\n"
-                  "lf relay --tag -p 8111                     -> Server listening port 8111, recv 40000 samples\n"
+                  "lf relay --tag -p 8111                     -> Server listening port 8111, recv 30000 samples\n"
                   "lf relay --tag -s 10000                    -> Server listening port 8000, recv 10000 samples\n"
                  );
 
@@ -1860,7 +1908,7 @@ int CmdLFRelay(const char *Cmd) {
         arg_lit0(NULL, "tag", "Simulation device, act as Server"),
         arg_lit0(NULL, "rdr", "Sniffing device, act as client"),
         arg_str0("i", "ip", "<ipaddr>", "Target IPv4 address to send data to. Used with `--rdr`"),
-        arg_u64_0("s", "samples", "<dec>", "Number of samples to collect (def: 40000)"),
+        arg_u64_0("s", "samples", "<dec>", "Number of samples to collect (def: 30000)"),
         arg_u64_0("p", "port", "<dec>", "Port number (def: 8000)"),
         arg_param_end
     };
@@ -1874,7 +1922,7 @@ int CmdLFRelay(const char *Cmd) {
     char ip[256] = { 0 };
     CLIParamStrToBuf(arg_get_str(ctx, 3), (uint8_t *)ip, sizeof(ip), &iplen);
 
-    uint64_t samples = arg_get_u64_def(ctx, 4, 40000);
+    uint64_t samples = arg_get_u64_def(ctx, 4, 30000);
     uint16_t port = arg_get_u32_def(ctx, 5, 8000) & 0xFFFF;
 
     CLIParserFree(ctx);

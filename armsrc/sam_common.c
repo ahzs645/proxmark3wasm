@@ -19,6 +19,7 @@
 
 #include <string.h>
 #include "sam_common.h"
+#include "util.h"          // switch_clock_to_ticks / _countsspclk
 #include "iclass.h"
 #include "proxmark3_arm.h"
 #include "BigBuf.h"
@@ -204,9 +205,24 @@ int sam_rxtx(const uint8_t *data, uint16_t n, uint8_t *resp, uint16_t *resplen) 
     // Whatever protocol GetATR()/PPS left the card on, rather than an assumed
     // T=0. Resolved once per exchange so the GET RESPONSE round below cannot
     // end up on a different protocol than the command it belongs to.
-    const uint8_t dev_cmd = sc_active_device_cmd();
+    const uint8_t active_cmd = sc_active_device_cmd();
+    const bool t1 = (active_cmd == I2C_DEVICE_CMD_SEND_T1);
+    // Use the v4.65+ compatibility T=0 opcode when available. Grace responses
+    // still assemble their 61xx/9Fxx continuations below on the PM3: they may
+    // carry material response data before the continuation status. T=1 already
+    // returns its whole APDU response through the module's block layer.
+#if SAM_T0_AUTORESP
+    const uint8_t dev_cmd = (active_cmd == I2C_DEVICE_CMD_SEND_T0)
+                            ? I2C_DEVICE_CMD_SEND_T0_AUTORESP
+                            : active_cmd;
+#else
+    const uint8_t dev_cmd = active_cmd;
+#endif
 
+    uint32_t tx_start = GetTicks();
     bool res = I2C_BufferWrite(data, n, dev_cmd, I2C_DEVICE_ADDRESS_MAIN);
+    sc_log_trace_span(data, n, true, tx_start);
+
     if (res == false) {
         DbpString("failed to send to SIM CARD");
         goto out;
@@ -261,10 +277,21 @@ int sam_rxtx(const uint8_t *data, uint16_t n, uint8_t *resp, uint16_t *resplen) 
         *resplen = 0;
     }
 
-    uint8_t cmd_getresp[] = {0x00, ISO7816_GET_RESPONSE, 0x00, 0x00, more_len};
-    sc_log_trace(cmd_getresp, sizeof(cmd_getresp), true);
+    // Grace T=1 exchanges use extended APDUs.  The normal short T=0 GET
+    // RESPONSE is invalid on that path, so use an extended Le when a T=1
+    // response explicitly asks for more data.
+    uint8_t cmd_getresp_t0[] = {0x00, ISO7816_GET_RESPONSE, 0x00, 0x00, more_len};
+    uint16_t want = more_len ? more_len : 256;
+    uint8_t cmd_getresp_t1[] = {0x00, ISO7816_GET_RESPONSE, 0x00, 0x00,
+                                0x00, (uint8_t)(want >> 8), (uint8_t)want
+                               };
+    const uint8_t *cmd_getresp = t1 ? cmd_getresp_t1 : cmd_getresp_t0;
+    const uint16_t cmd_getresp_len = t1 ? sizeof(cmd_getresp_t1) : sizeof(cmd_getresp_t0);
 
-    res = I2C_BufferWrite(cmd_getresp, sizeof(cmd_getresp), dev_cmd, I2C_DEVICE_ADDRESS_MAIN);
+    tx_start = GetTicks();
+    res = I2C_BufferWrite(cmd_getresp, cmd_getresp_len, active_cmd, I2C_DEVICE_ADDRESS_MAIN);
+    sc_log_trace_span(cmd_getresp, cmd_getresp_len, true, tx_start);
+
     if (res == false) {
         DbpString("failed to send to SIM CARD 2");
         goto out;
@@ -284,15 +311,6 @@ out:
     return res;
 }
 
-void switch_clock_to_ticks(void) {
-    StopTicks();
-    StartTicks();
-}
-
-void switch_clock_to_countsspclk(void) {
-    StopTicks();
-    StartCountSspClk();
-}
 
 /**
  * @brief Sends a payload to the SAM
@@ -341,31 +359,53 @@ int sam_send_payload_ex(
     int res = PM3_SUCCESS;
 
     uint8_t *buf = response;
+    const uint16_t inner_len = (uint16_t)(SAM_TX_ASN1_PREFIX_LENGTH + *payload_len);
+    const bool t1 = (sc_active_device_cmd() == I2C_DEVICE_CMD_SEND_T1);
+    uint16_t payload_offset = SAM_TX_APDU_PREFIX_LENGTH;
+
+    if ((uint32_t)inner_len + (t1 ? 9u : 5u) > ISO7816_MAX_FRAME) {
+        return PM3_EINVARG;
+    }
+    if (!t1 && inner_len > 0xff) {
+        return PM3_EINVARG;
+    }
 
     buf[0] = 0xA0; // CLA
     buf[1] = 0xDA; // INS (PUT DATA)
     buf[2] = 0x02; // P1 (TLV format?)
     buf[3] = 0x63; // P2
-    buf[4] = SAM_TX_ASN1_PREFIX_LENGTH + (uint8_t) * payload_len; // LEN
+    if (t1) {
+        // The Artemis T=1 service accepts Grace in extended APDU form.  This
+        // matches the working ACR39U exchange: 00 <Lc-hi> <Lc-lo> ... 0000.
+        buf[4] = 0x00;
+        buf[5] = (uint8_t)(inner_len >> 8);
+        buf[6] = (uint8_t)inner_len;
+        payload_offset = 7;
+    } else {
+        buf[4] = (uint8_t)inner_len;
+    }
 
     // Grace routing header: FROM, TO, REPLY-TO, 0x00, 0x00, scFlag
-    buf[5] = addr_src;
-    buf[6] = addr_dest;
-    buf[7] = addr_reply;
+    buf[payload_offset] = addr_src;
+    buf[payload_offset + 1] = addr_dest;
+    buf[payload_offset + 2] = addr_reply;
 
-    buf[8] = 0x00;
-    buf[9] = 0x00;
-    buf[10] = scFlag;
+    buf[payload_offset + 3] = 0x00;
+    buf[payload_offset + 4] = 0x00;
+    buf[payload_offset + 5] = scFlag;
 
     memcpy(
-        &buf[11],
+        &buf[payload_offset + SAM_TX_ASN1_PREFIX_LENGTH],
         payload,
         *payload_len
     );
 
-    uint16_t length = SAM_TX_ASN1_PREFIX_LENGTH + SAM_TX_APDU_PREFIX_LENGTH + (uint8_t) * payload_len;
+    uint16_t length = (uint16_t)(payload_offset + inner_len);
+    if (t1) {
+        buf[length++] = 0x00; // extended Le = 65536 (maximum response)
+        buf[length++] = 0x00;
+    }
 
-    sc_log_trace(buf, length, true);
     if (g_dbglevel >= DBG_INFO) {
         DbpString("SAM REQUEST APDU: ");
         Dbhexdump(length, buf, false);
@@ -405,6 +445,10 @@ int sam_get_version(bool info) {
 
     uint8_t *response = BigBuf_calloc(ISO7816_MAX_FRAME);
     uint16_t response_len = ISO7816_MAX_FRAME;
+    if (response == NULL) {
+        res = PM3_EMALLOC;
+        goto out;
+    }
 
     uint8_t payload[] = {
         0xa0, // <- SAM command
@@ -413,13 +457,29 @@ int sam_get_version(bool info) {
     };
     uint16_t payload_len = sizeof(payload);
 
-    sam_send_payload(
-        0x44, 0x0a, 0x44,
-        payload,
-        &payload_len,
-        response,
-        &response_len
-    );
+    int exchange = sam_send_payload(
+                       0x44, 0x0a, 0x44,
+                       payload,
+                       &payload_len,
+                       response,
+                       &response_len
+                   );
+
+    if (exchange != PM3_SUCCESS) {
+        res = exchange;
+        goto out;
+    }
+
+    // The Artemis T=1 endpoint accepts the extended GetVersion warmup with a
+    // bare 9000 (unlike the T=0 endpoint, it does not return the version TLV).
+    // It is only a link-settling ping here, so a successful status is enough;
+    // the following InitAuth exchange performs the actual authentication.
+    if ((sc_active_device_cmd() == I2C_DEVICE_CMD_SEND_T1) &&
+            (response_len >= 2) &&
+            (response[response_len - 2] == 0x90) &&
+            (response[response_len - 1] == 0x00)) {
+        goto out;
+    }
 
     // resp:
     // c1 64 00 00 00
@@ -487,6 +547,10 @@ int sam_get_serial_number(void) {
 
     uint8_t *response = BigBuf_calloc(ISO7816_MAX_FRAME);
     uint16_t response_len = ISO7816_MAX_FRAME;
+    if (response == NULL) {
+        res = PM3_EMALLOC;
+        goto out;
+    }
 
     uint8_t payload[] = {
         0xa0, // <- SAM command
@@ -602,6 +666,11 @@ void sam_append_asn1_node(const uint8_t *root, const uint8_t *node, uint8_t type
 void sam_send_ack(void) {
     uint8_t *response = BigBuf_calloc(ISO7816_MAX_FRAME);
     uint16_t response_len = ISO7816_MAX_FRAME;
+    if (response == NULL) {
+        if (g_dbglevel >= DBG_ERROR) DbpString(_RED_("SAM: failed to allocate buffer"));
+        BigBuf_free();
+        return;
+    }
 
     uint8_t payload[] = { 0xa0, 0 };
     uint16_t payload_len = sizeof(payload);

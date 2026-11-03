@@ -43,6 +43,11 @@
 #include "proxendian.h"
 #include "preferences.h"
 #include "mifare/gen4.h"
+#include "parsers/parsehid.h"
+#include "parsers/parsevigik.h"
+#include "parsers/parsehexact.h"
+#include "parsers/parseproac.h"
+#include "parsers/parserkf.h"
 #include "generator.h"              // keygens.
 #include "fpga.h"
 #include "mifare/mifarehost.h"
@@ -67,9 +72,21 @@ typedef struct {
 
 static int CmdHelp(const char *Cmd);
 
-static int HFMFAutoPwnSEN(sector_t *e_sector, size_t sector_cnt) {
+static int HFMFAutoPwnSEN(sector_t *e_sector, size_t sector_cnt, const char *suffix, bool no_save) {
     DropField();
-    return HFMFSENRecover(false, false, false, false, 0, 0x1, true, e_sector, sector_cnt);
+    return HFMFSENRecover(false, false, false, false, 0, 0x1, true, e_sector, sector_cnt, suffix, no_save);
+}
+
+// look for a known backdoor key which can read block 0
+static bool mf_find_backdoor_key(uint8_t *key) {
+    uint8_t blockdata[MFBLOCK_SIZE] = {0};
+    for (uint8_t i = 0; i < ARRAYLEN(fm11_backdoor_keys); i++) {
+        if (mf_read_block(0, MF_KEY_BD, fm11_backdoor_keys[i], blockdata) == PM3_SUCCESS) {
+            memcpy(key, fm11_backdoor_keys[i], MIFARE_KEY_SIZE);
+            return true;
+        }
+    }
+    return false;
 }
 
 // Static array for Saflok key levels
@@ -401,9 +418,11 @@ int mf_read_uid(uint8_t *uid, int *uidlen, int *nxptype) {
             return PM3_ETIMEOUT;
         }
 
-        memcpy(card.ats, resp.data.asBytes, rlen_398);
-        card.ats_len = rlen_398; // note: ats_len includes CRC Bytes
-        if (card.ats_len > 3) {
+        // Only a well formed ATS, TL plus the bytes TL counts plus CRC, means the
+        // PICC entered ISO14443-4.  A 4 bit NAK to RATS is not an ATS.
+        if ((rlen_398 > 3) && (resp.data.asBytes[0] == rlen_398 - 2)) {
+            memcpy(card.ats, resp.data.asBytes, rlen_398);
+            card.ats_len = rlen_398; // note: ats_len includes CRC Bytes
             select_status = 4;
         }
     }
@@ -857,6 +876,45 @@ static void mf_analyse_acl(uint16_t n, uint8_t *d) {
             }
         }
     }
+}
+
+// Everything `hf mf view` shows once the block data is in hand. Shared so a dump
+// read straight off the card gets the same treatment as one loaded from a file -
+// the key extraction and the VIGIK decode used to be reachable only via a file.
+static int mf_view_dump(uint8_t *dump, size_t bytes_read, uint16_t block_cnt, bool verbose, bool save_keys) {
+
+    mf_print_blocks(block_cnt, dump, verbose);
+
+    if (verbose) {
+        mf_print_keys(block_cnt, dump);
+        mf_analyse_acl(block_cnt, dump);
+    }
+
+    if (save_keys) {
+        mf_save_keys_from_arr(block_cnt, dump);
+    }
+
+    if (is_valid_hid_card(dump, bytes_read)) {
+        (void)hid_parser_parse(dump, bytes_read);
+    }
+
+    if (is_valid_vigik_card(dump, bytes_read)) {
+        (void)vigik_parser_parse(dump, bytes_read);
+    }
+
+    if (is_valid_hexact_card(dump, bytes_read)) {
+        (void)hexact_parser_parse(dump, bytes_read);
+    }
+
+    if (is_valid_proac_card(dump, bytes_read)) {
+        (void)proac_parser_parse(dump, bytes_read);
+    }
+
+    if (is_valid_rkf_card(dump, bytes_read)) {
+        (void)rkf_parser_parse(dump, bytes_read);
+    }
+
+    return PM3_SUCCESS;
 }
 
 /*
@@ -1655,6 +1713,7 @@ static int CmdHF14AMfDump(const char *Cmd) {
         arg_lit0(NULL, "4k", "MIFARE Classic 4k / S70"),
         arg_lit0(NULL, "ns", "no save to file"),
         arg_lit0("v", "verbose", "verbose output"),
+        arg_lit0(NULL, "sk", "Save extracted keys to binary file"),
         arg_param_end
     };
     CLIExecWithReturn(ctx, Cmd, argtable, true);
@@ -1673,6 +1732,7 @@ static int CmdHF14AMfDump(const char *Cmd) {
     bool m4 = arg_get_lit(ctx, 6);
     bool nosave = arg_get_lit(ctx, 7);
     bool verbose = arg_get_lit(ctx, 8);
+    bool save_keys = arg_get_lit(ctx, 9);
     CLIParserFree(ctx);
 
     uint64_t t1 = msclock();
@@ -1725,12 +1785,7 @@ static int CmdHF14AMfDump(const char *Cmd) {
 
     PrintAndLogEx(SUCCESS, "time: %" PRIu64 " seconds\n", (msclock() - t1) / 1000);
 
-    mf_print_blocks(block_cnt, mem, verbose);
-
-    if (verbose) {
-        mf_print_keys(block_cnt, mem);
-        mf_analyse_acl(block_cnt, mem);
-    }
+    mf_view_dump(mem, bytes, block_cnt, verbose, save_keys);
 
     // Skip saving card data to file
     if (nosave) {
@@ -2197,6 +2252,9 @@ static int CmdHF14AMfNested(const char *Cmd) { //TODO: single mode broken? can't
             case PM3_EFAILED:
                 PrintAndLogEx(FAILED, "Tag isn't vulnerable to Nested Attack (PRNG is not predictable).\n");
                 break;
+            case PM3_EWRONGANSWER:
+                PrintAndLogEx(FAILED, "Tag refused the nested authentication for block " _YELLOW_("%u") "\n", trgBlockNo);
+                break;
             case PM3_ESOFT:
                 PrintAndLogEx(FAILED, "No valid key found");
                 break;
@@ -2300,6 +2358,11 @@ static int CmdHF14AMfNested(const char *Cmd) { //TODO: single mode broken? can't
                         case PM3_EFAILED :
                             PrintAndLogEx(FAILED, "Tag isn't vulnerable to Nested Attack (PRNG is not predictable)\n");
                             break;
+                        case PM3_EWRONGANSWER:
+                            // tag refused this block,  nothing to gain by retrying it
+                            PrintAndLogEx(FAILED, "Tag refused the nested authentication for sector " _YELLOW_("%u") "\n", sectorNo);
+                            calibrate = false;
+                            continue;
                         case PM3_ESOFT:
                             //key not found
                             calibrate = false;
@@ -2911,6 +2974,20 @@ static int CmdHF14AMfNestedHard(const char *Cmd) {
     return isOK;
 }
 
+// how many keys are in hand right now.  a sector that can't be cracked should
+// not cost the ones that already came out
+static uint8_t mfc_found_key_count(const sector_t *e_sector, uint8_t sector_cnt) {
+    uint8_t n = 0;
+    for (uint8_t i = 0; i < sector_cnt; i++) {
+        for (uint8_t j = MF_KEY_A; j <= MF_KEY_B; j++) {
+            if (e_sector[i].foundKey[j]) {
+                n++;
+            }
+        }
+    }
+    return n;
+}
+
 static int CmdHF14AMfAutoPWN(const char *Cmd) {
 
     CLIParserContext *ctx;
@@ -3141,9 +3218,11 @@ static int CmdHF14AMfAutoPWN(const char *Cmd) {
             return PM3_ETIMEOUT;
         }
 
-        memcpy(card.ats, resp.data.asBytes, rlen_3120);
-        card.ats_len = rlen_3120; // note: ats_len includes CRC Bytes
-        if (card.ats_len > 3) {
+        // Only a well formed ATS, TL plus the bytes TL counts plus CRC, means the
+        // PICC entered ISO14443-4.  A 4 bit NAK to RATS is not an ATS.
+        if ((rlen_3120 > 3) && (resp.data.asBytes[0] == rlen_3120 - 2)) {
+            memcpy(card.ats, resp.data.asBytes, rlen_3120);
+            card.ats_len = rlen_3120; // note: ats_len includes CRC Bytes
             select_status = 4;
         }
     }
@@ -3295,12 +3374,17 @@ static int CmdHF14AMfAutoPWN(const char *Cmd) {
         if (known_key) {
             has_staticnonce = detect_classic_static_encrypted_nonce(loopupblk, keytype, key);
         } else {
-            has_staticnonce = detect_classic_static_encrypted_nonce(0, MF_KEY_A, g_mifare_default_key);
+            uint8_t bdkey[MIFARE_KEY_SIZE] = {0};
+            if (mf_find_backdoor_key(bdkey)) {
+                has_staticnonce = detect_classic_static_encrypted_nonce(0, MF_KEY_BD, bdkey);
+            } else {
+                has_staticnonce = detect_classic_static_encrypted_nonce(0, MF_KEY_A, g_mifare_default_key);
+            }
         }
     }
 
     if (has_staticnonce == NONCE_STATIC_ENC) {
-        int sen_res = HFMFAutoPwnSEN(e_sector, sector_cnt);
+        int sen_res = HFMFAutoPwnSEN(e_sector, sector_cnt, outfnlen ? outfilename : NULL, no_save);
         free(e_sector);
         free(fptr);
         return sen_res;
@@ -3395,7 +3479,11 @@ static int CmdHF14AMfAutoPWN(const char *Cmd) {
             res = mf_check_keys_fast(sector_cnt, true, true, 1, key_cnt, keyBlock, e_sector, use_flashmemory, verbose);
         } else {
 
-            uint32_t chunksize = key_cnt > MFC_CHKKEYS_FAST_MAX_KEYS ? MFC_CHKKEYS_FAST_MAX_KEYS : key_cnt;
+            uint32_t maxkeys = (g_conn.max_cmd_data_size - sizeof(mf_chkkeys_fast_t)) / 6;
+            if (maxkeys > 255) {
+                maxkeys = 255;
+            }
+            uint32_t chunksize = key_cnt > maxkeys ? maxkeys : key_cnt;
             bool firstChunk = true, lastChunk = false;
 
             for (uint8_t strategy = 1; strategy < 3; strategy++) {
@@ -3466,7 +3554,7 @@ static int CmdHF14AMfAutoPWN(const char *Cmd) {
     if (known_key && ((has_staticnonce == NONCE_NORMAL) || (has_staticnonce == NONCE_FAIL))) {
         has_staticnonce = detect_classic_static_encrypted_nonce(mfFirstBlockOfSector(sectorno), keytype, key);
         if (has_staticnonce == NONCE_STATIC_ENC) {
-            int sen_res = HFMFAutoPwnSEN(e_sector, sector_cnt);
+            int sen_res = HFMFAutoPwnSEN(e_sector, sector_cnt, outfnlen ? outfilename : NULL, no_save);
             free(keyBlock);
             free(e_sector);
             free(fptr);
@@ -3542,7 +3630,7 @@ noValidKeyFound:
     if (known_key && has_staticnonce == NONCE_NORMAL) {
         has_staticnonce = detect_classic_static_encrypted_nonce(mfFirstBlockOfSector(sectorno), keytype, key);
         if (has_staticnonce == NONCE_STATIC_ENC) {
-            int sen_res = HFMFAutoPwnSEN(e_sector, sector_cnt);
+            int sen_res = HFMFAutoPwnSEN(e_sector, sector_cnt, outfnlen ? outfilename : NULL, no_save);
             free(keyBlock);
             free(e_sector);
             free(fptr);
@@ -3555,8 +3643,14 @@ noValidKeyFound:
     num_to_bytes(0, MIFARE_KEY_SIZE, tmp_key);
     bool nested_failed = false;
 
+    // a refused sector prints a single line,  so it should not be wrapped in the
+    // blank line that separates the multi line output of a real attack
+    bool skipped_last = false;
+
     // Iterate over each sector and key(A/B)
     for (current_sector_i = 0; current_sector_i < sector_cnt; current_sector_i++) {
+
+        skipped_last = false;
 
         for (current_key_type_i = MF_KEY_A; current_key_type_i <= MF_KEY_B; current_key_type_i++) {
 
@@ -3658,7 +3752,10 @@ skipReadBKey:
                     if (prng_type && (nested_failed == false)) {
                         uint8_t retries = 0;
 
-                        PrintAndLogEx(NORMAL, "");
+                        if (skipped_last == false) {
+                            PrintAndLogEx(NORMAL, "");
+                        }
+
                         if (verbose) {
                             PrintAndLogEx(INFO, "--- " _CYAN_("Enter nested key recovery mode") " -----------------------------");
                             PrintAndLogEx(INFO, "Sector " _YELLOW_("%3d") " key type " _YELLOW_("%c"),
@@ -3671,9 +3768,29 @@ tryNested:
                         switch (isOK) {
                             case PM3_ETIMEOUT: {
                                 PrintAndLogEx(ERR, "\nError: No response from Proxmark3.");
+
+                                uint8_t havekeys = mfc_found_key_count(e_sector, sector_cnt);
+                                if (havekeys) {
+                                    PrintAndLogEx(INFO, "Keeping the " _YELLOW_("%u") " key%s recovered so far",
+                                                  havekeys,
+                                                  (havekeys == 1) ? "" : "s"
+                                                 );
+                                    goto all_found;
+                                }
+
                                 free(e_sector);
                                 free(fptr);
                                 return isOK;
+                            }
+                            case PM3_EWRONGANSWER: {
+                                // the tag NAKed the nested auth for this block.  it is a
+                                // refusal, so move on rather than grind the same sector
+                                PrintAndLogEx(FAILED, "Tag refused the nested authentication, skipping sector " _YELLOW_("%3d") " key type " _YELLOW_("%c"),
+                                              current_sector_i,
+                                              (current_key_type_i == MF_KEY_B) ? 'B' : 'A'
+                                             );
+                                skipped_last = true;
+                                continue;
                             }
                             case PM3_EOPABORTED: {
                                 PrintAndLogEx(WARNING, "\nButton pressed. Aborted.");
@@ -3703,7 +3820,7 @@ tryNested:
                             case PM3_ESTATIC_NONCE: {
                                 e_sector[current_sector_i].Key[current_key_type_i] = 0xffffffffffff;
                                 e_sector[current_sector_i].foundKey[current_key_type_i] = false;
-                                int sen_res = HFMFAutoPwnSEN(e_sector, sector_cnt);
+                                int sen_res = HFMFAutoPwnSEN(e_sector, sector_cnt, outfnlen ? outfilename : NULL, no_save);
                                 free(e_sector);
                                 free(fptr);
                                 return sen_res;
@@ -3761,7 +3878,7 @@ tryHardnested: // If the nested attack fails then we try the hardnested attack
                                 case PM3_ESTATIC_NONCE: {
                                     e_sector[current_sector_i].Key[current_key_type_i] = 0xffffffffffff;
                                     e_sector[current_sector_i].foundKey[current_key_type_i] = false;
-                                    int sen_res = HFMFAutoPwnSEN(e_sector, sector_cnt);
+                                    int sen_res = HFMFAutoPwnSEN(e_sector, sector_cnt, outfnlen ? outfilename : NULL, no_save);
                                     free(e_sector);
                                     free(fptr);
                                     return sen_res;
@@ -4045,7 +4162,11 @@ static int CmdHF14AMfChk_fast(const char *Cmd) {
         return PM3_EMALLOC;
     }
 
-    uint32_t chunksize = (keycnt > MFC_CHKKEYS_FAST_MAX_KEYS) ? MFC_CHKKEYS_FAST_MAX_KEYS : keycnt;
+    uint32_t maxkeys = (g_conn.max_cmd_data_size - sizeof(mf_chkkeys_fast_t)) / 6;
+    if (maxkeys > 255) {
+        maxkeys = 255;
+    }
+    uint32_t chunksize = (keycnt > maxkeys) ? maxkeys : keycnt;
     bool firstChunk = true, lastChunk = false;
 
     int i = 0;
@@ -5429,7 +5550,7 @@ int CmdHF14AMfELoad(const char *Cmd) {
     int cnt = 0;
 
     // 12 is the size of the struct the fct mf_eml_set_mem_xt uses to transfer to device
-    uint16_t max_avail_blocks = ((PM3_CMD_DATA_SIZE - 12) / block_width) * block_width;
+    uint16_t max_avail_blocks = ((g_conn.max_cmd_data_size - 12) / block_width) * block_width;
 
     while (bytes_read && cnt < block_cnt) {
         if (bytes_read == block_width) {
@@ -5440,7 +5561,11 @@ int CmdHF14AMfELoad(const char *Cmd) {
         uint16_t chunk_size = MIN(max_avail_blocks, bytes_read);
         uint16_t blocks_to_send = chunk_size / block_width;
 
-        if (mf_eml_set_mem_xt(data + offset, cnt, blocks_to_send, block_width) != PM3_SUCCESS) {
+        // the first chunk zeroes the emulator memory device side, so a dump smaller
+        // than the previous one can't leave a tail behind that reads back as card data
+        uint8_t flags = (cnt == 0) ? MFEMUL_MEMSET_CLEAR : 0;
+
+        if (mf_eml_set_mem_xt(data + offset, cnt, blocks_to_send, block_width, flags) != PM3_SUCCESS) {
             PrintAndLogEx(FAILED, "Can't set emulator mem at block: %3d", cnt);
             free(data);
             return PM3_ESOFT;
@@ -6849,41 +6974,11 @@ static int CmdHF14AMfMAD(const char *Cmd) {
         bool haveMAD2 = false;
         MAD1DecodeAndPrint(s0, swapmad, verbose, &haveMAD2);
 
-        int sector = DetectHID(s0, 0x484d);
-        if (sector > -1) {
-
-            // decode it
-            PrintAndLogEx(NORMAL, "");
-            PrintAndLogEx(INFO, "------------------------- " _CYAN_("Wiegand") " ---------------------------");
-            PrintAndLogEx(INFO, _CYAN_("HID PACS detected"));
-
-            size_t pacs_off = mfFirstBlockOfSector(sector) * MFBLOCK_SIZE;
-            uint8_t pacs_sector[MFBLOCK_SIZE * 3] = {0};
-            if (pacs_off + sizeof(pacs_sector) <= bytes_read) {
-                memcpy(pacs_sector, dump + pacs_off, sizeof(pacs_sector));
-            }
-
-            if (pacs_sector[16] == 0x02) {
-
-                PrintAndLogEx(SUCCESS, "Raw...... " _GREEN_("%s"), sprint_hex_inrow(pacs_sector + 24, 8));
-
-                //todo:  remove preamble/sentinel
-                uint32_t top = 0, mid = 0, bot = 0;
-                char hexstr[16 + 1] = {0};
-                hex_to_buffer((uint8_t *)hexstr, pacs_sector + 24, 8, sizeof(hexstr) - 1, 0, 0, true);
-                hexstring_to_u96(&top, &mid, &bot, hexstr);
-
-                char binstr[64 + 1];
-                hextobinstring(binstr, hexstr);
-                char *pbin = binstr;
-                while (strlen(pbin) && *(++pbin) == '0');
-
-                PrintAndLogEx(SUCCESS, "Binary... " _GREEN_("%s"), pbin);
-
-                decode_wiegand(top, mid, bot, 0);
-            }
+        if (is_valid_hid_card(dump, bytes_read)) {
+            (void)hid_parser_parse(dump, bytes_read);
         }
 
+        int sector = -1;
         sector = DetectHID(s0, 0x4910);
         if (sector > -1) {
             // decode it
@@ -8458,13 +8553,15 @@ static int CmdHF14AMfView(const char *Cmd) {
     CLIParserContext *ctx;
     CLIParserInit(&ctx, "hf mf view",
                   "Print a MIFARE Classic dump file (bin/eml/json)",
-                  "hf mf view -f hf-mf-01020304-dump.bin"
+                  "hf mf view -f hf-mf-01020304-dump.bin\n"
+                  "hf mf view --selftest"
                  );
     void *argtable[] = {
         arg_param_begin,
-        arg_str1("f", "file", "<fn>", "Specify a filename for dump file"),
+        arg_str0("f", "file", "<fn>", "Specify a filename for dump file"),
         arg_lit0("v", "verbose", "verbose output"),
         arg_lit0(NULL, "sk", "Save extracted keys to binary file"),
+        arg_lit0(NULL, "selftest", "Run the dump parsers self tests and exit"),
         arg_param_end
     };
     CLIExecWithReturn(ctx, Cmd, argtable, false);
@@ -8473,7 +8570,25 @@ static int CmdHF14AMfView(const char *Cmd) {
     CLIParamStrToBuf(arg_get_str(ctx, 1), (uint8_t *)filename, FILE_PATH_SIZE, &fnlen);
     bool verbose = arg_get_lit(ctx, 2);
     bool save_keys = arg_get_lit(ctx, 3);
+    bool selftest = arg_get_lit(ctx, 4);
     CLIParserFree(ctx);
+
+    if (selftest) {
+        int res = vigik_selftest();
+        if (res != PM3_SUCCESS) {
+            return res;
+        }
+        res = hexact_selftest();
+        if (res != PM3_SUCCESS) {
+            return res;
+        }
+        return rkf_selftest();
+    }
+
+    if (fnlen == 0) {
+        PrintAndLogEx(ERR, "Specify a filename with `-f` or run `--selftest`");
+        return PM3_EINVARG;
+    }
 
     // read dump file
     uint8_t *dump = NULL;
@@ -8498,64 +8613,9 @@ static int CmdHF14AMfView(const char *Cmd) {
         PrintAndLogEx(INFO, "File size %zu bytes, file blocks %d (0x%x)", bytes_read, block_cnt, block_cnt);
     }
 
-    mf_print_blocks(block_cnt, dump, verbose);
-
-    if (verbose) {
-        mf_print_keys(block_cnt, dump);
-        mf_analyse_acl(block_cnt, dump);
-    }
-
-    if (save_keys) {
-        mf_save_keys_from_arr(block_cnt, dump);
-    }
-
-    const mad1_sector_t *vigik_s0 = (bytes_read >= sizeof(mad1_sector_t)) ? (const mad1_sector_t *)dump : NULL;
-
-    int sector = vigik_s0 ? DetectHID(vigik_s0, 0x4910) : -1;
-    if (sector > -1) {
-        // decode it
-        PrintAndLogEx(INFO, "");
-        PrintAndLogEx(INFO, _CYAN_("VIGIK PACS detected"));
-
-        mad_entry_list_t mad_list = {0};
-        res = MADDecode(vigik_s0, NULL, &mad_list, false, true);
-        if (res != PM3_SUCCESS) {
-            PrintAndLogEx(ERR, "can't decode MAD");
-            return res;
-        }
-
-        typedef union UDATA {
-            uint8_t *bytes;
-            mfc_vigik_t *vigik;
-        } UDATA;
-        UDATA d;
-        d.bytes = calloc(bytes_read, sizeof(uint8_t));
-        if (d.bytes == NULL) {
-            PrintAndLogEx(WARNING, "Failed to allocate memory");
-            return PM3_EMALLOC;
-        }
-        uint16_t dlen = 0;
-
-        // vigik structure sector 0
-        memcpy(d.bytes + dlen, dump, MFBLOCK_SIZE * 3);
-        dlen += MFBLOCK_SIZE * 3;
-
-        for (size_t i = 0; i < mad_list.len; i++) {
-            if (0x4910 == mad_list.entries[i].aid || 0x4916 == mad_list.entries[i].aid) {
-                uint8_t sno = mad_list.entries[i].sector;
-                uint32_t offset = sno * MFBLOCK_SIZE * 4;
-                memcpy(d.bytes + dlen, dump + offset, MFBLOCK_SIZE * 3);
-                dlen += MFBLOCK_SIZE * 3;
-            }
-        }
-
-//          convert_mfc_2_arr(pdump, bytes_read, d, &dlen);
-        vigik_annotate(d.vigik);
-        free(d.bytes);
-    }
-
+    res = mf_view_dump(dump, bytes_read, block_cnt, verbose, save_keys);
     free(dump);
-    return PM3_SUCCESS;
+    return res;
 }
 
 static int parse_gtu_cfg(uint8_t *d, size_t n) {
@@ -9404,7 +9464,7 @@ static int CmdHF14AGen4Save(const char *Cmd) {
         uint16_t bytes_left = bytes ;
 
         // 12 is the size of the struct the fct mf_eml_set_mem_xt uses to transfer to device
-        uint16_t max_avail_blocks = ((PM3_CMD_DATA_SIZE - 12) / MFBLOCK_SIZE) * MFBLOCK_SIZE;
+        uint16_t max_avail_blocks = ((g_conn.max_cmd_data_size - 12) / MFBLOCK_SIZE) * MFBLOCK_SIZE;
 
         while (bytes_left > 0 && cnt < block_cnt) {
             if (bytes_left == MFBLOCK_SIZE) {
@@ -9415,7 +9475,7 @@ static int CmdHF14AGen4Save(const char *Cmd) {
             uint16_t chunk_size = MIN(max_avail_blocks, bytes_left);
             uint16_t blocks_to_send = chunk_size / MFBLOCK_SIZE;
 
-            if (mf_eml_set_mem_xt(dump + offset, cnt, blocks_to_send, MFBLOCK_SIZE) != PM3_SUCCESS) {
+            if (mf_eml_set_mem_xt(dump + offset, cnt, blocks_to_send, MFBLOCK_SIZE, 0) != PM3_SUCCESS) {
                 PrintAndLogEx(FAILED, "Can't set emulator mem at block: %3d", cnt);
                 free(dump);
                 return PM3_ESOFT;
@@ -9620,7 +9680,7 @@ static int gdm_write_config(uint8_t wakeup, uint8_t auth_cmd, const uint8_t *key
     }
     if (resp.status != PM3_SUCCESS) {
         PrintAndLogEx(FAILED, "Failed to write config. Status: %d", resp.status);
-        return PM3_EFAILED;
+        return resp.status;
     }
     return PM3_SUCCESS;
 }
@@ -9669,6 +9729,144 @@ static int gdm_resolve_wakeup(bool gdm, bool gen1a, bool wupa, int keylen,
     return PM3_SUCCESS;
 }
 
+// A single wakeup/auth attempt: wakeup type, magic-auth command, and key.
+typedef struct {
+    uint8_t wakeup_type;
+    uint8_t auth_cmd;
+    uint8_t key[6];
+} gdm_wakeup_t;
+
+static const char *gdm_wakeup_name(const gdm_wakeup_t *w) {
+    if (w->auth_cmd == MIFARE_MAGIC_GDM_AUTH_KEY) {
+        return "WUPA + magic auth";
+    }
+    if (w->wakeup_type == MF_WAKE_GEN1A) {
+        return "gen1a (40/43)";
+    }
+    return "gdm alt (20/23)";
+}
+
+// Build the wakeup attempts to try. Explicit --gdm/--gen1a/--wupa (or a key) => 1 attempt;
+static int gdm_wakeup_attempts(bool gdm, bool gen1a, bool wupa, const uint8_t *key, int keylen,
+                               bool prefer_auth, gdm_wakeup_t attempts[3], int *count) {
+    if (gdm || gen1a || wupa || keylen > 0) {
+        uint8_t wt = 0, ac = 0;
+        if (gdm_resolve_wakeup(gdm, gen1a, wupa, keylen, &wt, &ac) != PM3_SUCCESS) {
+            return PM3_EINVARG;
+        }
+        attempts[0].wakeup_type = wt;
+        attempts[0].auth_cmd = ac;
+        memcpy(attempts[0].key, key, 6);
+        *count = 1;
+        return PM3_SUCCESS;
+    }
+
+    static const uint8_t types_blk[3]  = { MF_WAKE_GEN1A, MF_WAKE_GDM_ALT, MF_WAKE_WUPA };
+    static const uint8_t auths_blk[3]  = { 0, 0, MIFARE_MAGIC_GDM_AUTH_KEY };
+    static const uint8_t types_auth[3] = { MF_WAKE_WUPA, MF_WAKE_GEN1A, MF_WAKE_GDM_ALT };
+    static const uint8_t auths_auth[3] = { MIFARE_MAGIC_GDM_AUTH_KEY, 0, 0 };
+    const uint8_t *types = prefer_auth ? types_auth : types_blk;
+    const uint8_t *auths = prefer_auth ? auths_auth : auths_blk;
+    for (int i = 0; i < 3; i++) {
+        attempts[i].wakeup_type = types[i];
+        attempts[i].auth_cmd = auths[i];
+        memset(attempts[i].key, 0, 6);
+    }
+    *count = 3;
+    return PM3_SUCCESS;
+}
+
+// Read a single block with one wakeup attempt. Quiet: returns status, prints nothing.
+static int gdm_try_read(uint8_t read_cmd, int block_no, const gdm_wakeup_t *w, uint8_t *out) {
+    mf_readblock_ex_t payload = {
+        .read_cmd = read_cmd,
+        .block_no = block_no,
+        .wakeup = w->wakeup_type,
+        .auth_cmd = w->auth_cmd
+    };
+    memcpy(payload.key, w->key, sizeof(payload.key));
+
+    clearCommandBuffer();
+    SendCommandNG(CMD_HF_MIFARE_READBL_EX, (uint8_t *)&payload, sizeof(payload));
+    PacketResponseNG resp;
+    if (WaitForResponseTimeout(CMD_HF_MIFARE_READBL_EX, &resp, 1500) == false) {
+        return PM3_ETIMEOUT;
+    }
+    if (resp.status != PM3_SUCCESS || resp.length != MFBLOCK_SIZE) {
+        return PM3_EFAILED;
+    }
+    memcpy(out, resp.data.asBytes, MFBLOCK_SIZE);
+    return PM3_SUCCESS;
+}
+
+// Try each attempt against `probe_blk`; return the index of the first that reads
+// successfully (data in `out`), or -1 if all fail.
+static int gdm_pick_wakeup(uint8_t read_cmd, int probe_blk, const gdm_wakeup_t *attempts,
+                           int count, uint8_t *out) {
+    for (int i = 0; i < count; i++) {
+        if (gdm_try_read(read_cmd, probe_blk, &attempts[i], out) == PM3_SUCCESS) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+// Probe with a matching READ to select the WRITE wakeup mode, avoiding partial writes.
+static int gdm_resolve_for_write(bool gdm, bool gen1a, bool wupa,
+                                 const uint8_t *key, int keylen,
+                                 uint8_t probe_read_cmd, int probe_blk,
+                                 bool needs_backdoor, const char *cmd_name,
+                                 gdm_wakeup_t *out_w,
+                                 uint8_t *out_probe_data, bool *out_have_probe) {
+    if (out_have_probe != NULL) {
+        *out_have_probe = false;
+    }
+
+    bool explicit_mode = (gdm || gen1a || wupa || keylen > 0);
+    // config reads can use magic auth; data/hidden reads usually cannot, so try backdoors first
+    bool prefer_auth = (probe_read_cmd == MIFARE_MAGIC_GDM_READ_CFG);
+
+    gdm_wakeup_t attempts[3];
+    int n_attempts = 0;
+    if (gdm_wakeup_attempts(gdm, gen1a, wupa, key, keylen, prefer_auth, attempts, &n_attempts) != PM3_SUCCESS) {
+        return PM3_EINVARG;
+    }
+
+    // Explicit wakeup: no probe, keep legacy single-attempt behaviour.
+    if (explicit_mode) {
+        *out_w = attempts[0];
+        return PM3_SUCCESS;
+    }
+
+    uint8_t buf[MFBLOCK_SIZE] = {0};
+    int idx = gdm_pick_wakeup(probe_read_cmd, probe_blk, attempts, n_attempts, buf);
+    if (idx < 0) {
+        if (needs_backdoor) {
+            // WUPA magic auth still reads config
+            gdm_wakeup_t w = { .wakeup_type = MF_WAKE_WUPA, .auth_cmd = MIFARE_MAGIC_GDM_AUTH_KEY };
+            memset(w.key, 0, sizeof(w.key));
+            if (gdm_try_read(MIFARE_MAGIC_GDM_READ_CFG, 0, &w, buf) == PM3_SUCCESS) {
+                PrintAndLogEx(WARNING, "This card only responds to WUPA magic auth; " _YELLOW_("%s") " needs a gen1a/gdm backdoor", cmd_name);
+                PrintAndLogEx(HINT, "Hint: enable one first:  " _YELLOW_("hf mf gdmsetcfg --wakestyle gen1a --wupa -k <key>"));
+                return PM3_EFAILED;
+            }
+        }
+        PrintAndLogEx(FAILED, "Could not find a working wakeup for " _YELLOW_("%s"), cmd_name);
+        PrintAndLogEx(HINT, "Hint: tried gen1a/gdm/wupa; card may be sealed or use a non-default magic auth key");
+        return PM3_EFAILED;
+    }
+
+    *out_w = attempts[idx];
+    if (out_probe_data != NULL) {
+        memcpy(out_probe_data, buf, MFBLOCK_SIZE);
+    }
+    if (out_have_probe != NULL) {
+        *out_have_probe = true;
+    }
+    PrintAndLogEx(INFO, "Auto-detected wakeup: " _YELLOW_("%s"), gdm_wakeup_name(out_w));
+    return PM3_SUCCESS;
+}
+
 // Read an <on|off> string option into a tri-state: 1 = on, 0 = off, -1 = not provided.
 static int gdm_arg_onoff(CLIParserContext *ctx, int idx) {
     struct arg_str *a = arg_get_str(ctx, idx);
@@ -9686,7 +9884,8 @@ static int CmdHF14AGen4_GDM_Cfg(const char *Cmd) {
     CLIParserContext *ctx;
     CLIParserInit(&ctx, "hf mf gdmgetcfg",
                   "Get configuration data from a GDM card.\n"
-                  "By default uses GDM alt wakeup (20/23). Use `--gen1a` or `--wupa` to override.",
+                  "With no wakeup flag it auto-detects the card's access mode (tries WUPA magic auth,\n"
+                  "then gen1a, then gdm alt). Use `--gdm`/`--gen1a`/`--wupa` to force one.",
                   "hf mf gdmgetcfg\n"
                   "hf mf gdmgetcfg --gen1a\n"
                   "hf mf gdmgetcfg --wupa -k FFFFFFFFFFFF"
@@ -9694,9 +9893,9 @@ static int CmdHF14AGen4_GDM_Cfg(const char *Cmd) {
     void *argtable[] = {
         arg_param_begin,
         arg_str0("k", "key", "<hex>", "key 6 bytes (only for --wupa mode)"),
-        arg_lit0(NULL, "gdm", "use gdm alt (20/23) magic wakeup (default)"),
-        arg_lit0(NULL, "gen1a", "use gen1a (40/43) magic wakeup"),
-        arg_lit0(NULL, "wupa", "use regular wakeup (WUPA + magic auth with key)"),
+        arg_lit0(NULL, "gdm", "use gdm alt (20/23) magic wakeup"),
+        arg_lit0(NULL, "gen1a", "access: force gen1a (40/43) magic wakeup"),
+        arg_lit0(NULL, "wupa", "access: force regular wakeup (WUPA + magic auth with key)"),
         arg_param_end
     };
     CLIExecWithReturn(ctx, Cmd, argtable, true);
@@ -9709,35 +9908,28 @@ static int CmdHF14AGen4_GDM_Cfg(const char *Cmd) {
     bool wupa = arg_get_lit(ctx, 4);
     CLIParserFree(ctx);
 
-    uint8_t wakeup_type = 0;
-    uint8_t auth_cmd = 0;
-    if (gdm_resolve_wakeup(gdm, gen1a, wupa, keylen, &wakeup_type, &auth_cmd) != PM3_SUCCESS) {
+    gdm_wakeup_t attempts[3];
+    int n_attempts = 0;
+    if (gdm_wakeup_attempts(gdm, gen1a, wupa, key, keylen, true, attempts, &n_attempts) != PM3_SUCCESS) {
         return PM3_EINVARG;
     }
 
-    mf_readblock_ex_t payload = {
-        .read_cmd = MIFARE_MAGIC_GDM_READ_CFG,
-        .block_no = 0,
-        .wakeup = wakeup_type,
-        .auth_cmd = auth_cmd
-    };
-    memcpy(payload.key, key, sizeof(payload.key));
-
-    clearCommandBuffer();
-    SendCommandNG(CMD_HF_MIFARE_READBL_EX, (uint8_t *)&payload, sizeof(payload));
-    PacketResponseNG resp;
-    if (WaitForResponseTimeout(CMD_HF_MIFARE_READBL_EX, &resp, 1500) == false) {
-        PrintAndLogEx(WARNING, "command execution time out");
-        return PM3_ETIMEOUT;
+    uint8_t cfg[MFBLOCK_SIZE] = {0};
+    int idx = gdm_pick_wakeup(MIFARE_MAGIC_GDM_READ_CFG, 0, attempts, n_attempts, cfg);
+    if (idx < 0) {
+        PrintAndLogEx(FAILED, "Failed to read config block");
+        if (n_attempts > 1) {
+            PrintAndLogEx(HINT, "Hint: tried WUPA/gen1a/gdm wakeups; card may be sealed or use a non-default magic auth key");
+        }
+        return PM3_EFAILED;
+    }
+    if (n_attempts > 1) {
+        PrintAndLogEx(INFO, "Auto-detected wakeup: " _YELLOW_("%s"), gdm_wakeup_name(&attempts[idx]));
     }
 
-    if (resp.status == PM3_SUCCESS && resp.length == MFBLOCK_SIZE) {
-        parse_gdm_cfg(resp.data.asBytes);
-
-        PrintAndLogEx(NORMAL, "");
-    }
-
-    return resp.status;
+    parse_gdm_cfg(cfg);
+    PrintAndLogEx(NORMAL, "");
+    return PM3_SUCCESS;
 }
 
 static int CmdHF14AGen4_GDM_SetCfg(const char *Cmd) {
@@ -9745,25 +9937,28 @@ static int CmdHF14AGen4_GDM_SetCfg(const char *Cmd) {
     CLIParserInit(&ctx, "hf mf gdmsetcfg",
                   "Set configuration data on a GDM card\n"
                   "Can either write raw 16 bytes (-d) or configure specific flags.\n"
-                  "If flags are provided, it will read the config, update flags, and write it back.",
+                  "If flags are provided, it will read the config, update flags, and write it back.\n"
+                  "With no wakeup flag it auto-detects the card's access mode (WUPA magic auth, gen1a, or gdm alt).\n"
+                  "`access:` flags select how this command talks to the card; `config:` flags change what is stored.",
                   "hf mf gdmsetcfg -d 850000000000000000005A5A00000008\n"
-                  "hf mf gdmsetcfg --cuid on --gen1 on\n"
+                  "hf mf gdmsetcfg --cuid on --wakestyle gen1a\n"
+                  "hf mf gdmsetcfg --wakestyle off\n"
                   "hf mf gdmsetcfg --shadow off --sigsec off --wupa -k FFFFFFFFFFFF"
                  );
     void *argtable[] = {
         arg_param_begin,
         arg_str0("d", "data", "<hex>", "raw bytes to write, 16 hex bytes"),
         arg_str0("k", "key", "<hex>", "key 6 bytes (only for regular wakeup)"),
-        arg_lit0(NULL, "gdm", "use gdm alt (20/23) magic wakeup (default)"),
-        arg_lit0(NULL, "gen1a", "use gen1a (40/43) magic wakeup"),
-        arg_lit0(NULL, "wupa", "use regular wakeup (WUPA + magic auth with key)"),
-        arg_str0(NULL, "gen1", "<on|off>", "Gen1 mode (7A FF)"),
-        arg_str0(NULL, "cuid", "<on|off>", "Gen2/CUID mode"),
-        arg_str0(NULL, "cl2", "<on|off>", "CL2 mode (7-byte UID) - pair with `hf mf gdmsetuid -u <7-byte>` to set a valid UID"),
-        arg_str0(NULL, "shadow", "<on|off>", "Shadow mode"),
-        arg_str0(NULL, "magicauth", "<on|off>", "Magic auth"),
-        arg_str0(NULL, "statenc", "<on|off>", "Static encrypted nonce"),
-        arg_str0(NULL, "sigsec", "<on|off>", "Signature sector"),
+        arg_lit0(NULL, "gdm", "access: force gdm alt (20/23) magic wakeup"),
+        arg_lit0(NULL, "gen1a", "access: force gen1a (40/43) magic wakeup"),
+        arg_lit0(NULL, "wupa", "access: force regular wakeup (WUPA + magic auth with key)"),
+        arg_str0(NULL, "cuid", "<on|off>", "config: Gen2/CUID mode"),
+        arg_str0(NULL, "cl2", "<on|off>", "config: CL2 mode (7-byte UID) - pair with `hf mf gdmsetuid -u <7-byte>`"),
+        arg_str0(NULL, "shadow", "<on|off>", "config: Shadow mode"),
+        arg_str0(NULL, "magicauth", "<on|off>", "config: Magic auth (what --wupa uses)"),
+        arg_str0(NULL, "statenc", "<on|off>", "config: Static encrypted nonce"),
+        arg_str0(NULL, "sigsec", "<on|off>", "config: Signature sector"),
+        arg_str0(NULL, "wakestyle", "<gdm|gen1a|off>", "config: backdoor - gdm (7AFF85), gen1a (7AFF00), or off (8500, seal)"),
         arg_param_end
     };
     CLIExecWithReturn(ctx, Cmd, argtable, false);
@@ -9781,13 +9976,29 @@ static int CmdHF14AGen4_GDM_SetCfg(const char *Cmd) {
     bool wupa = arg_get_lit(ctx, 5);
 
     // read <on|off> flags into tri-states (1/0/-1) before freeing ctx
-    int gen1_flag = gdm_arg_onoff(ctx, 6);
-    int cuid_flag = gdm_arg_onoff(ctx, 7);
-    int cl2_flag = gdm_arg_onoff(ctx, 8);
-    int shadow_flag = gdm_arg_onoff(ctx, 9);
-    int magicauth_flag = gdm_arg_onoff(ctx, 10);
-    int statenc_flag = gdm_arg_onoff(ctx, 11);
-    int sigsec_flag = gdm_arg_onoff(ctx, 12);
+    int cuid_flag = gdm_arg_onoff(ctx, 6);
+    int cl2_flag = gdm_arg_onoff(ctx, 7);
+    int shadow_flag = gdm_arg_onoff(ctx, 8);
+    int magicauth_flag = gdm_arg_onoff(ctx, 9);
+    int statenc_flag = gdm_arg_onoff(ctx, 10);
+    int sigsec_flag = gdm_arg_onoff(ctx, 11);
+
+    // Backdoor selector, the only control for it: gdm -> 7AFF85, gen1a -> 7AFF00, off -> 8500.
+    enum { WS_NONE, WS_GDM, WS_GEN1A, WS_OFF } wakestyle = WS_NONE;
+    struct arg_str *ws = arg_get_str(ctx, 12);
+    if (ws->count > 0) {
+        if (strcasecmp(ws->sval[0], "gdm") == 0) {
+            wakestyle = WS_GDM;
+        } else if (strcasecmp(ws->sval[0], "gen1a") == 0) {
+            wakestyle = WS_GEN1A;
+        } else if (strcasecmp(ws->sval[0], "off") == 0) {
+            wakestyle = WS_OFF;
+        } else {
+            PrintAndLogEx(FAILED, "--wakestyle must be " _YELLOW_("gdm") ", " _YELLOW_("gen1a") " or " _YELLOW_("off") ", got `%s`", ws->sval[0]);
+            CLIParserFree(ctx);
+            return PM3_EINVARG;
+        }
+    }
 
     CLIParserFree(ctx);
 
@@ -9796,14 +10007,23 @@ static int CmdHF14AGen4_GDM_SetCfg(const char *Cmd) {
         return PM3_EINVARG;
     }
 
-    uint8_t wakeup_type = 0;
-    uint8_t auth_cmd = 0;
-    if (gdm_resolve_wakeup(gdm, gen1a, wupa, keylen, &wakeup_type, &auth_cmd) != PM3_SUCCESS) {
-        return PM3_EINVARG;
+    // Auto-detect wakeup by probing a config read (reachable via magic auth or either backdoor).
+    gdm_wakeup_t gw;
+    uint8_t probe_cfg[MFBLOCK_SIZE] = {0};
+    bool have_probe = false;
+    int wres = gdm_resolve_for_write(gdm, gen1a, wupa, key, keylen,
+                                     MIFARE_MAGIC_GDM_READ_CFG, 0, false, "hf mf gdmsetcfg",
+                                     &gw, probe_cfg, &have_probe);
+    if (wres != PM3_SUCCESS) {
+        return wres;
     }
+    uint8_t wakeup_type = gw.wakeup_type;
+    uint8_t auth_cmd = gw.auth_cmd;
+    memcpy(key, gw.key, sizeof(key));
 
-    bool any_flag = (gen1_flag != -1 || cuid_flag != -1 || cl2_flag != -1 || shadow_flag != -1 ||
-                     magicauth_flag != -1 || statenc_flag != -1 || sigsec_flag != -1);
+    bool any_flag = (cuid_flag != -1 || cl2_flag != -1 || shadow_flag != -1 ||
+                     magicauth_flag != -1 || statenc_flag != -1 || sigsec_flag != -1 ||
+                     wakestyle != WS_NONE);
 
     // Logic: if -d is specified, write raw block.
     // Else, read config, update flags, write block.
@@ -9832,10 +10052,12 @@ static int CmdHF14AGen4_GDM_SetCfg(const char *Cmd) {
         if (resp.status == PM3_SUCCESS) {
             PrintAndLogEx(SUCCESS, "Write ( " _GREEN_("ok") " )");
             PrintAndLogEx(HINT, "Hint: Try `" _YELLOW_("hf mf gdmgetcfg") "` to verify");
+        } else if (resp.status == PM3_ETEAROFF) {
+            PrintAndLogEx(INFO, "Tear off triggered");
         } else {
             PrintAndLogEx(FAILED, "Write ( " _RED_("fail") " )");
         }
-        return PM3_SUCCESS;
+        return resp.status;
     }
 
     // Config flag mode
@@ -9844,9 +10066,11 @@ static int CmdHF14AGen4_GDM_SetCfg(const char *Cmd) {
         return PM3_EINVARG;
     }
 
-    // Step 1: Read config
+    // Step 1: Read config - reuse the block already read while auto-probing the wakeup.
     uint8_t config[MFBLOCK_SIZE];
-    if (gdm_read_config(wakeup_type, auth_cmd, key, config) != PM3_SUCCESS) {
+    if (have_probe) {
+        memcpy(config, probe_cfg, MFBLOCK_SIZE);
+    } else if (gdm_read_config(wakeup_type, auth_cmd, key, config) != PM3_SUCCESS) {
         return PM3_EFAILED;
     }
     bool changed = false;
@@ -9861,21 +10085,28 @@ static int CmdHF14AGen4_GDM_SetCfg(const char *Cmd) {
             } \
         }
 
-    if (gen1_flag != -1) {
-        if (gen1_flag == 1) {
-            if (config[0] != 0x7A || config[1] != 0xFF) {
-                config[0] = 0x7A;
-                config[1] = 0xFF;
-                changed = true;
-                PrintAndLogEx(INFO, "Set Gen1 mode to on");
-            }
-        } else {
-            if (config[0] != 0x85 || config[1] != 0x00) {
-                config[0] = 0x85;
-                config[1] = 0x00;
-                changed = true;
-                PrintAndLogEx(INFO, "Set Gen1 mode to off");
-            }
+    if (wakestyle == WS_OFF) {
+        if (config[0] != 0x85 || config[1] != 0x00) {
+            config[0] = 0x85;
+            config[1] = 0x00;
+            changed = true;
+            PrintAndLogEx(INFO, "Set magic wakeup to off (backdoor sealed)");
+            PrintAndLogEx(WARNING, "Both gdm and gen1a wakeups are now disabled; only WUPA magic auth remains");
+        }
+    } else if (wakestyle == WS_GDM || wakestyle == WS_GEN1A) {
+        if (config[0] != 0x7A || config[1] != 0xFF) {
+            config[0] = 0x7A;
+            config[1] = 0xFF;
+            changed = true;
+            PrintAndLogEx(INFO, "Set magic wakeup to on");
+        }
+        uint8_t style_byte = (wakestyle == WS_GDM) ? 0x85 : 0x00;
+        if (config[2] != style_byte) {
+            config[2] = style_byte;
+            changed = true;
+            PrintAndLogEx(INFO, "Set wakeup style to %s", (wakestyle == WS_GDM) ? "gdm alt (20/23)" : "gen1a (40/43)");
+            PrintAndLogEx(WARNING, "After this write the card answers " _YELLOW_("--%s") " only, not the other one",
+                          (wakestyle == WS_GDM) ? "gdm" : "gen1a");
         }
     }
 
@@ -9899,8 +10130,9 @@ static int CmdHF14AGen4_GDM_SetCfg(const char *Cmd) {
     }
 
     // Step 2: Write config
-    if (gdm_write_config(wakeup_type, auth_cmd, key, config) != PM3_SUCCESS) {
-        return PM3_EFAILED;
+    int res = gdm_write_config(wakeup_type, auth_cmd, key, config);
+    if (res != PM3_SUCCESS) {
+        return res;
     }
 
     PrintAndLogEx(SUCCESS, "Config updated successfully");
@@ -9912,7 +10144,7 @@ static int CmdHF14AGen4_GDM_SetBlk(const char *Cmd) {
     CLIParserContext *ctx;
     CLIParserInit(&ctx, "hf mf gdmsetblk",
                   "Set public block data on a GDM card\n"
-                  "By default uses GDM alt wakeup (20/23). Use `--gen1a` or `--wupa` to override.\n"
+                  "With no wakeup flag it auto-detects the card's access mode (gen1a, gdm alt, or WUPA magic auth).\n"
                   "`--force` param is used to override warnings like bad ACL writes.\n"
                   "          if not specified, it will exit if detected",
                   "hf mf gdmsetblk --blk 1 -d 000102030405060708090a0b0c0d0e0f\n"
@@ -9924,9 +10156,9 @@ static int CmdHF14AGen4_GDM_SetBlk(const char *Cmd) {
         arg_int1(NULL, "blk", "<dec>", "public block number"),
         arg_str1("d", "data", "<hex>", "bytes to write, 16 hex bytes"),
         arg_str0("k", "key", "<hex>", "key, 6 hex bytes (only for --wupa mode)"),
-        arg_lit0(NULL, "gdm", "use gdm alt (20/23) magic wakeup (default)"),
-        arg_lit0(NULL, "gen1a", "use gen1a (40/43) magic wakeup"),
-        arg_lit0(NULL, "wupa", "use regular wakeup (WUPA + magic auth with key)"),
+        arg_lit0(NULL, "gdm", "access: force gdm alt (20/23) magic wakeup"),
+        arg_lit0(NULL, "gen1a", "access: force gen1a (40/43) magic wakeup"),
+        arg_lit0(NULL, "wupa", "access: force regular wakeup (WUPA + magic auth with key)"),
         arg_lit0(NULL, "force", "override warnings"),
         arg_param_end
     };
@@ -9958,11 +10190,17 @@ static int CmdHF14AGen4_GDM_SetBlk(const char *Cmd) {
         return PM3_EINVARG;
     }
 
-    uint8_t wakeup_type = 0;
-    uint8_t auth_cmd = 0;
-    if (gdm_resolve_wakeup(gdm, gen1a, wupa, keylen, &wakeup_type, &auth_cmd) != PM3_SUCCESS) {
-        return PM3_EINVARG;
+    // Auto-detect wakeup by probing a public-block read of the target block.
+    gdm_wakeup_t gw;
+    int wres = gdm_resolve_for_write(gdm, gen1a, wupa, key, keylen,
+                                     ISO14443A_CMD_READBLOCK, b, false, "hf mf gdmsetblk",
+                                     &gw, NULL, NULL);
+    if (wres != PM3_SUCCESS) {
+        return wres;
     }
+    uint8_t wakeup_type = gw.wakeup_type;
+    uint8_t auth_cmd = gw.auth_cmd;
+    memcpy(key, gw.key, sizeof(key));
 
     uint8_t blockno = (uint8_t)b;
 
@@ -9999,7 +10237,7 @@ static int CmdHF14AGen4_GDM_SetBlk(const char *Cmd) {
     } else {
         PrintAndLogEx(FAILED, "Write ( " _RED_("fail") " )");
     }
-    return PM3_SUCCESS;
+    return resp.status;
 }
 
 static int CmdHF14AGen4_GDM_SetHidBlk(const char *Cmd) {
@@ -10008,7 +10246,7 @@ static int CmdHF14AGen4_GDM_SetHidBlk(const char *Cmd) {
     CLIParserInit(&ctx, "hf mf gdmsethidblk",
                   "Write hidden block data on a GDM card.\n"
                   "Hidden blocks 0-7 map to the card's hidden sector area.\n"
-                  "By default uses GDM alt wakeup (20/23). Use `--gen1a` or `--wupa` to override.\n"
+                  "With no wakeup flag it auto-detects a backdoor (gen1a or gdm alt); a WUPA-only card is rejected.\n"
                   "`--force` param is used to override warnings like bad BCC or ACL writes.\n"
                   "          if not specified, it will exit if detected",
                   "hf mf gdmsethidblk --blk 0 -d 880494716904EA0C2394510800000000\n"
@@ -10021,9 +10259,9 @@ static int CmdHF14AGen4_GDM_SetHidBlk(const char *Cmd) {
         arg_int1(NULL, "blk", "<dec>", "hidden block number (0-7)"),
         arg_str1("d", "data", "<hex>", "bytes to write, 16 hex bytes"),
         arg_str0("k", "key", "<hex>", "key 6 bytes (only for --wupa mode)"),
-        arg_lit0(NULL, "gdm", "use gdm alt (20/23) magic wakeup (default)"),
-        arg_lit0(NULL, "gen1a", "use gen1a (40/43) magic wakeup"),
-        arg_lit0(NULL, "wupa", "use regular wakeup (WUPA + magic auth with key)"),
+        arg_lit0(NULL, "gdm", "access: force gdm alt (20/23) magic wakeup"),
+        arg_lit0(NULL, "gen1a", "access: force gen1a (40/43) magic wakeup"),
+        arg_lit0(NULL, "wupa", "access: force regular wakeup (WUPA + magic auth with key)"),
         arg_lit0(NULL, "force", "override warnings"),
         arg_param_end
     };
@@ -10058,11 +10296,17 @@ static int CmdHF14AGen4_GDM_SetHidBlk(const char *Cmd) {
     }
 
     // --- validate key length + resolve wakeup mode ---
-    uint8_t wakeup_type = 0;
-    uint8_t auth_cmd = 0;
-    if (gdm_resolve_wakeup(gdm, gen1a, wupa, keylen, &wakeup_type, &auth_cmd) != PM3_SUCCESS) {
-        return PM3_EINVARG;
+    // Auto-detect wakeup by probing a hidden-block read; hidden writes need a gen1a/gdm backdoor.
+    gdm_wakeup_t gw;
+    int wres = gdm_resolve_for_write(gdm, gen1a, wupa, key, keylen,
+                                     MIFARE_MAGIC_GDM_READBLOCK, b, true, "hf mf gdmsethidblk",
+                                     &gw, NULL, NULL);
+    if (wres != PM3_SUCCESS) {
+        return wres;
     }
+    uint8_t wakeup_type = gw.wakeup_type;
+    uint8_t auth_cmd = gw.auth_cmd;
+    memcpy(key, gw.key, sizeof(key));
 
     uint8_t blockno = (uint8_t)b;
 
@@ -10138,7 +10382,7 @@ static int CmdHF14AGen4_GDM_SetHidBlk(const char *Cmd) {
     } else {
         PrintAndLogEx(FAILED, "Write ( " _RED_("fail") " )");
     }
-    return PM3_SUCCESS;
+    return resp.status;
 }
 
 // Shared worker for gdmgetblk / gdmgethidblk: reads a single block (--blk) or a
@@ -10163,40 +10407,34 @@ static int gdm_read_blocks(int blk, int sec, const uint8_t *key, int keylen,
         return PM3_EINVARG;
     }
 
-    uint8_t wakeup_type = 0;
-    uint8_t auth_cmd = 0;
-    if (gdm_resolve_wakeup(gdm, gen1a, wupa, keylen, &wakeup_type, &auth_cmd) != PM3_SUCCESS) {
+    gdm_wakeup_t attempts[3];
+    int n_attempts = 0;
+    if (gdm_wakeup_attempts(gdm, gen1a, wupa, key, keylen, false, attempts, &n_attempts) != PM3_SUCCESS) {
         return PM3_EINVARG;
     }
 
     int start_blk = (blk != -1) ? blk : mfFirstBlockOfSector(sec);
     int num_blks = (blk != -1) ? 1 : mfNumBlocksPerSector(sec);
 
-    for (int i = 0; i < num_blks; i++) {
+    // probe the first block to pick a working wakeup, then reuse it for the rest
+    uint8_t data[MFBLOCK_SIZE] = {0};
+    int idx = gdm_pick_wakeup(read_cmd, start_blk, attempts, n_attempts, data);
+    if (idx < 0) {
+        PrintAndLogEx(FAILED, "Failed to read %s %d", label, start_blk);
+        return PM3_EFAILED;
+    }
+    if (n_attempts > 1) {
+        PrintAndLogEx(INFO, "Auto-detected wakeup: " _YELLOW_("%s"), gdm_wakeup_name(&attempts[idx]));
+    }
+    PrintAndLogEx(SUCCESS, "%s %3d: %s", label, start_blk, sprint_hex_inrow(data, MFBLOCK_SIZE));
+
+    for (int i = 1; i < num_blks; i++) {
         int current_blk = start_blk + i;
-
-        mf_readblock_ex_t payload = {
-            .read_cmd = read_cmd,
-            .block_no = current_blk,
-            .wakeup = wakeup_type,
-            .auth_cmd = auth_cmd
-        };
-        memcpy(payload.key, key, sizeof(payload.key));
-
-        clearCommandBuffer();
-        SendCommandNG(CMD_HF_MIFARE_READBL_EX, (uint8_t *)&payload, sizeof(payload));
-        PacketResponseNG resp;
-        if (WaitForResponseTimeout(CMD_HF_MIFARE_READBL_EX, &resp, 1500) == false) {
-            PrintAndLogEx(FAILED, "command execution time out (block %d)", current_blk);
-            return PM3_ETIMEOUT;
+        if (gdm_try_read(read_cmd, current_blk, &attempts[idx], data) != PM3_SUCCESS) {
+            PrintAndLogEx(FAILED, "Failed to read %s %d", label, current_blk);
+            return PM3_EFAILED;
         }
-
-        if (resp.status == PM3_SUCCESS && resp.length == MFBLOCK_SIZE) {
-            PrintAndLogEx(SUCCESS, "%s %3d: %s", label, current_blk, sprint_hex_inrow(resp.data.asBytes, MFBLOCK_SIZE));
-        } else {
-            PrintAndLogEx(FAILED, "Failed to read %s %d. Status: %d", label, current_blk, resp.status);
-            return resp.status;
-        }
+        PrintAndLogEx(SUCCESS, "%s %3d: %s", label, current_blk, sprint_hex_inrow(data, MFBLOCK_SIZE));
     }
 
     return PM3_SUCCESS;
@@ -10205,7 +10443,8 @@ static int gdm_read_blocks(int blk, int sec, const uint8_t *key, int keylen,
 static int CmdHF14AGen4_GDM_GetHidBlk(const char *Cmd) {
     CLIParserContext *ctx;
     CLIParserInit(&ctx, "hf mf gdmgethidblk",
-                  "Read hidden block(s) from a GDM card",
+                  "Read hidden block(s) from a GDM card.\n"
+                  "With no wakeup flag it auto-detects the card's access mode (WUPA magic auth, gen1a, or gdm alt).",
                   "hf mf gdmgethidblk --blk 0\n"
                   "hf mf gdmgethidblk --sec 1 --gdm"
                  );
@@ -10214,9 +10453,9 @@ static int CmdHF14AGen4_GDM_GetHidBlk(const char *Cmd) {
         arg_int0(NULL, "blk", "<dec>", "block to read"),
         arg_int0(NULL, "sec", "<dec>", "sector to read"),
         arg_str0("k", "key", "<hex>", "key 6 bytes (only for --wupa mode)"),
-        arg_lit0(NULL, "gdm", "use gdm alt (20/23) magic wakeup (default)"),
-        arg_lit0(NULL, "gen1a", "use gen1a (40/43) magic wakeup"),
-        arg_lit0(NULL, "wupa", "use regular wakeup (WUPA + magic auth with key)"),
+        arg_lit0(NULL, "gdm", "use gdm alt (20/23) magic wakeup"),
+        arg_lit0(NULL, "gen1a", "access: force gen1a (40/43) magic wakeup"),
+        arg_lit0(NULL, "wupa", "access: force regular wakeup (WUPA + magic auth with key)"),
         arg_param_end
     };
     CLIExecWithReturn(ctx, Cmd, argtable, false);
@@ -10237,7 +10476,8 @@ static int CmdHF14AGen4_GDM_GetHidBlk(const char *Cmd) {
 static int CmdHF14AGen4_GDM_GetBlk(const char *Cmd) {
     CLIParserContext *ctx;
     CLIParserInit(&ctx, "hf mf gdmgetblk",
-                  "Read public block(s) from a GDM card",
+                  "Read public block(s) from a GDM card.\n"
+                  "With no wakeup flag it auto-detects the card's access mode (WUPA magic auth, gen1a, or gdm alt).",
                   "hf mf gdmgetblk --blk 0\n"
                   "hf mf gdmgetblk --sec 1 --gdm"
                  );
@@ -10246,9 +10486,9 @@ static int CmdHF14AGen4_GDM_GetBlk(const char *Cmd) {
         arg_int0(NULL, "blk", "<dec>", "block to read"),
         arg_int0(NULL, "sec", "<dec>", "sector to read"),
         arg_str0("k", "key", "<hex>", "key 6 bytes (only for --wupa mode)"),
-        arg_lit0(NULL, "gdm", "use gdm alt (20/23) magic wakeup (default)"),
-        arg_lit0(NULL, "gen1a", "use gen1a (40/43) magic wakeup"),
-        arg_lit0(NULL, "wupa", "use regular wakeup (WUPA + magic auth with key)"),
+        arg_lit0(NULL, "gdm", "use gdm alt (20/23) magic wakeup"),
+        arg_lit0(NULL, "gen1a", "access: force gen1a (40/43) magic wakeup"),
+        arg_lit0(NULL, "wupa", "access: force regular wakeup (WUPA + magic auth with key)"),
         arg_param_end
     };
     CLIExecWithReturn(ctx, Cmd, argtable, false);
@@ -10269,7 +10509,8 @@ static int CmdHF14AGen4_GDM_GetBlk(const char *Cmd) {
 static int CmdHF14AGen4_GDM_SetUid(const char *Cmd) {
     CLIParserContext *ctx;
     CLIParserInit(&ctx, "hf mf gdmsetuid",
-                  "Set UID on a GDM card",
+                  "Set UID on a GDM card.\n"
+                  "With no wakeup flag it auto-detects a backdoor (gen1a or gdm alt); a WUPA-only card is rejected.",
                   "hf mf gdmsetuid -u 01020304\n"
                   "hf mf gdmsetuid -u 01020304050607 --gen1a"
                  );
@@ -10277,9 +10518,9 @@ static int CmdHF14AGen4_GDM_SetUid(const char *Cmd) {
         arg_param_begin,
         arg_str1("u", "uid", "<hex>", "UID to set (4 or 7 hex bytes)"),
         arg_str0("k", "key", "<hex>", "key 6 bytes (only for --wupa mode)"),
-        arg_lit0(NULL, "gdm", "use gdm alt (20/23) magic wakeup (default)"),
-        arg_lit0(NULL, "gen1a", "use gen1a (40/43) magic wakeup"),
-        arg_lit0(NULL, "wupa", "use regular wakeup (WUPA + magic auth with key)"),
+        arg_lit0(NULL, "gdm", "access: force gdm alt (20/23) magic wakeup"),
+        arg_lit0(NULL, "gen1a", "access: force gen1a (40/43) magic wakeup"),
+        arg_lit0(NULL, "wupa", "access: force regular wakeup (WUPA + magic auth with key)"),
         arg_lit0(NULL, "f3d", "use F3 perso mode (writes to hidden block 1 instead of 0)"),
         arg_param_end
     };
@@ -10304,11 +10545,17 @@ static int CmdHF14AGen4_GDM_SetUid(const char *Cmd) {
         return PM3_EINVARG;
     }
 
-    uint8_t wakeup_type = 0;
-    uint8_t auth_cmd = 0;
-    if (gdm_resolve_wakeup(gdm, gen1a, wupa, keylen, &wakeup_type, &auth_cmd) != PM3_SUCCESS) {
-        return PM3_EINVARG;
+    // Auto-detect wakeup by probing a hidden-block read; gdmsetuid needs a gen1a/gdm backdoor
+    gdm_wakeup_t gw;
+    int wres = gdm_resolve_for_write(gdm, gen1a, wupa, key, keylen,
+                                     MIFARE_MAGIC_GDM_READBLOCK, 0, true, "hf mf gdmsetuid",
+                                     &gw, NULL, NULL);
+    if (wres != PM3_SUCCESS) {
+        return wres;
     }
+    uint8_t wakeup_type = gw.wakeup_type;
+    uint8_t auth_cmd = gw.auth_cmd;
+    memcpy(key, gw.key, sizeof(key));
 
     // Step 1: Read Config
     uint8_t config[MFBLOCK_SIZE];
@@ -10387,8 +10634,9 @@ static int CmdHF14AGen4_GDM_SetUid(const char *Cmd) {
 
     // Step 3: Write config if needed
     if (update_config) {
-        if (gdm_write_config(wakeup_type, auth_cmd, key, config) != PM3_SUCCESS) {
-            return PM3_EFAILED;
+        int res = gdm_write_config(wakeup_type, auth_cmd, key, config);
+        if (res != PM3_SUCCESS) {
+            return res;
         }
         PrintAndLogEx(SUCCESS, "Config updated successfully");
     }
@@ -10403,7 +10651,7 @@ static int CmdHF14AGen4_GDM_SetUid(const char *Cmd) {
         }
         if (resp.status != PM3_SUCCESS) {
             PrintAndLogEx(FAILED, "Failed to write hidden block 0. Status: %d", resp.status);
-            return PM3_EFAILED;
+            return resp.status;
         }
         PrintAndLogEx(SUCCESS, "Hidden block 0 updated successfully");
     }
@@ -10417,29 +10665,86 @@ static int CmdHF14AGen4_GDM_SetUid(const char *Cmd) {
     }
     if (resp.status != PM3_SUCCESS) {
         PrintAndLogEx(FAILED, "Failed to write real block %d. Status: %d", write_payload.block_no, resp.status);
-        return PM3_EFAILED;
+        return resp.status;
     }
     PrintAndLogEx(SUCCESS, "Real block %d updated successfully", write_payload.block_no);
 
     return PM3_SUCCESS;
 }
 
+static int gdm_wipe_write_block(const gdm_wakeup_t *w, uint8_t write_cmd, uint8_t block_no, const uint8_t *data) {
+    mf_writeblock_ex_t payload = {
+        .wakeup = w->wakeup_type,
+        .auth_cmd = w->auth_cmd,
+        .write_cmd = write_cmd,
+        .block_no = block_no
+    };
+    memcpy(payload.key, w->key, sizeof(payload.key));
+    memcpy(payload.block_data, data, sizeof(payload.block_data));
+
+    clearCommandBuffer();
+    SendCommandNG(CMD_HF_MIFARE_WRITEBL_EX, (uint8_t *)&payload, sizeof(payload));
+
+    PacketResponseNG resp;
+    if (WaitForResponseTimeout(CMD_HF_MIFARE_WRITEBL_EX, &resp, 1500) == false) {
+        PrintAndLogEx(FAILED, "Block %u write timed out", block_no);
+        return PM3_ETIMEOUT;
+    }
+    if (resp.status != PM3_SUCCESS) {
+        PrintAndLogEx(FAILED, "Block %u write failed. Status: %d", block_no, resp.status);
+        return resp.status;
+    }
+    return PM3_SUCCESS;
+}
+
+static int gdm_wipe_verify_uid(const uint8_t *expected_uid) {
+    clearCommandBuffer();
+    SendIso14aReader(ISO14A_CONNECT | ISO14A_CLEARTRACE | ISO14A_NO_DISCONNECT, NULL, 0);
+
+    PacketResponseNG resp;
+    uint8_t select_status = 0;
+    if (WaitForIso14aReply(&resp, 2500, NULL, &select_status) == false) {
+        DropField();
+        PrintAndLogEx(FAILED, "Could not select the card after writing the clean config");
+        return PM3_ETIMEOUT;
+    }
+
+    iso14a_card_select_t card;
+    memcpy(&card, resp.data.asBytes, sizeof(card));
+    DropField();
+
+    if (select_status == 0 || card.uidlen != 4 || memcmp(card.uid, expected_uid, 4) != 0) {
+        PrintAndLogEx(FAILED, "Clean UID verification failed");
+        if (select_status != 0) {
+            PrintAndLogEx(INFO, "Expected UID: %s", sprint_hex(expected_uid, 4));
+            PrintAndLogEx(INFO, "Selected UID: %s", sprint_hex(card.uid, card.uidlen));
+        }
+        return PM3_EFAILED;
+    }
+
+    PrintAndLogEx(SUCCESS, "Selected clean UID: %s", sprint_hex(card.uid, card.uidlen));
+    return PM3_SUCCESS;
+}
+
 static int CmdHF14AGen4_GDM_Wipe(const char *Cmd) {
     CLIParserContext *ctx;
     CLIParserInit(&ctx, "hf mf gdmwipe",
-                  "Wipe a GDM card to factory defaults",
+                  "Wipe a GDM card to a known clean 4-byte template.\n"
+                  "Sets UID to 11223344, clears real and hidden data blocks, and sets sector trailers to default values.\n"
+                  "With no wakeup flag it auto-detects a backdoor; a WUPA-only card is rejected.",
                   "hf mf gdmwipe --gdm"
                  );
     void *argtable[] = {
         arg_param_begin,
         arg_str0("k", "key", "<hex>", "key 6 bytes (only for --wupa mode)"),
-        arg_lit0(NULL, "gdm", "use gdm alt (20/23) magic wakeup (default)"),
-        arg_lit0(NULL, "gen1a", "use gen1a (40/43) magic wakeup"),
-        arg_lit0(NULL, "wupa", "use regular wakeup (WUPA + magic auth with key)"),
+        arg_lit0(NULL, "gdm", "access: force gdm alt (20/23) magic wakeup"),
+        arg_lit0(NULL, "gen1a", "access: force gen1a (40/43) magic wakeup"),
+        arg_lit0(NULL, "wupa", "access: force regular wakeup (WUPA + magic auth with key)"),
         arg_lit0("a", "all", "wipe 4K card (40 sectors) instead of 1K card (16 sectors)"),
         arg_param_end
     };
-    CLIExecWithReturn(ctx, Cmd, argtable, false);
+    // allow a bare `hf mf gdmwipe` (all args optional) so the no-flag auto-detect path works
+    CLIExecWithReturn(ctx, Cmd, argtable, true);
 
     int keylen = 0;
     uint8_t key[6] = {0};
@@ -10451,43 +10756,58 @@ static int CmdHF14AGen4_GDM_Wipe(const char *Cmd) {
     bool wipe_4k = arg_get_lit(ctx, 5);
     CLIParserFree(ctx);
 
-    uint8_t wakeup_type = 0;
-    uint8_t auth_cmd = 0;
-    if (gdm_resolve_wakeup(gdm, gen1a, wupa, keylen, &wakeup_type, &auth_cmd) != PM3_SUCCESS) {
-        return PM3_EINVARG;
+    // Auto-detect wakeup by probing a hidden-block read; gdmwipe rewrites hidden blocks,
+    // so it needs a gen1a/gdm backdoor (WUPA-only cards are rejected before any write).
+    gdm_wakeup_t gw;
+    int wres = gdm_resolve_for_write(gdm, gen1a, wupa, key, keylen,
+                                     MIFARE_MAGIC_GDM_READBLOCK, 0, true, "hf mf gdmwipe",
+                                     &gw, NULL, NULL);
+    if (wres != PM3_SUCCESS) {
+        return wres;
     }
+    if (gw.wakeup_type == MF_WAKE_WUPA) {
+        PrintAndLogEx(WARNING, "hf mf gdmwipe needs a gen1a/gdm backdoor; WUPA magic auth is insufficient");
+        PrintAndLogEx(HINT, "Hint: enable one first:  " _YELLOW_("hf mf gdmsetcfg --wakestyle gen1a --wupa -k <key>"));
+        return PM3_EFAILED;
+    }
+    uint8_t wakeup_type = gw.wakeup_type;
+    uint8_t auth_cmd = gw.auth_cmd;
+    memcpy(key, gw.key, sizeof(key));
 
-    // Step 1: Write Config
-    uint8_t standard_config[MFBLOCK_SIZE] = {0x7A, 0xFF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x5A, 0x00, 0x00, 0x00, 0x08};
-    mf_writeblock_ex_t config_payload = {
-        .wakeup = wakeup_type,
-        .auth_cmd = auth_cmd,
-        .write_cmd = MIFARE_MAGIC_GDM_WRITE_CFG, // 0xE1
-        .block_no = 0
-    };
-    memcpy(config_payload.key, key, 6);
-    memcpy(config_payload.block_data, standard_config, MFBLOCK_SIZE);
-
-    clearCommandBuffer();
-    SendCommandNG(CMD_HF_MIFARE_WRITEBL_EX, (uint8_t *)&config_payload, sizeof(config_payload));
-    PacketResponseNG resp;
-    if (WaitForResponseTimeout(CMD_HF_MIFARE_WRITEBL_EX, &resp, 1500) == false || resp.status != PM3_SUCCESS) {
-        PrintAndLogEx(FAILED, "Failed to write standard config. Status: %d", resp.status);
+    uint8_t clean_config[MFBLOCK_SIZE] = {0x7A, 0xFF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x5A, 0x00, 0x00, 0x00, 0x08};
+    uint8_t cur_config[MFBLOCK_SIZE] = {0};
+    if (gdm_read_config(wakeup_type, auth_cmd, key, cur_config) != PM3_SUCCESS) {
+        PrintAndLogEx(FAILED, "Cannot preserve the current wakeup style; no data was changed");
+        return PM3_EFAILED;
+    }
+    if (cur_config[2] == 0x00 || cur_config[2] == 0x85) {
+        clean_config[2] = cur_config[2];
     } else {
-        PrintAndLogEx(SUCCESS, "Standard config written");
+        clean_config[2] = (wakeup_type == MF_WAKE_GDM_ALT) ? 0x85 : 0x00;
+        PrintAndLogEx(WARNING, "Unknown wakeup style %02X; using %s", cur_config[2],
+                      clean_config[2] == 0x85 ? "gdm alt (20/23)" : "gen1a (40/43)");
     }
 
-    // Step 2: Wipe sectors
     int max_sector = wipe_4k ? 40 : 16;
     uint8_t default_data[MFBLOCK_SIZE] = {0};
-    uint8_t default_trailer[MFBLOCK_SIZE] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x07, 0x80, 0x69, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
-    uint8_t block0_data[MFBLOCK_SIZE] = {0xDE, 0x77, 0x15, 0xB8, 0x04, 0x08, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+    uint8_t default_trailer[MFBLOCK_SIZE] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x07, 0x80, 0x69, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+    uint8_t block0_data[MFBLOCK_SIZE] = {0x11, 0x22, 0x33, 0x44, 0x44, 0x08, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
 
-    mf_writeblock_ex_t write_payload = {
-        .wakeup = wakeup_type,
-        .auth_cmd = auth_cmd
-    };
-    memcpy(write_payload.key, key, 6);
+    int failed_blocks = 0;
+    int total_blocks = 0;
+    uint8_t verify_data[MFBLOCK_SIZE] = {0};
+
+    // Stage a valid 4-byte UID before changing the active UID source.
+    if (gdm_wipe_write_block(&gw, ISO14443A_CMD_WRITEBLOCK, 0, block0_data) != PM3_SUCCESS) {
+        PrintAndLogEx(FAILED, "Could not stage the clean block 0; config was not changed");
+        return PM3_EFAILED;
+    }
+    if (gdm_try_read(ISO14443A_CMD_READBLOCK, 0, &gw, verify_data) != PM3_SUCCESS ||
+            memcmp(verify_data, block0_data, MFBLOCK_SIZE) != 0) {
+        PrintAndLogEx(FAILED, "Clean block 0 readback failed; config was not changed");
+        return PM3_EPARTIAL;
+    }
+    total_blocks++;
 
     for (int sec = 0; sec < max_sector; sec++) {
         int first_blk = mfFirstBlockOfSector(sec);
@@ -10498,49 +10818,72 @@ static int CmdHF14AGen4_GDM_Wipe(const char *Cmd) {
             bool is_trailer = (blk == trailer_blk);
             uint8_t *data_to_write = is_trailer ? default_trailer : default_data;
 
-            // Real block writes
-            write_payload.write_cmd = ISO14443A_CMD_WRITEBLOCK; // 0xA0
-            write_payload.block_no = blk;
-            if (blk == 0) {
-                memcpy(write_payload.block_data, block0_data, MFBLOCK_SIZE);
-            } else {
-                memcpy(write_payload.block_data, data_to_write, MFBLOCK_SIZE);
+            if (blk != 0) {
+                if (gdm_wipe_write_block(&gw, ISO14443A_CMD_WRITEBLOCK, blk, data_to_write) != PM3_SUCCESS) {
+                    failed_blocks++;
+                }
+                total_blocks++;
             }
 
-            clearCommandBuffer();
-            SendCommandNG(CMD_HF_MIFARE_WRITEBL_EX, (uint8_t *)&write_payload, sizeof(write_payload));
-            WaitForResponseTimeout(CMD_HF_MIFARE_WRITEBL_EX, &resp, 1500);
-
-            // Hidden block writes
-            write_payload.write_cmd = MIFARE_MAGIC_GDM_WRITEBLOCK; // 0xA8
-            if (blk == 7) {
-                memcpy(write_payload.block_data, MF_SIGNATURE_KEYS, MFBLOCK_SIZE);
+            // Hidden blocks 0 and 1 can still hold the active 7-byte/F3 UID.
+            if (blk > 1) {
+                const uint8_t *hidden_data = (blk == 7) ? MF_SIGNATURE_KEYS : data_to_write;
+                if (gdm_wipe_write_block(&gw, MIFARE_MAGIC_GDM_WRITEBLOCK, blk, hidden_data) != PM3_SUCCESS) {
+                    failed_blocks++;
+                }
+                total_blocks++;
             }
-
-            clearCommandBuffer();
-            SendCommandNG(CMD_HF_MIFARE_WRITEBL_EX, (uint8_t *)&write_payload, sizeof(write_payload));
-            WaitForResponseTimeout(CMD_HF_MIFARE_WRITEBL_EX, &resp, 1500);
         }
         PrintAndLogEx(INFO, "Wiping sector %d...", sec);
     }
 
-    PrintAndLogEx(SUCCESS, "Wipe completed!");
+    if (failed_blocks != 0) {
+        PrintAndLogEx(FAILED, "Wipe incomplete - " _RED_("%d") " of %d pre-commit block writes failed", failed_blocks, total_blocks);
+        PrintAndLogEx(HINT, "Hint: config and active UID mode were left unchanged");
+        return PM3_EPARTIAL;
+    }
+
+    // Commit the 4-byte personality only after its UID source is valid.
+    if (gdm_write_config(wakeup_type, auth_cmd, key, clean_config) != PM3_SUCCESS) {
+        PrintAndLogEx(FAILED, "Clean config was not committed; the card was partially wiped");
+        return PM3_EPARTIAL;
+    }
+    PrintAndLogEx(SUCCESS, "Clean config written");
+
+    if (gdm_wipe_verify_uid(block0_data) != PM3_SUCCESS) {
+        PrintAndLogEx(HINT, "Hint: the magic wakeup remains enabled for recovery");
+        return PM3_EPARTIAL;
+    }
+
+    // The clean 4-byte personality no longer uses hidden UID data.
+    for (uint8_t blk = 0; blk <= 1; blk++) {
+        if (gdm_wipe_write_block(&gw, MIFARE_MAGIC_GDM_WRITEBLOCK, blk, default_data) != PM3_SUCCESS) {
+            failed_blocks++;
+        }
+    }
+    if (failed_blocks != 0) {
+        PrintAndLogEx(FAILED, "Clean 4-byte mode is active, but hidden UID cleanup failed");
+        return PM3_EPARTIAL;
+    }
+
+    PrintAndLogEx(SUCCESS, "Wipe completed using the clean 4-byte template");
     return PM3_SUCCESS;
 }
 
 static int CmdHF14AGen4_GDM_SetSig(const char *Cmd) {
     CLIParserContext *ctx;
     CLIParserInit(&ctx, "hf mf gdmsetsig",
-                  "Set MFC EV1 signature on a GDM card",
+                  "Set MFC EV1 signature on a GDM card.\n"
+                  "With no wakeup flag it auto-detects a backdoor (gen1a or gdm alt); a WUPA-only card is rejected.",
                   "hf mf gdmsetsig -s <64 hex chars>"
                  );
     void *argtable[] = {
         arg_param_begin,
         arg_str1("s", "sig", "<hex>", "32-byte signature (64 hex characters)"),
         arg_str0("k", "key", "<hex>", "key 6 bytes (only for --wupa mode)"),
-        arg_lit0(NULL, "gdm", "use gdm alt (20/23) magic wakeup (default)"),
-        arg_lit0(NULL, "gen1a", "use gen1a (40/43) magic wakeup"),
-        arg_lit0(NULL, "wupa", "use regular wakeup (WUPA + magic auth with key)"),
+        arg_lit0(NULL, "gdm", "access: force gdm alt (20/23) magic wakeup"),
+        arg_lit0(NULL, "gen1a", "access: force gen1a (40/43) magic wakeup"),
+        arg_lit0(NULL, "wupa", "access: force regular wakeup (WUPA + magic auth with key)"),
         arg_param_end
     };
     CLIExecWithReturn(ctx, Cmd, argtable, false);
@@ -10563,11 +10906,17 @@ static int CmdHF14AGen4_GDM_SetSig(const char *Cmd) {
         return PM3_EINVARG;
     }
 
-    uint8_t wakeup_type = 0;
-    uint8_t auth_cmd = 0;
-    if (gdm_resolve_wakeup(gdm, gen1a, wupa, keylen, &wakeup_type, &auth_cmd) != PM3_SUCCESS) {
-        return PM3_EINVARG;
+    // Auto-detect wakeup by probing a hidden-block read (block 5); gdmsetsig needs a gen1a/gdm backdoor.
+    gdm_wakeup_t gw;
+    int wres = gdm_resolve_for_write(gdm, gen1a, wupa, key, keylen,
+                                     MIFARE_MAGIC_GDM_READBLOCK, 5, true, "hf mf gdmsetsig",
+                                     &gw, NULL, NULL);
+    if (wres != PM3_SUCCESS) {
+        return wres;
     }
+    uint8_t wakeup_type = gw.wakeup_type;
+    uint8_t auth_cmd = gw.auth_cmd;
+    memcpy(key, gw.key, sizeof(key));
 
     // Step 1: Write signature part 1 (block 5)
     mf_writeblock_ex_t write_payload = {
@@ -10582,9 +10931,13 @@ static int CmdHF14AGen4_GDM_SetSig(const char *Cmd) {
     clearCommandBuffer();
     SendCommandNG(CMD_HF_MIFARE_WRITEBL_EX, (uint8_t *)&write_payload, sizeof(write_payload));
     PacketResponseNG resp;
-    if (WaitForResponseTimeout(CMD_HF_MIFARE_WRITEBL_EX, &resp, 1500) == false || resp.status != PM3_SUCCESS) {
+    if (WaitForResponseTimeout(CMD_HF_MIFARE_WRITEBL_EX, &resp, 1500) == false) {
+        PrintAndLogEx(FAILED, "Failed to write signature part 1 (block 5): timeout");
+        return PM3_ETIMEOUT;
+    }
+    if (resp.status != PM3_SUCCESS) {
         PrintAndLogEx(FAILED, "Failed to write signature part 1 (block 5). Status: %d", resp.status);
-        return PM3_EFAILED;
+        return resp.status;
     }
     PrintAndLogEx(SUCCESS, "Signature part 1 written to block 5");
 
@@ -10594,9 +10947,13 @@ static int CmdHF14AGen4_GDM_SetSig(const char *Cmd) {
 
     clearCommandBuffer();
     SendCommandNG(CMD_HF_MIFARE_WRITEBL_EX, (uint8_t *)&write_payload, sizeof(write_payload));
-    if (WaitForResponseTimeout(CMD_HF_MIFARE_WRITEBL_EX, &resp, 1500) == false || resp.status != PM3_SUCCESS) {
+    if (WaitForResponseTimeout(CMD_HF_MIFARE_WRITEBL_EX, &resp, 1500) == false) {
+        PrintAndLogEx(FAILED, "Failed to write signature part 2 (block 6): timeout");
+        return PM3_ETIMEOUT;
+    }
+    if (resp.status != PM3_SUCCESS) {
         PrintAndLogEx(FAILED, "Failed to write signature part 2 (block 6). Status: %d", resp.status);
-        return PM3_EFAILED;
+        return resp.status;
     }
     PrintAndLogEx(SUCCESS, "Signature part 2 written to block 6");
 
@@ -10608,8 +10965,9 @@ static int CmdHF14AGen4_GDM_SetSig(const char *Cmd) {
 
     if (config[13] != 0x5A) {
         config[13] = 0x5A;
-        if (gdm_write_config(wakeup_type, auth_cmd, key, config) != PM3_SUCCESS) {
-            return PM3_EFAILED;
+        int res = gdm_write_config(wakeup_type, auth_cmd, key, config);
+        if (res != PM3_SUCCESS) {
+            return res;
         }
         PrintAndLogEx(SUCCESS, "Enabled signature sector in config (config[13] = 0x5A)");
     } else {
@@ -10628,9 +10986,13 @@ static int CmdHF14AGen4_GDM_SetSig(const char *Cmd) {
 
     clearCommandBuffer();
     SendCommandNG(CMD_HF_MIFARE_WRITEBL_EX, (uint8_t *)&trailer_payload, sizeof(trailer_payload));
-    if (WaitForResponseTimeout(CMD_HF_MIFARE_WRITEBL_EX, &resp, 1500) == false || resp.status != PM3_SUCCESS) {
+    if (WaitForResponseTimeout(CMD_HF_MIFARE_WRITEBL_EX, &resp, 1500) == false) {
+        PrintAndLogEx(FAILED, "Failed to write signature sector trailer (hidden block 7): timeout");
+        return PM3_ETIMEOUT;
+    }
+    if (resp.status != PM3_SUCCESS) {
         PrintAndLogEx(FAILED, "Failed to write signature sector trailer (hidden block 7). Status: %d", resp.status);
-        return PM3_EFAILED;
+        return resp.status;
     }
     PrintAndLogEx(SUCCESS, "Signature sector trailer written to hidden block 7");
 
@@ -11019,7 +11381,7 @@ static int CmdHFMFHidEncode(const char *Cmd) {
     wiegand_card_t card;
     memset(&card, 0, sizeof(wiegand_card_t));
     card.FacilityCode = arg_get_u32_def(ctx, 4, 0);
-    card.CardNumber = arg_get_u32_def(ctx, 5, 0);
+    card.CardNumber = arg_get_u64_def(ctx, 5, 0);
 
     char format[16] = {0};
     int format_len = 0;
@@ -11203,9 +11565,11 @@ static int CmdHF14AMfInfo(const char *Cmd) {
             return PM3_ETIMEOUT;
         }
 
-        memcpy(card.ats, resp.data.asBytes, rlen_11266);
-        card.ats_len = rlen_11266; // note: ats_len includes CRC Bytes
-        if (card.ats_len > 3) {
+        // Only a well formed ATS, TL plus the bytes TL counts plus CRC, means the
+        // PICC entered ISO14443-4.  A 4 bit NAK to RATS is not an ATS.
+        if ((rlen_11266 > 3) && (resp.data.asBytes[0] == rlen_11266 - 2)) {
+            memcpy(card.ats, resp.data.asBytes, rlen_11266);
+            card.ats_len = rlen_11266; // note: ats_len includes CRC Bytes
             select_status = 4;
         }
     }
@@ -12058,7 +12422,7 @@ static command_t CommandTable[] = {
     {"gdmgethidblk", CmdHF14AGen4_GDM_GetHidBlk, IfPm3Iso14443a, "Read hidden block from GDM card"},
     {"gdmsethidblk", CmdHF14AGen4_GDM_SetHidBlk, IfPm3Iso14443a, "Write hidden block to GDM card"},
     {"gdmsetuid", CmdHF14AGen4_GDM_SetUid, IfPm3Iso14443a, "Set UID on GDM card"},
-    {"gdmwipe", CmdHF14AGen4_GDM_Wipe, IfPm3Iso14443a, "Wipe GDM card to factory defaults"},
+    {"gdmwipe", CmdHF14AGen4_GDM_Wipe, IfPm3Iso14443a, "Wipe GDM card to a clean template"},
     {"gdmsetsig", CmdHF14AGen4_GDM_SetSig, IfPm3Iso14443a, "Set MFC EV1 signature on GDM card"},
     {"-----------", CmdHelp,                IfPm3Iso14443a,  "----------------------- " _CYAN_("ndef") " -----------------------"},
     {"ndefformat",  CmdHFMFNDEFFormat,      IfPm3Iso14443a,  "Format MIFARE Classic Tag as NFC Tag"},

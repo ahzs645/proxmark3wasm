@@ -98,9 +98,9 @@ static int colin_currfline;
 static int colin_curlline;
 static int cjat91_saMifareChkKeys(uint8_t blockNo, uint8_t keyType, bool clearTrace, uint8_t keyCount, const uint8_t *datain, uint64_t *key);
 static int e_MifareECardLoad(uint32_t numofsectors, uint8_t keytype);
-static void saMifareMakeTag(void);
+static void __attribute__((noinline)) saMifareMakeTag(void);
 static int saMifareCSetBlock(uint32_t arg0, uint32_t arg1, uint32_t arg2, const uint8_t *datain);
-static void WriteTagToFlash(uint32_t uid, size_t size);
+static void __attribute__((noinline)) WriteTagToFlash(uint32_t uid, size_t size);
 
 // TODO : Implement fast read of KEYS like in RFIdea
 // also http://ext.delaat.net/rp/2015-2016/p04/report.pdf
@@ -252,6 +252,14 @@ static char *ReadSchemasFromSPIFFS(char *filename) {
     int changed = rdv40_spiffs_lazy_mount();
     uint32_t size = size_in_spiffs((char *)filename);
     uint8_t *mem = BigBuf_calloc(size);
+    if (mem == NULL) {
+        if (changed) {
+            rdv40_spiffs_lazy_unmount();
+        }
+        SpinOff(0);
+        return NULL;
+    }
+
     rdv40_spiffs_read_as_filetype((char *)filename, (uint8_t *)mem, size, RDV40_SPIFFS_SAFETY_SAFE);
 
     if (changed) {
@@ -261,9 +269,14 @@ static char *ReadSchemasFromSPIFFS(char *filename) {
     return (char *)mem;
 }
 
-static void add_schemas_from_json_in_spiffs(char *filename) {
+static void __attribute__((noinline)) add_schemas_from_json_in_spiffs(char *filename) {
 
     const char *jsonfile = ReadSchemasFromSPIFFS((char *)filename);
+    if (jsonfile == NULL) {
+        DbprintfEx(FLAG_NEWLINE, "[!!] out of memory, schemas NOT loaded");
+        cjSetCursLeft();
+        return;
+    }
 
     int i, len = strlen(jsonfile);
     struct json_token t;
@@ -281,7 +294,7 @@ static void add_schemas_from_json_in_spiffs(char *filename) {
     }
 }
 
-static void ReadLastTagFromFlash(void) {
+static void __attribute__((noinline)) ReadLastTagFromFlash(void) {
     SpinOff(0);
     LED_A_ON();
     LED_B_ON();
@@ -294,6 +307,12 @@ static void ReadLastTagFromFlash(void) {
     cjSetCursLeft();
 
     uint8_t *mem = BigBuf_calloc(size);
+    if (mem == NULL) {
+        DbprintfEx(FLAG_NEWLINE, "[!!] out of memory, last tag NOT recovered");
+        cjSetCursLeft();
+        SpinOff(0);
+        return;
+    }
 
     // this one will handle filetype (symlink or not) and resolving by itself
     rdv40_spiffs_read_as_filetype((char *)HFCOLIN_LASTTAG_SYMLINK, (uint8_t *)mem, len, RDV40_SPIFFS_SAFETY_SAFE);
@@ -307,7 +326,7 @@ static void ReadLastTagFromFlash(void) {
     return;
 }
 
-static void WriteTagToFlash(uint32_t uid, size_t size) {
+static void __attribute__((noinline)) WriteTagToFlash(uint32_t uid, size_t size) {
     SpinOff(0);
     LED_A_ON();
     LED_B_ON();
@@ -315,7 +334,17 @@ static void WriteTagToFlash(uint32_t uid, size_t size) {
     LED_D_ON();
 
     uint32_t len = size;
-    uint8_t data[(size * (16 * 64)) / 1024];
+
+    // this used to be a VLA - `uint8_t data[(size * (16 * 64)) / 1024]` - which put
+    // another `size` bytes (1024 at the only call site) on top of RunMod's already
+    // 2.5 kB frame, and did not show up in -fstack-usage as anything but "dynamic".
+    uint8_t *data = BigBuf_calloc((size * (16 * 64)) / 1024);
+    if (data == NULL) {
+        DbprintfEx(FLAG_NEWLINE, "[!!] out of memory, tag NOT written to flash");
+        cjSetCursLeft();
+        SpinOff(0);
+        return;
+    }
 
     emlGetMem_xt(data, 0, (size * 64) / 1024, MIFARE_BLOCK_SIZE);
 
@@ -447,6 +476,13 @@ void RunMod(void) {
 
     // Can remember something like that in case of Bigbuf
     keyBlock = BigBuf_calloc(ARRAYLEN(mfKeys) * MF_KEY_LENGTH);
+    if (keyBlock == NULL) {
+        DbprintfEx(FLAG_NEWLINE, "[!!] out of memory, aborting");
+        cjSetCursLeft();
+        SpinOff(0);
+        return;
+    }
+
     int mfKeysCnt = ARRAYLEN(mfKeys);
 
     for (int mfKeyCounter = 0; mfKeyCounter < mfKeysCnt; mfKeyCounter++) {
@@ -864,7 +900,7 @@ static int cjat91_saMifareChkKeys(uint8_t blockNo, uint8_t keyType, bool clearTr
     return retval;
 }
 
-static void saMifareMakeTag(void) {
+static void __attribute__((noinline)) saMifareMakeTag(void) {
     uint8_t cfail = 0;
     cjSetCursLeft();
     cjTabulize();
@@ -951,7 +987,7 @@ static int saMifareCSetBlock(uint32_t arg0, uint32_t arg1, uint32_t arg2, const 
     if (workFlags & 0x08) {
         iso14443a_setup(FPGA_HF_ISO14443A_READER_LISTEN);
         //  clear_trace();
-        set_tracing(FALSE);
+        set_tracing(false);
     }
 
     while (true) {

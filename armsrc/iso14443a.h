@@ -61,6 +61,13 @@ typedef struct {
     uint8_t  *output;
     uint8_t  *parity;
 } tDemod14a;
+
+static inline bool iso14a_is_complete_frame(const tDemod14a *demod, uint16_t expected_len) {
+    return expected_len > 0 && demod->len == expected_len
+           && demod->bitCount == 0 && demod->collisionPos == 0
+           && demod->parityLen == (expected_len + 7u) / 8u;
+}
+
 /*
 typedef enum {
     MOD_NOMOD = 0,
@@ -142,6 +149,7 @@ void Uart14aReset(void);
 void Uart14aInit(uint8_t *d, uint16_t n, uint8_t *par);
 RAMFUNC bool MillerDecoding(uint8_t bit, uint32_t non_real_time);
 RAMFUNC int ManchesterDecoding(uint8_t bit, uint16_t offset, uint32_t non_real_time);
+RAMFUNC int ManchesterDecoding_Thinfilm(uint8_t bit, uint32_t non_real_time);
 
 int RAMFUNC SniffIso14443a(uint8_t param);
 void SimulateIso14443aTag(uint8_t tagType, uint16_t flags, uint8_t *useruid, uint8_t exitAfterNReads);
@@ -167,13 +175,15 @@ bool SimulateIso14443aInit(uint8_t tagType, uint16_t flags, uint8_t *data,
                            uint8_t *ulc_key);
 
 bool GetIso14443aCommandFromReader(uint8_t *received, uint16_t received_maxlen, uint8_t *par, int *len);
-void iso14443a_antifuzz(uint32_t flags);
+void iso14443a_antifuzz(uint32_t flags, uint8_t mode);
 int GetATQA(uint8_t *resp, uint16_t resp_len, uint8_t *resp_par, const iso14a_polling_parameters_t *polling_parameters);
 void ReaderIso14443a(PacketCommandNG *c);
 void ReaderTransmit(const uint8_t *frame, uint16_t len, uint32_t *timing);
 void ReaderTransmitBitsPar(const uint8_t *frame, uint16_t bits, uint8_t *par, uint32_t *timing);
 void ReaderTransmitPar(const uint8_t *frame, uint16_t len, uint8_t *par, uint32_t *timing);
 uint16_t ReaderReceive(uint8_t *receivedAnswer, uint16_t answer_maxlen, uint8_t *par);
+uint32_t iso14a_last_tx_end(void);
+uint32_t iso14a_last_rx_start(void);
 
 void iso14443a_setup(uint8_t fpga_minor_mode);
 int iso14_apdu(uint8_t *cmd, uint16_t cmd_len, bool send_chaining, void *data, uint16_t data_len, uint8_t *res);
@@ -190,6 +200,7 @@ int EmSend4bit(uint8_t resp);
 int EmSendCmd(uint8_t *resp, uint16_t respLen);
 int EmSendCmdEx(uint8_t *resp, uint16_t respLen, bool collision);
 int EmGetCmd(uint8_t *received, uint16_t received_max_len, uint16_t *len, uint8_t *par);
+int EmGetCmdTimeout(uint8_t *received, uint16_t received_max_len, uint16_t *len, uint8_t *par, uint32_t timeout_ms);
 int EmSendCmdPar(uint8_t *resp, uint16_t respLen, uint8_t *par);
 int EmSendCmdParEx(uint8_t *resp, uint16_t respLen, uint8_t *par, bool collision);
 int EmSendPrecompiledCmd(tag_response_info_t *p_response);

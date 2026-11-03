@@ -148,6 +148,8 @@ void StartTickCount(void) {
 // Get the current count.
 uint32_t RAMFUNC GetTickCount(void) {
     ertc_time_type time;
+    // Read SBS first to latch TIME/DATE until the calendar getter reads DATE.
+    uint32_t subsecond = ERTC->sbs;
     ertc_calendar_get(&time);
     return mktime_utc_fast(
                // time.year is short length, not full, so 2025 is 25.
@@ -156,7 +158,7 @@ uint32_t RAMFUNC GetTickCount(void) {
                time.month, time.day, time.hour, time.min, time.sec,
                // this ms is from 0 -> 1000 of second, not timestamp value
                // ms = ((divb + 1) - subsecond * 1000) / (divb + 1)
-               (3125 - ertc_sub_second_get()) * 1000 / 3125) - tick_start_val; // current - start = tick
+               (3125 - subsecond) * 1000 / 3125) - tick_start_val; // current - start = tick
 }
 
 //  -------------------------------------------------------------------------
@@ -230,6 +232,20 @@ void ResetPrecisionCounter(void) {
 
 uint16_t RAMFUNC GetPrecisionCounter(void) {
     return (uint16_t)tmr_counter_value_get(AT32_TMR_PRECISE_COUNTER);
+}
+
+// The free running counter itself, and the distance from a captured value.
+//
+// Declared in ticks_apis.h and used by the Hitag paths, which need a reference
+// they can subtract from rather than a value relative to the last reset.  These
+// were added for AT91 without an AT32 counterpart, which left the PM5 build
+// failing to link with undefined references to both.
+uint16_t RAMFUNC GetPrecisionCounterRaw(void) {
+    return (uint16_t)tmr_counter_value_get(AT32_TMR_PRECISE_COUNTER);
+}
+
+uint16_t RAMFUNC GetPrecisionCounterDelta(uint16_t start) {
+    return (uint16_t)((uint16_t)tmr_counter_value_get(AT32_TMR_PRECISE_COUNTER) - start);
 }
 
 void StartLoEdgeCapture(void) {
@@ -332,12 +348,19 @@ void StopTimestamp(void) {
 }
 
 uint32_t RAMFUNC GetTimestamp(void) {
-    if (tmr_flag_get(AT32_TMR_TIMESTAMP, TMR_OVF_FLAG)) {
+    // Sample the counter on both sides of the overflow check, so a wrap that
+    // lands between the two cannot make the timestamp go backwards.  See the
+    // AT91 version for why that matters.
+    uint16_t cv_before = (uint16_t)tmr_counter_value_get(AT32_TMR_TIMESTAMP);
+    bool overflowed = tmr_flag_get(AT32_TMR_TIMESTAMP, TMR_OVF_FLAG);
+    uint16_t cv_after = (uint16_t)tmr_counter_value_get(AT32_TMR_TIMESTAMP);
+
+    if (overflowed) {
         tmr_flag_clear(AT32_TMR_TIMESTAMP, TMR_OVF_FLAG);
         timestamp_high++;
+        cv_before = cv_after;
     }
-    uint16_t cv = (uint16_t)tmr_counter_value_get(AT32_TMR_TIMESTAMP);
-    return (((uint32_t)timestamp_high << 16) + cv) / TICKS_PER_CARRIER_PERIOD;
+    return (((uint32_t)timestamp_high << 16) + cv_before) / TICKS_PER_CARRIER_PERIOD;
 }
 
 #endif // #ifndef AS_BOOTROM

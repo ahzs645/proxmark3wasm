@@ -25,6 +25,16 @@
 #include "string.h"
 #include "usb_cdc_apis.h"
 #include "usart.h"
+#ifdef WITH_BWM_FORWARD
+#include "bwm_forward.h"
+#endif
+#ifdef WITH_CEP
+#include "pm5_cep.h"
+#endif
+#include "BigBuf.h"        // trace_restart_timeline
+#ifdef WITH_SMARTCARD
+#include "i2c.h"           // sc_log_trace_reset
+#endif
 
 size_t nbytes(size_t nbits) {
     return (nbits >> 3) + ((nbits % 8) > 0);
@@ -323,22 +333,42 @@ int BUTTON_HELD(int ms) {
 // This function returns false if no data is available or
 // the USB connection is invalid.
 bool data_available(void) {
-#ifdef WITH_FPC_USART_HOST
-    return usb_poll_validate_length() || (usart_rxdata_available() > 0);
+    bool avail;
+#if defined(WITH_BWM_FORWARD)
+    // The BWM (BLE / WiFi) link is the host connection on a Proxmark5, so it
+    // has to be polled here too or CMD_BREAK_LOOP is never seen over it.
+    avail = usb_poll_validate_length() || (bwm_fwd_rxdata_available() > 0);
+#elif defined(WITH_FPC_USART_HOST)
+    avail = usb_poll_validate_length() || (usart_rxdata_available() > 0);
 #else
-    return usb_poll_validate_length();
+    avail = usb_poll_validate_length();
 #endif
+#if defined(WITH_CEP)
+    // CEP is independent of BWM/FPC (both may be live at once) - a Flipper
+    // sending CMD_BREAK_LOOP into a running reader loop is otherwise
+    // invisible here, leaving the loop (and its RF field) running until an
+    // unrelated USB command happens to arrive.
+    avail = avail || cep_spi_rx_pending();
+#endif
+    return avail;
 }
 
 // This function doesn't check if the USB connection is valid.
 // In most of the cases, you should use data_available() unless
 // the timing is critical.
 bool data_available_fast(void) {
-#ifdef WITH_FPC_USART_HOST
-    return usb_available_length() || (usart_rxdata_available() > 0);
+    bool avail;
+#if defined(WITH_BWM_FORWARD)
+    avail = usb_available_length() || (bwm_fwd_rxdata_available() > 0);
+#elif defined(WITH_FPC_USART_HOST)
+    avail = usb_available_length() || (usart_rxdata_available() > 0);
 #else
-    return usb_available_length();
+    avail = usb_available_length();
 #endif
+#if defined(WITH_CEP)
+    avail = avail || cep_spi_rx_pending();
+#endif
+    return avail;
 }
 
 // Combined function to convert an unsigned int to an array of hex values corresponding to the last three bits of k1
@@ -359,4 +389,19 @@ void convertToHexArray(uint32_t num, uint8_t *partialkey) {
         group[3] = '\0';  // Null-terminate the group string
         partialkey[i] = (uint8_t)strtoul(group, NULL, 2);
     }
+}
+
+void switch_clock_to_ticks(void) {
+    StopTicks();
+    StartTicks();
+#ifdef WITH_SMARTCARD
+    sc_log_trace_reset();
+#endif
+    trace_restart_timeline();
+}
+
+void switch_clock_to_countsspclk(void) {
+    StopTicks();
+    StartCountSspClk();
+    trace_restart_timeline();
 }

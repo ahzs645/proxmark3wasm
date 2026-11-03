@@ -263,9 +263,11 @@ class Pm3PassportApp(App):
                 box.add_widget(plate)
             else:
                 cls, title = {
-                    1: (PersonalPage, "Additional personal details  ·  EF_DG11"),
-                    2: (IssuerPage, "Additional document details  ·  EF_DG12"),
-                    3: (SecurityPage, "Document security  ·  EF_SOD, EF_DG14, EF_DG15"),
+                    # The files are appended by the page itself, from what
+                    # the document actually turned out to carry.
+                    1: (PersonalPage, "Additional personal details"),
+                    2: (IssuerPage, "Additional document details"),
+                    3: (SecurityPage, "Document security"),
                     4: (FilesPage, "Dumped files"),
                     5: (LogPage, "pm3 client output"),
                 }[index]
@@ -398,6 +400,17 @@ class Pm3PassportApp(App):
             self.status_bac = "failed"
             self.status_auth = "None"
             self.show_error(result.error)
+            self.select_tab(5)
+            return
+        if record is not None and record.is_empty:
+            # Nothing the classifier recognises went wrong, but no file was
+            # written.  Calling that a success drops you on an empty page.
+            self.status_bac = "failed"
+            self.status_auth = "None"
+            self.show_error(
+                errors.NothingReadError(),
+                detail=str(result.log_path or record.source_dir or ""),
+            )
             self.select_tab(5)
             return
         self.status_bac = "success"

@@ -29,4 +29,6 @@ pm3 *pm3_get_current_dev(void);
 int pm3_web_exec(const char *cmd);
 int pm3_web_exec_opts(const char *cmd, int capture, int quiet);
 const char *pm3_web_take_output(void);
+int pm3_flash(const char *port, const char *const *images, int nimages,
+              bool unlock_bootloader, bool force);
 #endif // LIBPM3_H

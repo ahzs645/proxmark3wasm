@@ -10,6 +10,7 @@
 #define BWM_WIFI_H
 
 #include "common.h"
+#include "pm3_cmd.h"   // bwm_ble_status_t
 
 // app_com command codes (authoritative, from BWM main/app_com_defs.h)
 #define BWM_CMD_SET_TO_WIFI_DISABLE_MODE   2000   // no payload: tear down WiFi, back to BLE-only
@@ -34,7 +35,11 @@
 #define BWM_CMD_SET_TCP_SERVER_PORT        2205   // payload: uint16 LE port
 
 #define BWM_WIFI_FORWARD_TCP_SERVER        0      // wifi_forward_type_t::WIFI_FORWARD_TCP_SERVER
+#ifndef BWM_CMD_CMD_ERROR
 #define BWM_CMD_CMD_ERROR                  8091   // slave bcast: command error report
+#endif
+#define BWM_CMD_LOG_FORWARD_ENABLE         1014   // payload: u8 (0=stop, non-zero=start)
+#define BWM_CMD_LOG_MESSAGE                8090   // slave bcast: ESP_LOGx output (string)
 
 // Low-level: send one app_com HOST_CMD and wait for its SLAVE_RESP.
 // resp/resp_len may be NULL if no response payload is expected.
@@ -56,6 +61,91 @@ int bwm_wifi_forward_down(void);
 // BWM IPv4 (host order, a in low byte; 0 if none) to *ip_out and 1/0 to
 // *connected (true == has a DHCP lease). Returns PM3_EFAILED if the BWM/UART
 // does not answer.
-int bwm_wifi_forward_status(uint8_t *connected, uint32_t *ip_out);
+// WiFi connect state reported by --status (mirrors the ESP enum; 0xFF = off).
+#define BWM_WIFI_STATE_DISCONNECTED  0
+#define BWM_WIFI_STATE_CONNECTING    1
+#define BWM_WIFI_STATE_CONNECTED     2
+#define BWM_WIFI_STATE_RECONNECT     3
+#define BWM_WIFI_STATE_STOPPED       4
+#define BWM_WIFI_STATE_OFF           0xFF
+int bwm_wifi_forward_status(uint8_t *state, uint32_t *ip_out);
+
+// ESP OTA over the BWM UART link (no header/soldering): drives the ESP's own
+// OTA commands to reflash a *working* BWM to a new ESP image.
+#define BWM_CMD_OTA_BEGIN   1800   // req: u32 total size
+#define BWM_CMD_OTA_WRITE   1801   // req: firmware chunk
+#define BWM_CMD_OTA_END     1802   // no payload: finalize + set boot partition
+// After a working OTA_END, the ESP has marked the new partition bootable but
+// does not reboot on its own - REBOOT must be sent explicitly (DEV.md 12.8).
+#define BWM_CMD_REBOOT      1803
+// BEGIN erases (or finishes aborting) an OTA slot. A 1.8 MB erase on ESP32-C2
+// commonly takes 20-40 s, so this must be well above the old 15 s race.
+#ifndef BWM_OTA_BEGIN_TIMEOUT_MS
+#define BWM_OTA_BEGIN_TIMEOUT_MS   60000
+#endif
+#ifndef BWM_OTA_WRITE_TIMEOUT_MS
+#define BWM_OTA_WRITE_TIMEOUT_MS   20000
+#endif
+#define BWM_CMD_GET_VERSION_INFO   1000   // resp: running firmware version string
+#define BWM_CMD_STOP_BLE_SPP       4022   // no payload: stop BLE during OTA (flash contention)
+#define BWM_CMD_START_BLE_SPP      4021   // no payload: restore BLE after OTA
+#define BWM_CMD_SET_BLE_DEVICE_NAME 4002   // req: name bytes
+#define BWM_CMD_GET_BLE_DEVICE_NAME 4003   // resp: current BLE device name string
+// ESP power-save switch (DFS + light sleep + low-duty advertising), persisted on
+// the ESP. Both return the ESP's applied state in *state.
+#define BWM_CMD_SET_SYS_POWER_SAVE 1019   // req: u8 0=off 1=on; resp: u8 applied state
+#define BWM_CMD_GET_SYS_POWER_SAVE 1020   // resp: u8 state
+int bwm_esp_get_power_save(uint8_t *state, uint32_t timeout_ms);
+// Host settings the module stores for us (app_host NVS); the ids are ours.
+#define BWM_CMD_SET_SYS_HOST_VALUE 1021   // req: [id u8][value u32]; resp: u32
+#define BWM_CMD_GET_SYS_HOST_VALUE 1022   // req: [id u8]; resp: [present u8][value u32]
+#define BWM_HOSTVAL_AUTOOFF_ENABLED 0
+#define BWM_HOSTVAL_AUTOOFF_IDLE_S  1
+#define BWM_HOSTVAL_AUTOOFF_UNPLUG  2
+int bwm_esp_host_value_set(uint8_t id, uint32_t value, uint32_t timeout_ms);
+// PM3_SUCCESS with the value, PM3_ENODATA if never stored, else the link error.
+int bwm_esp_host_value_get(uint8_t id, uint32_t *value, uint32_t timeout_ms);
+#define BWM_CMD_GET_BLE_SPP_STATUS 4020   // resp: u8 0=stopped 1=advertising 2=client connected
+#define BWM_BLE_STATE_CONNECTED    2
+int bwm_esp_get_ble_state(uint8_t *state, uint32_t timeout_ms);
+
+// BLE settings behind `hw bwm ble` (app_com_defs.h, BLE block @4000).
+#define BWM_CMD_GET_BLE_DEVICE_ADDR    4007   // resp: 6 bytes
+#define BWM_CMD_SET_BLE_BONDING_ENABLE 4008   // req: u8; takes effect at the next stack start
+#define BWM_CMD_GET_BLE_BONDING_ENABLE 4009   // resp: u8
+#define BWM_CMD_SET_BLE_BONDING_KEY    4010   // req: 6 ASCII digits
+#define BWM_CMD_GET_BLE_BONDING_KEY    4011   // resp: 6 ASCII digits
+#define BWM_CMD_GET_BLE_BONDED_NUMS    4012   // resp: u8 count
+#define BWM_CMD_GET_BLE_BONDED_ADDR    4013   // req: u8 index; resp: addr[6] + type
+#define BWM_CMD_DEL_BLE_BONDED         4014   // req: u8 index
+#define BWM_CMD_CLEAR_BLE_BONDED       4015   // no payload
+#define BWM_CMD_SET_BLE_TX_POWER       4018   // req: [type][level]
+#define BWM_CMD_GET_BLE_TX_POWER       4019   // req: u8 type; resp: u8 level
+#define BWM_CMD_SET_BLE_ENABLE         4023   // req: u8 (persisted, applied at once); resp: u8 stored. Newer ESP fw only
+#define BWM_CMD_GET_BLE_ENABLE         4024   // resp: u8
+int bwm_esp_set_ble_enable(bool on, uint8_t *stored);
+int bwm_esp_set_ble_bonding(bool on);
+int bwm_esp_set_ble_key(const uint8_t key[6]);
+int bwm_esp_ble_forget(uint8_t idx);        // 0xFF = all
+int bwm_esp_set_ble_txpower(uint8_t type, uint8_t level);
+// Stop + start the stack so a bonding change applies; no-op while it is stopped.
+int bwm_esp_ble_restart(void);
+// Best-effort snapshot for `hw bwm ble`; fields the module cannot answer read 0xFF.
+// PM3_ETIMEOUT (nothing filled in) when the module does not answer the first query.
+int bwm_esp_ble_status(bwm_ble_status_t *st);
+// ESP WiFi modem power-save type (0 none, 1 min, 2 max), persisted on the ESP.
+#define BWM_CMD_SET_WIFI_CFG_PS_MODE 2052   // req: u8 mode; resp: u8 applied mode
+#define BWM_CMD_GET_WIFI_CFG_PS_MODE 2053   // resp: u8 mode
+int bwm_esp_get_wifi_ps(uint8_t *mode);
+int bwm_esp_set_wifi_ps(uint8_t mode, uint8_t *applied);
+int bwm_esp_set_power_save(bool on, uint8_t *state);
+int bwm_esp_get_version(uint8_t *buf, uint16_t *buflen, uint32_t timeout_ms);
+int bwm_esp_get_ble_name(uint8_t *buf, uint16_t *buflen);
+int bwm_esp_set_ble_name(const uint8_t *name, uint16_t len);
+int bwm_esp_ota_begin(uint32_t total_size);
+int bwm_esp_ota_write(const uint8_t *data, uint16_t len);
+int bwm_esp_ota_end(void);
+int bwm_esp_reboot(void);
+int bwm_esp_ota_abort(void);
 
 #endif
