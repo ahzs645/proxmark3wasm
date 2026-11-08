@@ -2,6 +2,7 @@ name: FPGA PM5 Build
 
 on:
   push:
+    branches: [master]
     paths:
       - 'fpga/**'
       - '.github/workflows/fpga-pm5.yml'
@@ -10,6 +11,10 @@ on:
       - 'fpga/**'
       - '.github/workflows/fpga-pm5.yml'
   workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 env:
   # oss-cad-suite is released daily; bump the date to move to a newer one.

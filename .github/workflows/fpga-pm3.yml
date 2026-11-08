@@ -2,6 +2,7 @@ name: FPGA PM3 Build
 
 on:
   push:
+    branches: [master]
     paths:
       - 'fpga/**'
       - '.github/workflows/fpga-pm3.yml'
@@ -13,6 +14,10 @@ on:
 
 permissions:
   contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 env:
   # The PM3, PM3-ULT and iCopy-X images are Spartan-II and Spartan-3E, and

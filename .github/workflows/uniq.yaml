@@ -2,6 +2,7 @@ name: Check uniq keys
 
 on:
   push:
+    branches: [master]
     paths:
       - 'client/dictionaries/**'
       - 'client/resources/*.json'
@@ -13,6 +14,10 @@ on:
       - 'tools/check_json_uniq.py'
   workflow_dispatch:
 
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 jobs:
   check-unique:

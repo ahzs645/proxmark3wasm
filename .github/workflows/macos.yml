@@ -2,6 +2,7 @@ name: MacOS Build and Test
 
 on:
   push:
+    branches: [master]
     paths-ignore:
       - 'doc/**'
       - 'docker/**'
@@ -15,6 +16,12 @@ on:
       - 'traces/**'
       - '.vscode/**'
       - '**.md'
+
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 jobs:
   macos-make:
